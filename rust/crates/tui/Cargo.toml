@@ -1,0 +1,23 @@
+[package]
+name = "cordanui-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cordanui"
+path = "src/main.rs"
+
+[dependencies]
+cordanui-schema = { path = "../schema" }
+cordanui-plugin-runtime = { path = "../plugin-runtime" }
+cordanui-sync = { path = "../sync" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+toml = { workspace = true }
+dirs = { workspace = true }

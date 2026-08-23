@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/schema", "crates/tui", "crates/plugin-runtime", "crates/sync", "plugins/cordanui-agents"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# schema crate
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# tui crate
+ratatui = "0.29"
+crossterm = "0.28"
+rusqlite = { version = "0.32", features = ["bundled"] }
+dirs = "5"
+anyhow = "1"
+
+# sync crate
+libsql = "0.9"
+
+# plugin-runtime + cordanui-agents
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json"] }

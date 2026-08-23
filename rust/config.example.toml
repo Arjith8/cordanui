@@ -1,0 +1,37 @@
+# cordanui configuration
+#
+# This file is optional. If it doesn't exist, cordanui runs in local-only
+# mode (no Turso sync). Copy this to ~/.config/cordanui/config.toml and
+# fill in your Turso credentials to enable sync.
+#
+# Get your Turso database URL and auth token at https://turso.tech
+
+[keybinds]
+# All keybinds are configurable. Key syntax: modifiers first, joined by '+'
+# (e.g. "ctrl+a", "alt+space", "shift+tab", "f2"). Special names: esc, enter,
+# tab, backtab, space, backspace, delete, insert, home, end, pageup, pagedown,
+# up, down, left, right, f1..f9. Omit this whole section to use the defaults.
+
+# Prefix key that arms command mode.
+leader = "ctrl+a"
+
+# <leader> + new_goal: add a new goal.
+new_goal = "n"
+
+# <leader> + show_details: toggle the selected goal's description + subgoals.
+show_details = "tab"
+
+# Bare key (no leader): cycle status pending → in progress → done.
+cycle_status = "tab"
+
+# <leader> + help: open the help page.
+help = "h"
+
+[turso]
+# Your Turso database URL (libsql://...).
+# Create a database at https://turso.tech/app
+url = "libsql://your-db.turso.io"
+
+# Your Turso auth token.
+# Generate one with: turso db tokens create your-db-name
+token = "your-auth-token-here"
