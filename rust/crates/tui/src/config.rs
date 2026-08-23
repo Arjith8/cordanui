@@ -132,6 +132,8 @@ pub struct Keybinds {
     pub cycle_status: KeyBinding,
     /// `<leader> + this` opens the help page.
     pub help: KeyBinding,
+    /// `<leader> + this` opens the plugin manager popup.
+    pub plugins: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -142,6 +144,7 @@ impl Default for Keybinds {
             show_details: KeyBinding::parse("tab").unwrap(),
             cycle_status: KeyBinding::parse("tab").unwrap(),
             help: KeyBinding::parse("h").unwrap(),
+            plugins: KeyBinding::parse("p").unwrap(),
         }
     }
 }
@@ -181,6 +184,7 @@ impl Keybinds {
             show_details: get("show_details", &defaults.show_details),
             cycle_status: get("cycle_status", &defaults.cycle_status),
             help: get("help", &defaults.help),
+            plugins: get("plugins", &defaults.plugins),
         }
     }
 
@@ -205,6 +209,7 @@ impl Keybinds {
         push("show_details", &self.show_details, &d.show_details, "<leader> + key — toggle description + subgoals");
         push("cycle_status", &self.cycle_status, &d.cycle_status, "bare key — cycle pending → in progress → done");
         push("help", &self.help, &d.help, "<leader> + key — open this help page");
+        push("plugins", &self.plugins, &d.plugins, "<leader> + key — open the plugin manager");
         v
     }
 }

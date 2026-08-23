@@ -308,6 +308,126 @@ pub fn next_sort_order(db: &Database, parent_id: Option<&str>) -> anyhow::Result
     }
 }
 
+// ---------- plugins registry ----------
+
+/// A row of the `plugins` table.
+#[derive(Debug, Clone)]
+pub struct PluginRow {
+    pub id: String,
+    pub source: String,
+    pub dir: String,
+    pub active: bool,
+    pub installed_at: String,
+}
+
+const PLUGIN_COLS: &str = "id, source, dir, active, installed_at";
+
+/// All installed plugins, most recently installed first.
+pub fn list_plugins(db: &Database) -> anyhow::Result<Vec<PluginRow>> {
+    let result = db.query_simple(&format!(
+        "SELECT {PLUGIN_COLS} FROM plugins ORDER BY installed_at DESC, id"
+    ))?;
+    Ok(result.rows().iter().map(values_to_plugin).collect())
+}
+
+/// Record a freshly installed plugin. Active by default.
+pub fn add_plugin(db: &Database, id: &str, source: &str, dir: &str) -> anyhow::Result<()> {
+    let ts = cordanui_schema::now_iso();
+    db.execute(
+        "INSERT INTO plugins (id, source, dir, active, installed_at) \
+         VALUES (?, ?, ?, 1, ?) \
+         ON CONFLICT(id) DO UPDATE SET \
+             source = excluded.source, dir = excluded.dir, \
+             active = 1, installed_at = excluded.installed_at",
+        vec![
+            Value::from(id),
+            Value::from(source),
+            Value::from(dir),
+            Value::from(ts),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Toggle / set a plugin's active flag.
+pub fn set_plugin_active(db: &Database, id: &str, active: bool) -> anyhow::Result<()> {
+    db.execute(
+        "UPDATE plugins SET active = ? WHERE id = ?",
+        vec![Value::from(active as i64), Value::from(id)],
+    )?;
+    Ok(())
+}
+
+/// Remove a plugin's registry row (does not touch its files).
+pub fn remove_plugin_row(db: &Database, id: &str) -> anyhow::Result<()> {
+    db.execute("DELETE FROM plugins WHERE id = ?", vec![Value::from(id)])?;
+    Ok(())
+}
+
+/// Upsert a theme row on behalf of an installed plugin.
+pub fn upsert_theme(
+    db: &Database,
+    id: &str,
+    name: &str,
+    source: &str,
+    colors_json: &str,
+) -> anyhow::Result<()> {
+    db.execute(
+        "INSERT INTO themes (id, name, source, colors_json) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(id) DO UPDATE SET \
+             name = excluded.name, source = excluded.source, colors_json = excluded.colors_json",
+        vec![
+            Value::from(id),
+            Value::from(name),
+            Value::from(source),
+            Value::from(colors_json),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Make `theme_id` the active theme (explicit mode).
+pub fn set_active_theme(db: &Database, theme_id: &str) -> anyhow::Result<()> {
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES ('theme_mode', 'explicit') \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        vec![],
+    )?;
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES ('selected_theme_id', ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        vec![Value::from(theme_id)],
+    )?;
+    Ok(())
+}
+
+/// Revert to system mode (builtin dark in the TUI).
+pub fn clear_theme_selection(db: &Database) -> anyhow::Result<()> {
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES ('theme_mode', 'system') \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        vec![],
+    )?;
+    Ok(())
+}
+
+fn values_to_plugin(row: &Vec<Value>) -> PluginRow {
+    let s = |i: usize| -> String {
+        match row.get(i) {
+            Some(Value::Text(v)) => v.clone(),
+            _ => String::new(),
+        }
+    };
+    let active = matches!(row.get(3), Some(Value::Integer(n)) if *n != 0);
+    PluginRow {
+        id: s(0),
+        source: s(1),
+        dir: s(2),
+        active,
+        installed_at: s(4),
+    }
+}
+
 // ---------- helpers ----------
 
 /// Map a row of `Value`s to a `Goal`. Column order must match

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use anyhow::Context;
 use cordanui_schema::{CreateGoalInput, Goal, GoalStatus, UpdateGoalInput};
 use cordanui_sync::Database;
 
@@ -35,6 +36,22 @@ pub enum Mode {
     },
     /// Help overlay.
     Help,
+    /// Plugin manager popup (installed list + install input).
+    PluginManager {
+        /// Which pane has keyboard focus.
+        pane: PluginPane,
+    },
+    /// Plugin manager's own help page.
+    PluginHelp,
+}
+
+/// Focus within the plugin manager popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PluginPane {
+    /// Browsing the installed-plugins list (default).
+    List,
+    /// Install overlay: typing a query / watching install progress.
+    Install,
 }
 
 /// The text input buffer used in AddGoal / EditTitle / EditDescription modes.
@@ -138,6 +155,14 @@ pub struct App {
     pub input: InputBuffer,
     /// Transient status message shown in the status bar.
     pub message: Option<String>,
+    /// Plugin manager: in-flight task channel (background thread).
+    pub plugin_rx: Option<std::sync::mpsc::Receiver<crate::plugins::TaskEvent>>,
+    /// Plugin manager: current task state rendered in the popup.
+    pub plugin_state: crate::plugins::TaskState,
+    /// Installed plugins (most recent first).
+    pub installed_plugins: Vec<db::PluginRow>,
+    /// Selection index into `installed_plugins`.
+    pub plugin_selected: usize,
 }
 
 impl App {
@@ -160,6 +185,10 @@ impl App {
             mode: Mode::Normal,
             input: InputBuffer::new(),
             message: None,
+            plugin_rx: None,
+            plugin_state: crate::plugins::TaskState::Idle,
+            installed_plugins: Vec::new(),
+            plugin_selected: 0,
         })
     }
 
@@ -507,6 +536,188 @@ impl App {
     pub fn cancel(&mut self) {
         self.mode = Mode::Normal;
         self.input.clear();
+    }
+
+    /// Leader + plugins: open the plugin manager popup (list focused).
+    pub fn open_plugin_manager(&mut self) -> anyhow::Result<()> {
+        self.input.clear();
+        self.reload_installed_plugins()?;
+        self.plugin_selected = 0;
+        self.mode = Mode::PluginManager {
+            pane: PluginPane::List,
+        };
+        Ok(())
+    }
+
+    /// `i` from the list: open the install input overlay.
+    pub fn start_install_mode(&mut self) {
+        self.input.clear();
+        self.mode = Mode::PluginManager {
+            pane: PluginPane::Install,
+        };
+    }
+
+    /// Re-read the plugins registry from the DB.
+    pub fn reload_installed_plugins(&mut self) -> anyhow::Result<()> {
+        self.installed_plugins = db::list_plugins(&self.db)?;
+        let max = self.installed_plugins.len().saturating_sub(1);
+        self.plugin_selected = self.plugin_selected.min(max);
+        Ok(())
+    }
+
+    /// Activate/deactivate the selected plugin. Activating a theme-capable
+    /// plugin applies its first theme pack live; deactivating reverts to
+    /// builtin dark.
+    pub fn toggle_plugin_active(&mut self) -> anyhow::Result<()> {
+        let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
+            return Ok(());
+        };
+        let id = p.id.clone();
+        let dir = std::path::PathBuf::from(&p.dir);
+        let activating = !p.active;
+
+        db::set_plugin_active(&self.db, &id, activating)?;
+
+        // Theme-capable plugins get special handling.
+        let is_theme_plugin = std::fs::read_to_string(dir.join("cordanui.toml"))
+            .ok()
+            .and_then(|t| cordanui_plugin_runtime::PluginManifest::from_str(&t).ok())
+            .map(|m| m.capabilities.theme)
+            .unwrap_or(false);
+
+        let mut msg = if activating {
+            format!("{id} activated")
+        } else {
+            format!("{id} deactivated")
+        };
+
+        if is_theme_plugin {
+            if activating {
+                let themes = crate::plugins::scan_theme_files(&dir);
+                if let Some(t) = themes.first() {
+                    db::set_active_theme(&self.db, &t.id)?;
+                    self.theme = crate::theme::Theme::load(&self.db);
+                    msg = format!("{id} activated — theme '{}' applied", t.name);
+                } else {
+                    msg = format!("{id} activated (no theme packs found)");
+                }
+            } else {
+                db::clear_theme_selection(&self.db)?;
+                self.theme = crate::theme::Theme::load(&self.db);
+                msg = format!("{id} deactivated — reverted to builtin dark");
+            }
+        }
+
+        self.set_message(&msg);
+        self.reload_installed_plugins()
+    }
+
+    /// Uninstall the selected plugin: delete files + registry row.
+    pub fn uninstall_selected_plugin(&mut self) -> anyhow::Result<()> {
+        let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
+            return Ok(());
+        };
+        let dir = std::path::PathBuf::from(&p.dir);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("removing {}", dir.display()))?;
+        }
+        db::remove_plugin_row(&self.db, &p.id)?;
+        self.set_message("plugin uninstalled");
+        self.reload_installed_plugins()
+    }
+
+    /// Dispatch a plugin task for whatever is in the input buffer:
+    /// verify + install a GitHub repo, or run a free-text search.
+    pub fn start_plugin_search(&mut self) {
+        let query = self.input.text.trim().to_string();
+        if query.is_empty() {
+            return;
+        }
+        self.plugin_rx = Some(crate::plugins::spawn_plugin_task(&query));
+        self.plugin_state = crate::plugins::TaskState::Working(Vec::new());
+    }
+
+    /// Drain the in-flight plugin task (non-blocking). Called every loop
+    /// iteration; `Log` events accumulate in the activity log so the popup
+    /// can show live progress (resolving → cloning % → manifest check).
+    pub fn poll_plugin_search(&mut self) -> anyhow::Result<()> {
+        if self.plugin_rx.is_none() {
+            return Ok(());
+        }
+        let rx = self.plugin_rx.take().unwrap();
+        loop {
+            match rx.try_recv() {
+                Ok(crate::plugins::TaskEvent::Log(line)) => {
+                    match &mut self.plugin_state {
+                        crate::plugins::TaskState::Working(log) => {
+                            log.push(line);
+                            // Keep the log bounded.
+                            if log.len() > 60 {
+                                log.drain(..log.len() - 40);
+                            }
+                        }
+                        _ => {
+                            self.plugin_state =
+                                crate::plugins::TaskState::Working(vec![line]);
+                        }
+                    }
+                    // Keep draining; the task may still be running.
+                }
+                Ok(crate::plugins::TaskEvent::Results(r)) => {
+                    self.plugin_state = crate::plugins::TaskState::Results(r);
+                    break;
+                }
+                Ok(crate::plugins::TaskEvent::NotFound(q)) => {
+                    self.plugin_state = crate::plugins::TaskState::NotFound(q);
+                    break;
+                }
+                Ok(crate::plugins::TaskEvent::Error(e)) => {
+                    self.plugin_state = crate::plugins::TaskState::Error(e);
+                    break;
+                }
+                Ok(crate::plugins::TaskEvent::Installed { name, dir, themes }) => {
+                    // Register it (most-recent-first) and refresh the list
+                    // so the page updates on the next frame.
+                    let source = self.input.text.trim().to_string();
+                    let _ = db::add_plugin(&self.db, &name, &source, &dir);
+                    // Import any theme packs into the themes table so they
+                    // can be activated immediately.
+                    for t in &themes {
+                        let _ = db::upsert_theme(&self.db, &t.id, &t.name, &source, &t.colors_json);
+                    }
+                    self.reload_installed_plugins()?;
+                    let msg = if themes.is_empty() {
+                        format!("installed {name}")
+                    } else {
+                        format!("installed {name} (+{} theme{})", themes.len(), if themes.len() == 1 { "" } else { "s" })
+                    };
+                    self.set_message(&msg);
+                    self.plugin_state =
+                        crate::plugins::TaskState::Installed { name, dir, theme_count: themes.len() };
+                    // Done — hand control back to the list.
+                    if matches!(
+                        self.mode,
+                        Mode::PluginManager { pane: PluginPane::Install }
+                    ) {
+                        self.mode = Mode::PluginManager { pane: PluginPane::List };
+                        self.input.clear();
+                    }
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // Still running — put the channel back.
+                    self.plugin_rx = Some(rx);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.plugin_state =
+                        crate::plugins::TaskState::Error("task thread died".into());
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn set_message(&mut self, msg: &str) {

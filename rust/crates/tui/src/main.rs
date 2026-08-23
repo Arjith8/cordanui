@@ -3,12 +3,14 @@
 //! Phase 1: local goal tracker. Goal tree, add/edit/complete/delete/reorder,
 //! local SQLite. No sync, no plugins, no agent mode.
 //!
-//! The agent backend is now a separate optional component at
-//! `plugins/cordanui-agents/` — the TUI has no dependency on it.
+//! The agent backend is an optional external component — the TUI has no
+//! dependency on it; plugins communicate over the JSON-stdio protocol in
+//! `crates/plugin-runtime`.
 
 mod app;
 mod config;
 mod db;
+mod plugins;
 mod theme;
 mod ui;
 
@@ -78,8 +80,17 @@ fn run(
                     break;
                 }
             }
+            Mode::PluginManager { pane } => {
+                if handle_plugin_manager_key(app, key, pane)? {
+                    break;
+                }
+            }
+            Mode::PluginHelp => handle_plugin_help_key(app, key),
             _ => handle_input_key(app, key)?,
         }
+
+        // Non-blocking drain of any in-flight plugin task.
+        app.poll_plugin_search()?;
 
         // Clear transient message after any key in normal mode
         if app.mode == Mode::Normal && !app.leader_pending && app.message.is_some() {
@@ -137,6 +148,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             }
             _ if binds.show_details.matches(key) => app.toggle_details(),
             _ if binds.help.matches(key) => app.mode = Mode::Help,
+            _ if binds.plugins.matches(key) => app.open_plugin_manager()?,
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -190,6 +202,92 @@ fn handle_input_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn handle_plugin_manager_key(
+    app: &mut app::App,
+    key: KeyEvent,
+    pane: app::PluginPane,
+) -> anyhow::Result<bool> {
+    use app::PluginPane;
+
+    // C-d / C-c quit from anywhere (terminal is restored by the run loop).
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return Ok(true);
+    }
+
+    match pane {
+        // Typing an install query.
+        // Install overlay: type a query, Enter installs, Esc returns.
+        PluginPane::Install => match key.code {
+            KeyCode::Esc => {
+                app.input.clear();
+                app.mode = Mode::PluginManager { pane: PluginPane::List };
+            }
+            KeyCode::Enter => {
+                if !app.input.text.trim().is_empty() {
+                    app.start_plugin_search();
+                }
+            }
+            KeyCode::Backspace => app.input.backspace(),
+            KeyCode::Left => app.input.move_left(),
+            KeyCode::Right => app.input.move_right(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.input.clear()
+            }
+            KeyCode::Char(c) => {
+                if c.is_control() {
+                    return Ok(false);
+                }
+                app.input.push_char(c);
+            }
+            _ => {}
+        },
+
+        // Installed-plugins list.
+        PluginPane::List => match key.code {
+            KeyCode::Esc => app.cancel(),
+            KeyCode::Char('?') => app.mode = Mode::PluginHelp,
+            // Open the install input overlay.
+            KeyCode::Char('i') | KeyCode::Char('n') => app.start_install_mode(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if app.plugin_selected > 0 {
+                    app.plugin_selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let max = app.installed_plugins.len().saturating_sub(1);
+                if app.plugin_selected < max {
+                    app.plugin_selected += 1;
+                }
+            }
+            // Activate / deactivate.
+            KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char(' ') => {
+                app.toggle_plugin_active()?
+            }
+            // Uninstall (files + registry row).
+            KeyCode::Char('d') | KeyCode::Delete => app.uninstall_selected_plugin()?,
+            _ => {}
+        },
+    }
+    Ok(false)
+}
+
+fn handle_plugin_help_key(app: &mut app::App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc
+        | KeyCode::Enter
+        | KeyCode::Char('q')
+        | KeyCode::Char('?')
+        | KeyCode::Char('h') => {
+            app.mode = Mode::PluginManager {
+                pane: app::PluginPane::List,
+            };
+        }
+        _ => {}
+    }
 }
 
 fn handle_help_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/schema", "crates/tui", "crates/plugin-runtime", "crates/sync", "plugins/cordanui-agents"]
+members = ["crates/schema", "crates/tui", "crates/plugin-runtime", "crates/sync"]
 
 [workspace.package]
 version = "0.1.0"

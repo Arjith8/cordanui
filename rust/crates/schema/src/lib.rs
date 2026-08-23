@@ -12,7 +12,47 @@ use uuid::Uuid;
 
 /// The canonical SQL schema. Embedded so any Rust client can bootstrap a
 /// local DB on first run without shipping a separate .sql file.
+///
+/// This always describes the **latest** shape — fresh installs get it
+/// directly, existing databases are brought up to date by [`MIGRATIONS`].
 pub const SCHEMA_SQL: &str = include_str!("../../../schema/schema.sql");
+
+/// A single forward-only schema migration.
+///
+/// Invariants:
+/// - Versions are strictly increasing and never edited or reused once
+///   shipped — append new ones at the end.
+/// - `sql` must be idempotent *per version*: it runs at most once per
+///   database (recorded in `_migrations`), so plain DDL is fine.
+/// - Fresh installs never execute these: they get the final schema from
+///   `SCHEMA_SQL` and each migration is recorded as already applied.
+#[derive(Debug, Clone, Copy)]
+pub struct Migration {
+    pub version: i64,
+    pub name: &'static str,
+    pub sql: &'static str,
+}
+
+/// All migrations, oldest first. Applied on every startup; anything already
+/// recorded in `_migrations` is skipped.
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "themes_drop_is_dark_source_is_github_url",
+        sql: "ALTER TABLE themes DROP COLUMN is_dark;",
+    },
+    Migration {
+        version: 2,
+        name: "create_plugins_table",
+        sql: "CREATE TABLE IF NOT EXISTS plugins (\
+                  id           TEXT PRIMARY KEY,\
+                  source       TEXT NOT NULL,\
+                  dir          TEXT NOT NULL,\
+                  active       INTEGER NOT NULL DEFAULT 0,\
+                  installed_at TEXT NOT NULL\
+              );",
+    },
+];
 
 /// Goal lifecycle status. Stored as TEXT in SQLite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

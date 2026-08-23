@@ -33,8 +33,7 @@ CREATE TABLE IF NOT EXISTS themes (
     id           TEXT PRIMARY KEY,        -- 'builtin-dark', 'builtin-light', or UUID for plugin themes
     name         TEXT NOT NULL,
     source       TEXT NOT NULL DEFAULT 'builtin',
-                 -- builtin | plugin
-    is_dark      INTEGER NOT NULL DEFAULT 0,
+                 -- builtin | GitHub repo URL of the plugin that added the theme
     colors_json  TEXT NOT NULL,
     last_used_at TEXT                      -- NULL until explicitly selected; drives MRU ordering
 );
@@ -44,4 +43,14 @@ CREATE TABLE IF NOT EXISTS themes (
 CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
+);
+
+-- Installed plugins. `source` is the GitHub URL the plugin came from;
+-- rows are listed most-recent-first; `active` gates whether the host uses it.
+CREATE TABLE IF NOT EXISTS plugins (
+    id           TEXT PRIMARY KEY,        -- manifest [plugin].name
+    source       TEXT NOT NULL,           -- GitHub repo URL
+    dir          TEXT NOT NULL,           -- install directory on disk
+    active       INTEGER NOT NULL DEFAULT 0,
+    installed_at TEXT NOT NULL
 );

@@ -5,13 +5,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
 use cordanui_schema::GoalStatus;
 
-use crate::app::{App, Mode};
+use crate::app::{App, Mode, PluginPane};
 
 /// Status glyph + color for each goal status.
 fn status_style<'a>(status: GoalStatus, c: &'a ThemeColors) -> (&'static str, Color) {
@@ -49,6 +49,12 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     if let Mode::ConfirmDelete { goal_id } = &app.mode {
         render_delete_confirm(frame, goal_id, &app.theme.colors);
+    }
+    if let Mode::PluginManager { pane } = &app.mode {
+        render_plugin_manager(app, pane.clone(), frame);
+    }
+    if app.mode == Mode::PluginHelp {
+        render_plugin_help(app, frame);
     }
 }
 
@@ -213,6 +219,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
         Mode::ConfirmDelete { .. } => (" DELETE ".to_string(), String::new()),
         Mode::Help => (" HELP ".to_string(), String::new()),
+        Mode::PluginManager { .. } | Mode::PluginHelp => (" PLUGIN ".to_string(), app.input.text.clone()),
     };
 
     let label_style = match &app.mode {
@@ -220,6 +227,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::AddGoal { .. } | Mode::EditTitle { .. } | Mode::EditDescription { .. } => {
             Style::default().fg(c.accent)
         }
+        Mode::PluginManager { .. } | Mode::PluginHelp => Style::default().fg(c.accent),
         Mode::ConfirmDelete { .. } => Style::default().fg(c.danger),
         Mode::Help => Style::default().fg(c.accent),
     };
@@ -232,7 +240,10 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         leader_span,
         Span::styled(label, label_style),
         Span::styled(text, Style::default().fg(c.text)),
-        if matches!(app.mode, Mode::AddGoal { .. } | Mode::EditTitle { .. } | Mode::EditDescription { .. }) {
+        if matches!(
+            app.mode,
+            Mode::AddGoal { .. } | Mode::EditTitle { .. } | Mode::EditDescription { .. } | Mode::PluginManager { .. }
+        ) {
             Span::styled("│", Style::default().fg(c.text_dim))
         } else {
             Span::raw("")
@@ -263,6 +274,13 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::EditDescription { .. } => "Enter to save · Esc to cancel".into(),
         Mode::ConfirmDelete { .. } => "y to confirm · n/Esc to cancel".into(),
         Mode::Help => "Esc/q to close help".into(),
+        Mode::PluginManager { pane: PluginPane::Install } => {
+            "GitHub link / owner/repo / terms · Enter install · Esc back".into()
+        }
+        Mode::PluginManager { pane: PluginPane::List } => {
+            "i install · ↑↓ select · Enter activate · d uninstall · ? help · Esc close".into()
+        }
+        Mode::PluginHelp => "Esc/q to close".into()
     };
 
     let line = Line::from(vec![Span::styled(
@@ -337,6 +355,7 @@ fn render_help_overlay(app: &App, frame: &mut Frame, c: &ThemeColors) {
 
 fn render_delete_confirm(frame: &mut Frame, goal_id: &str, c: &ThemeColors) {
     let area = centered_rect(50, 25, frame.area());
+    frame.render_widget(Clear, area);
     let block = Block::default()
         .title(" Confirm Delete ")
         .borders(Borders::ALL)
@@ -363,9 +382,240 @@ fn render_delete_confirm(frame: &mut Frame, goal_id: &str, c: &ThemeColors) {
     frame.render_widget(&paragraph, area);
 }
 
+/// Spinner frames for in-progress popups (advanced on a 200ms tick).
+const SPINNER: [&str; 6] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴"];
+
+/// Plugin manager popup.
+///
+/// - List pane: installed plugins only, nothing else competing for space.
+/// - Install pane (`i`): an accent-bordered input box overlays the top with
+///   live git progress streaming beneath it; on success the popup returns
+///   to the list, which now contains the new entry.
+fn render_plugin_manager(app: &mut App, pane: PluginPane, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(76, 72, frame.area());
+    frame.render_widget(Clear, area);
+
+    let outer = Block::default()
+        .title(" Plugin Manager ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.accent));
+    let inner = outer.inner(area);
+    frame.render_widget(&outer, area);
+
+    match pane {
+        PluginPane::Install => {
+            // Input box on top…
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1)])
+                .split(inner);
+            let input_block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(c.accent).add_modifier(Modifier::BOLD))
+                .title(Span::styled(
+                    " install — GitHub link / owner/repo / terms ",
+                    Style::default().fg(c.accent),
+                ));
+            let placeholder = if app.input.text.is_empty() {
+                Span::styled("https://github.com/…", Style::default().fg(c.text_faint))
+            } else {
+                Span::raw("")
+            };
+            let line = Line::from(vec![
+                Span::styled(format!(" {}", app.input.text.clone()), Style::default().fg(c.text)),
+                placeholder,
+                Span::styled("│", Style::default().fg(c.accent)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(line).block(input_block),
+                chunks[0],
+            );
+
+            // …live task status below it.
+            let mut lines = Vec::new();
+            push_task_status(&app.plugin_state, c, &mut lines);
+            if lines.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  Enter to start the install — Esc to cancel.",
+                    Style::default().fg(c.text_faint),
+                )));
+            }
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
+                chunks[1],
+            );
+        }
+
+        PluginPane::List => {
+            // Last task outcome (if any) shown briefly above the list.
+            let mut lines = Vec::new();
+            push_task_status(&app.plugin_state, c, &mut lines);
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+
+            if app.installed_plugins.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "  Nothing installed yet. Press i to install a plugin.",
+                    Style::default().fg(c.text_faint),
+                )));
+            } else {
+                for (i, p) in app.installed_plugins.iter().enumerate() {
+                    let selected = i == app.plugin_selected;
+                    let cursor = if selected { "▶ " } else { "  " };
+                    let style = if selected {
+                        Style::default().fg(c.text).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(c.text)
+                    };
+                    let state = if p.active { "[active]" } else { "[     ]" };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {cursor}"), Style::default().fg(c.accent)),
+                        Span::styled(format!("{:<18}", truncate_str(&p.id, 17)), style),
+                        Span::styled(
+                            format!("{:>8} ", state),
+                            if p.active {
+                                Style::default().fg(c.status_done)
+                            } else {
+                                Style::default().fg(c.text_faint)
+                            },
+                        ),
+                        Span::styled(truncate_str(&p.source, 34), Style::default().fg(c.text_faint)),
+                    ]));
+                }
+            }
+
+            frame.render_widget(
+                Paragraph::new(lines).wrap(Wrap { trim: false }),
+                inner,
+            );
+        }
+    }
+}
+
+/// Render the current task state as log lines into `lines`.
+fn push_task_status(
+    state: &crate::plugins::TaskState,
+    c: &ThemeColors,
+    lines: &mut Vec<Line<'static>>,
+) {
+    match state {
+        crate::plugins::TaskState::Idle => {}
+        crate::plugins::TaskState::Working(log) => {
+            let f = SPINNER[(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() / 200 % (SPINNER.len() as u128))
+                .unwrap_or(0) as usize)];
+            lines.push(Line::from(Span::styled(
+                format!(" {f} working…"),
+                Style::default().fg(c.status_wip).add_modifier(Modifier::BOLD),
+            )));
+            for entry in log.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+                lines.push(Line::from(Span::styled(
+                    format!("   {entry}"),
+                    Style::default().fg(c.text_dim),
+                )));
+            }
+        }
+        crate::plugins::TaskState::Installed { name, dir, theme_count } => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " ✓ Installed {name}{}",
+                    if *theme_count > 0 {
+                        format!(" (+{} theme{})", theme_count, if *theme_count == 1 { "" } else { "s" })
+                    } else {
+                        String::new()
+                    }
+                ),
+                Style::default().fg(c.status_done).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                format!("   at {dir}"),
+                Style::default().fg(c.text_faint),
+            )));
+        }
+        crate::plugins::TaskState::Results(repos) => {
+            for r in repos {
+                lines.push(Line::from(Span::styled(
+                    format!(" {}", r.summary()),
+                    Style::default().fg(c.text),
+                )));
+            }
+        }
+        crate::plugins::TaskState::NotFound(q) => {
+            lines.push(Line::from(Span::styled(
+                format!(" No repo found for '{q}'."),
+                Style::default().fg(c.danger),
+            )));
+        }
+        crate::plugins::TaskState::Error(e) => {
+            lines.push(Line::from(Span::styled(
+                format!(" Error: {e}"),
+                Style::default().fg(c.danger),
+            )));
+        }
+    }
+}
+
+/// Truncate a string on char boundaries with an ellipsis.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// The plugin manager's own help page.
+fn render_plugin_help(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(55, 55, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Plugin Manager Help ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.accent));
+
+    let l = app.keybinds.leader.label();
+    let p = app.keybinds.plugins.label();
+    let lines = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("  Open: {l}+{p}"),
+            Style::default().fg(c.accent).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(""),
+        Line::from("  ↑ / ↓, j / k     move selection"),
+        Line::from("    Enter / a      activate · deactivate plugin"),
+        Line::from("    d              uninstall (files + registry)"),
+        Line::from("    i              open the install input box"),
+        Line::from("    Enter          install from the input"),
+        Line::from("    ?              this help"),
+        Line::from("    Esc            close"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Installs clone the repo into",
+            Style::default().fg(c.text_faint),
+        )),
+        Line::from(Span::styled(
+            "  ~/.local/share/cordanui/plugins/<repo>",
+            Style::default().fg(c.text_faint),
+        )),
+        Line::from(Span::styled(
+            "  and register it active, most recent first.",
+            Style::default().fg(c.text_faint),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().fg(c.text));
+    frame.render_widget(&paragraph, area);
+}
+
 /// Helper: centered rect for overlays.
-fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let pop_h = area.height * percent_y / 100;
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {    let pop_h = area.height * percent_y / 100;
     let pop_w = area.width * percent_x / 100;
     let y = area.y + (area.height - pop_h) / 2;
     let x = area.x + (area.width - pop_w) / 2;

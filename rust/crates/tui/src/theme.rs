@@ -82,7 +82,7 @@ const BUILTIN_DARK_ID: &str = "builtin-dark";
 const BUILTIN_LIGHT_ID: &str = "builtin-light";
 
 const SEED_BUILTINS_SQL: &str = "INSERT OR IGNORE INTO themes \
-     (id, name, source, is_dark, colors_json) VALUES (?, ?, 'builtin', ?, ?)";
+     (id, name, source, colors_json) VALUES (?, ?, 'builtin', ?)";
 
 // Full token maps so rows are interchangeable with the mobile client's
 // seeds (same keys as ThemeColors camelCased).
@@ -122,7 +122,6 @@ impl Theme {
             vec![
                 Value::from(BUILTIN_DARK_ID),
                 Value::from("Cordanui Dark"),
-                Value::from(1),
                 Value::from(DARK_COLORS_JSON),
             ],
         )?;
@@ -131,7 +130,6 @@ impl Theme {
             vec![
                 Value::from(BUILTIN_LIGHT_ID),
                 Value::from("Cordanui Light"),
-                Value::from(0),
                 Value::from(LIGHT_COLORS_JSON),
             ],
         )?;

@@ -27,6 +27,9 @@ cycle_status = "tab"
 # <leader> + help: open the help page.
 help = "h"
 
+# <leader> + plugins: open the plugin manager popup.
+plugins = "p"
+
 [turso]
 # Your Turso database URL (libsql://...).
 # Create a database at https://turso.tech/app

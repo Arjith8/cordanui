@@ -135,9 +135,58 @@ impl Database {
         let db = Arc::new(db);
         let conn = runtime.block_on(async { db.connect() })?;
 
-        // Apply schema
+        // Apply schema + migrations. This runs on every startup; the
+        // `_migrations` table records what has been applied so each
+        // migration executes at most once per database.
         runtime.block_on(async {
-            conn.execute_batch(cordanui_schema::SCHEMA_SQL).await
+            // Does this database predate the migration system? (A DB with a
+            // `goals` table was created before/without migrations; a fresh
+            // empty file gets the latest schema directly and only needs its
+            // migrations recorded.)
+            let mut rows = conn
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'goals'",
+                    Vec::<Value>::new(),
+                )
+                .await?;
+            let pre_existing = rows.next().await?.is_some();
+
+            conn.execute_batch(cordanui_schema::SCHEMA_SQL).await?;
+
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS _migrations (\
+                     version    INTEGER PRIMARY KEY,\
+                     name       TEXT NOT NULL,\
+                     applied_at TEXT NOT NULL\
+                 );",
+            )
+            .await?;
+
+            for m in cordanui_schema::MIGRATIONS {
+                let mut rows = conn
+                    .query(
+                        "SELECT 1 FROM _migrations WHERE version = ?",
+                        vec![Value::from(m.version)],
+                    )
+                    .await?;
+                if rows.next().await?.is_some() {
+                    continue; // already applied
+                }
+
+                if pre_existing {
+                    conn.execute_batch(m.sql).await?;
+                }
+                // Fresh installs: SCHEMA_SQL already produced the final
+                // shape — just record the migration as applied.
+
+                conn.execute(
+                    "INSERT INTO _migrations (version, name, applied_at) \
+                     VALUES (?, ?, datetime('now'))",
+                    vec![Value::from(m.version), Value::from(m.name)],
+                )
+                .await?;
+            }
+            Ok::<(), anyhow::Error>(())
         })?;
 
         // Enable foreign keys
@@ -354,5 +403,115 @@ mod tests {
         // (we can't easily test the real path, but we can test the logic)
         let config = SyncConfig::default();
         assert!(!config.is_sync_enabled());
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cordanui-sync-mig-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("test.db")
+    }
+
+    #[test]
+    fn fresh_db_records_migrations_without_running_them() {
+        let db = Database::open(&SyncConfig {
+            db_path: temp_db("fresh"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Every migration is recorded as applied…
+        let result = db
+            .query_simple("SELECT version FROM _migrations ORDER BY version")
+            .unwrap();
+        let versions: Vec<i64> = result
+            .rows()
+            .iter()
+            .map(|r| match &r[0] {
+                Value::Integer(n) => *n,
+                v => panic!("expected integer version, got {v:?}"),
+            })
+            .collect();
+        let expected: Vec<i64> = cordanui_schema::MIGRATIONS.iter().map(|m| m.version).collect();
+        assert_eq!(versions, expected);
+
+        // …and the final schema already reflects them (no `is_dark`).
+        assert!(db.query_simple("SELECT is_dark FROM themes LIMIT 1").is_err());
+    }
+
+    #[test]
+    fn legacy_db_gets_migrated() {
+        use tokio::runtime::Builder;
+
+        let path = temp_db("legacy");
+
+        // Simulate a database created before the migration system: old
+        // themes shape (with `is_dark`) and no `_migrations` table.
+        {
+            let rt = Builder::new_current_thread().enable_all().build().unwrap();
+            let raw = rt.block_on(async { libsql::Builder::new_local(&path).build().await }).unwrap();
+            let conn = rt.block_on(async { raw.connect() }).unwrap();
+            rt.block_on(async {
+                conn.execute_batch(
+                    "CREATE TABLE goals (\
+                         id           TEXT PRIMARY KEY,\
+                         title        TEXT NOT NULL,\
+                         description  TEXT,\
+                         status       TEXT NOT NULL DEFAULT 'pending',\
+                         parent_id    TEXT REFERENCES goals(id) ON DELETE CASCADE,\
+                         sort_order   INTEGER NOT NULL DEFAULT 0,\
+                         created_at   TEXT NOT NULL,\
+                         updated_at   TEXT NOT NULL,\
+                         completed_at TEXT,\
+                         agent_status   TEXT,\
+                         agent_result   TEXT,\
+                         agent_progress TEXT,\
+                         metadata       TEXT\
+                     );",
+                )
+                .await
+                .unwrap();
+                conn.execute_batch(
+                    "CREATE TABLE themes (\
+                         id          TEXT PRIMARY KEY,\
+                         name        TEXT NOT NULL,\
+                         source      TEXT NOT NULL DEFAULT 'builtin',\
+                         is_dark     INTEGER NOT NULL DEFAULT 0,\
+                         colors_json TEXT NOT NULL\
+                     );",
+                )
+                .await
+                .unwrap();
+            });
+            // Drop the runtime so the file handle is released.
+            drop(conn);
+            drop(raw);
+            drop(rt);
+        }
+
+        let db = Database::open(&SyncConfig {
+            db_path: path,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // Migration ran: the column is gone but the data survives.
+        assert!(db.query_simple("SELECT is_dark FROM themes LIMIT 1").is_err());
+        db.execute(
+            "INSERT INTO themes (id, name, source, colors_json) VALUES ('t1', 'T', 'https://github.com/x/y', '{}')",
+            vec![],
+        )
+        .unwrap();
+
+        // …and it was recorded exactly once.
+        let result = db
+            .query_simple(
+                "SELECT COUNT(*) FROM _migrations WHERE name LIKE 'themes_drop_is_dark%'",
+            )
+            .unwrap();
+        match &result.rows()[0][0] {
+            Value::Integer(n) => assert_eq!(*n, 1),
+            v => panic!("expected count, got {v:?}"),
+        }
     }
 }
