@@ -8,6 +8,10 @@ A cordanui plugin is a **standalone executable** that the host spawns as a
 subprocess and talks to over **JSON on stdin/stdout**. No shared libraries,
 no linking, no special runtime. Any language works; examples are in Rust.
 
+Building an LLM **provider** (OpenAI/Anthropic-style gateways)? Read
+[`AGENTS-PROVIDERS.md`](./AGENTS-PROVIDERS.md) after this — it adds the
+upstream API specs and validation rules.
+
 ---
 
 ## 1. Repository layout
@@ -325,3 +329,64 @@ Contract:
   detected and validated.
 - Builds run `[build].cmd` inside the cloned repo dir. Keep builds hermetic;
   pin dependency versions.
+
+---
+
+## 9. Declarative settings (`[[field]]`) — plugins that need user input
+
+Plugins can ask the host for user-configurable values (API keys, base
+URLs, default models) by declaring a form in `cordanui.toml`. The host
+renders it, stores the answers, and hands them back to your subprocess on
+every invocation. Plugins never touch the database and never prompt at
+runtime.
+
+```toml
+[[field]]
+key = "api_key"          # required; unique within the manifest
+label = "API Key"        # shown in the form
+type = "secret"          # text | secret | number | bool | select
+required = true
+
+[[field]]
+key = "base_url"
+type = "text"
+default = "https://example.com/v1"
+
+[[field]]
+key = "model"
+type = "select"
+options = ["glm-5.2", "kimi-k3"]
+default = "glm-5.2"
+
+[[field]]
+key = "stream"
+type = "bool"
+default = "true"
+```
+
+Contract:
+
+- **Authoring rules**: keys must be unique and non-empty; `select` requires
+  non-empty `options` and its `default` must be one of them; `bool`
+  defaults are `"true"`/`"false"` strings; `number` defaults must parse.
+  The host validates all of this and refuses to open a broken form.
+- **Storage**: values live in the host's shared key-value `settings` table
+  under `<plugin.name>.<field.key>`. You cannot read or write outside your
+  namespace. Secrets render masked in the UI (stored as plain text today;
+  keyring migration is planned — don't rely on the storage being encrypted).
+- **How you receive values**: on every invocation the host collects your
+  stored values into a JSON object and passes it as the `config` field of
+  `CompleteRequest` / `AgentRunConfig`:
+
+  ```json
+  { "task_id": "…", "title": "…", "config": {
+      "api_key": "sk-…", "base_url": "https://example.com/v1",
+      "model": "glm-5.2", "stream": "true" } }
+  ```
+
+  All values arrive as **strings** regardless of field type. Absent
+  optional fields may be missing from `config` entirely — tolerate it and
+  fall back to sensible defaults.
+- **User flow**: plugin manager → select plugin → `c` (Configure). There is
+  no runtime prompting: if a required value is unset, fail fast with an
+  `error` event telling the user to run *Configure* on your plugin.
