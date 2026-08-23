@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "cordanui",
+    "slug": "cordanui-mobile",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.cordanui.mobile"
+    },
+    "android": {
+      "package": "com.cordanui.mobile"
+    },
+    "scheme": "cordanui",
+    "plugins": ["expo-sqlite"]
+  }
+}
