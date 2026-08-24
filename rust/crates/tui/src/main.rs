@@ -10,7 +10,7 @@
 mod app;
 mod config;
 mod db;
-mod plugin_ui;
+pub mod plugin_ui;
 mod plugins;
 mod style;
 mod theme;
@@ -94,6 +94,7 @@ fn run(
             Mode::AgentPicker { .. } => handle_agent_picker_key(app, key)?,
             Mode::PluginModal => handle_plugin_modal_key(app, key),
             Mode::PluginPanel => handle_plugin_panel_key(app, key),
+            Mode::Command => handle_command_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
@@ -104,6 +105,7 @@ fn run(
         app.apply_style_updates()?;
         app.poll_plugin_ui_requests();
         app.poll_plugin_panel();
+        app.poll_command_results();
 
         // Clear transient message after any key in normal mode
         if app.mode == Mode::Normal && !app.leader_pending && app.message.is_some() {
@@ -165,6 +167,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
                     app.open_agent_picker(row.goal.id.clone())?;
                 }
             }
+            _ if binds.commands.matches(key) => app.open_command_mode(),
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -396,6 +399,27 @@ fn handle_confirm_delete_key(app: &mut app::App, key: KeyEvent) -> anyhow::Resul
         _ => {}
     }
     Ok(())
+}
+
+/// Keys in the command line. Enter runs the first matching command on a
+/// worker thread; its result surfaces via the status line.
+fn handle_command_key(app: &mut app::App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel(),
+        KeyCode::Enter => {
+            let cmd = app.command_matches().into_iter().next();
+            if let Some(cmd) = cmd {
+                app.execute_plugin_command(&cmd);
+            } else {
+                app.set_message("no matching command");
+            }
+        }
+        KeyCode::Backspace => {
+            app.input.backspace();
+        }
+        KeyCode::Char(c) if !c.is_control() => app.input.push_char(c),
+        _ => {}
+    }
 }
 
 /// Keys in a plugin-owned panel (`cord.ui.show_panel`). Keys are forwarded

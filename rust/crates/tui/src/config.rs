@@ -139,6 +139,8 @@ pub struct Keybinds {
     pub plugins: KeyBinding,
     /// `<leader> + this` runs the selected goal through a provider plugin.
     pub run_agent: KeyBinding,
+    /// `<leader> + this` opens the plugin-command line.
+    pub commands: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -151,6 +153,7 @@ impl Default for Keybinds {
             help: KeyBinding::parse("h").unwrap(),
             plugins: KeyBinding::parse("p").unwrap(),
             run_agent: KeyBinding::parse("r").unwrap(),
+            commands: KeyBinding::parse(";").unwrap(),
         }
     }
 }
@@ -192,6 +195,7 @@ impl Keybinds {
             help: get("help", &defaults.help),
             plugins: get("plugins", &defaults.plugins),
             run_agent: get("run_agent", &defaults.run_agent),
+            commands: get("commands", &defaults.commands),
         }
     }
 

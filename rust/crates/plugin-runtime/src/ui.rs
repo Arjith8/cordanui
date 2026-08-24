@@ -127,12 +127,18 @@ pub enum Widget {
 
 impl Widget {
     pub fn text(content: impl Into<String>) -> Self {
-        Self::Text { content: content.into(), fg: None, bold: false }
+        Self::Text {
+            content: content.into(),
+            fg: None,
+            bold: false,
+        }
     }
 
     /// An empty tree (renders nothing).
     pub fn empty() -> Self {
-        Self::Column { children: Vec::new() }
+        Self::Column {
+            children: Vec::new(),
+        }
     }
 
     /// Extract a widget tree from a Lua value. Accepted shapes:
@@ -156,7 +162,10 @@ impl Widget {
         };
 
         if let Ok(items) = t.get::<Vec<String>>("items") {
-            let highlight: Option<usize> = t.get::<mlua::Integer>("highlight").ok().map(|n| (n - 1).max(0) as usize);
+            let highlight: Option<usize> = t
+                .get::<mlua::Integer>("highlight")
+                .ok()
+                .map(|n| (n - 1).max(0) as usize);
             return Ok(Some(Self::List { items, highlight }));
         }
         if let Ok(children_values) = t.get::<Vec<LuaValue>>("children") {

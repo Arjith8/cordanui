@@ -58,6 +58,13 @@ use crate::ui::{PanelSpec, SharedPanelHost, SharedUiHost, UiLevel, UiRequest, Ui
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
 
+/// A command registered by a plugin via `plugin.commands`.
+#[derive(Debug, Clone)]
+pub struct CommandInfo {
+    pub name: String,
+    pub desc: String,
+}
+
 /// Host capabilities handed to a plugin at load time. Everything is
 /// optional: absent surfaces make the corresponding `cord.*` calls error
 /// cleanly instead of existing silently.
@@ -147,14 +154,70 @@ impl LuaPlugin {
             .globals()
             .get("plugin")
             .context("main.lua must define a global `plugin` table")?;
-        if !plugin.contains_key("complete")? && !plugin.contains_key("agent_run")? {
-            bail!("plugin table defines neither complete nor agent_run");
+        let has_provider = plugin.contains_key("complete")? || plugin.contains_key("agent_run")?;
+        let has_commands = plugin.contains_key("commands")?;
+        if !has_provider && !has_commands {
+            bail!("plugin table defines neither complete, agent_run, nor commands");
         }
 
         Ok(Self {
             lua,
             name: name.to_string(),
         })
+    }
+
+    /// Registered commands from the optional `plugin.commands` table:
+    ///
+    /// ```lua
+    /// plugin.commands = {
+    ///   ["rose-pine.select"] = { run = M.select, desc = "Pick a flavor" },
+    /// }
+    /// ```
+    ///
+    /// Entries without a `run` function are skipped. Sorted by name.
+    pub fn list_commands(&self) -> Vec<CommandInfo> {
+        let mut out = Vec::new();
+        let Ok(commands): mlua::Result<Table> = self
+            .lua
+            .globals()
+            .get("plugin")
+            .and_then(|p: Table| p.get("commands"))
+        else {
+            return out;
+        };
+        for pair in commands.pairs::<String, Table>().flatten() {
+            let (name, entry) = pair;
+            if entry.get::<Function>("run").is_err() {
+                continue;
+            }
+            let desc = entry.get::<String>("desc").unwrap_or_default();
+            out.push(CommandInfo { name, desc });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Invoke a registered command. The command runs to completion and may
+    /// open dialogs (`cord.ui.*`) or panels while it runs. If it returns a
+    /// string, the host surfaces it as a status message.
+    pub async fn call_command(&self, name: &str) -> Result<Option<String>> {
+        let plugin: Table = self.lua.globals().get("plugin")?;
+        let commands: Table = plugin
+            .get("commands")
+            .context("plugin does not define a commands table")?;
+        let entry: Table = commands
+            .get(name)
+            .with_context(|| format!("no command named '{name}'"))?;
+        let run: Function = entry.get("run").context("command has no run function")?;
+
+        match run
+            .call_async::<LuaValue>(())
+            .await
+            .map_err(|e| anyhow::anyhow!("command '{name}' failed: {e}"))?
+        {
+            LuaValue::String(s) => Ok(Some(s.to_string_lossy())),
+            _ => Ok(None),
+        }
     }
 
     /// One-shot completion: calls `plugin.complete(request)`, converts the
@@ -714,7 +777,11 @@ fn register_cord_ui(
                         .unwrap_or(false)
                 });
 
-                host.open_panel(PanelSpec { title, draw, on_key });
+                host.open_panel(PanelSpec {
+                    title,
+                    draw,
+                    on_key,
+                });
                 Ok(true)
             }
         })?,
@@ -1036,9 +1103,8 @@ end
             "base_url": "http://127.0.0.1:1", // unreachable; we only load
             "default_model": "grok-code",
         });
-        let _plugin =
-            LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), HostHooks::new())
-                .expect("provider-zen should load");
+        let _plugin = LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), HostHooks::new())
+            .expect("provider-zen should load");
     }
 
     // ---------- cord.* styling ----------
@@ -1099,7 +1165,13 @@ end
     async fn cord_styling_routes_g_and_local() {
         let dir = fixture("styles", STYLES_LUA);
         let host = Arc::new(MockStyles::default());
-        let plugin = LuaPlugin::load(&dir, "styles", None, HostHooks::new().with_styles(host.clone())).unwrap();
+        let plugin = LuaPlugin::load(
+            &dir,
+            "styles",
+            None,
+            HostHooks::new().with_styles(host.clone()),
+        )
+        .unwrap();
 
         let resp = plugin
             .complete(&CompleteRequest {
@@ -1148,7 +1220,13 @@ end
 "##,
         );
         let host = Arc::new(MockStyles::default());
-        let plugin = LuaPlugin::load(&dir, "styles-reset", None, HostHooks::new().with_styles(host.clone())).unwrap();
+        let plugin = LuaPlugin::load(
+            &dir,
+            "styles-reset",
+            None,
+            HostHooks::new().with_styles(host.clone()),
+        )
+        .unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "m".into(),
@@ -1187,6 +1265,67 @@ end
             })
             .await
             .unwrap()
+    }
+
+    /// Combined style+ui(+panel) test host with an answer queue. Popped
+    /// LIFO; empty queue falls back to each dialog kind's cancel value.
+    #[derive(Default)]
+    struct QueueHost {
+        queue: std::sync::Mutex<Vec<UiResponse>>,
+        persistent: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        session: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+        notifications: std::sync::Mutex<Vec<(String, String)>>,
+    }
+    impl crate::style::StyleHost for QueueHost {
+        fn set(&self, persistent: bool, var: &str, hex: &str) {
+            let map = if persistent {
+                &self.persistent
+            } else {
+                &self.session
+            };
+            map.lock().unwrap().insert(var.into(), hex.into());
+        }
+        fn clear(&self, persistent: bool, var: &str) {
+            let map = if persistent {
+                &self.persistent
+            } else {
+                &self.session
+            };
+            map.lock().unwrap().remove(var);
+        }
+        fn clear_all(&self, persistent: bool) {
+            let map = if persistent {
+                &self.persistent
+            } else {
+                &self.session
+            };
+            map.lock().unwrap().clear();
+        }
+        fn resolved(&self, var: &str) -> Option<String> {
+            self.session.lock().unwrap().get(var).cloned()
+        }
+    }
+    impl crate::ui::UiHost for QueueHost {
+        fn submit(&self, pending: crate::ui::PendingUi) {
+            let canned = self.queue.lock().unwrap().pop();
+            let response = canned.unwrap_or_else(|| match &pending.request {
+                UiRequest::Input { .. } | UiRequest::Text { .. } => UiResponse::Text(None),
+                UiRequest::Confirm { .. } => UiResponse::Confirmed(false),
+                UiRequest::Pick { .. } => UiResponse::Choice(None),
+                UiRequest::MultiSelect { .. } => UiResponse::Choices(None),
+            });
+            let _ = pending.respond.send(response);
+        }
+        fn notify(&self, level: crate::ui::UiLevel, message: String) {
+            self.notifications
+                .lock()
+                .unwrap()
+                .push((level.as_str().to_string(), message));
+        }
+    }
+    impl crate::ui::PanelHost for QueueHost {
+        fn open_panel(&self, _spec: crate::ui::PanelSpec) {}
+        fn close_panel(&self) {}
     }
 
     /// A host that answers every dialog with a canned response.
@@ -1455,7 +1594,8 @@ end
             *self.spec.lock().unwrap() = Some(spec);
         }
         fn close_panel(&self) {
-            self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1489,9 +1629,13 @@ end
 "##,
         );
         let host = std::sync::Arc::new(CapturedPanel::default());
-        let plugin =
-            LuaPlugin::load(&dir, "panel", None, HostHooks::new().with_panels(host.clone()))
-                .unwrap();
+        let plugin = LuaPlugin::load(
+            &dir,
+            "panel",
+            None,
+            HostHooks::new().with_panels(host.clone()),
+        )
+        .unwrap();
 
         // Drive complete() to completion on this thread's runtime; the
         // panel call itself is non-blocking, so complete() finishes only
@@ -1523,8 +1667,13 @@ end
             Widget::Column { children } => {
                 assert!(matches!(&children[0],
                     Widget::Text { content, .. } if content == "sel=1"));
-                assert!(matches!(&children[1],
-                    Widget::List { highlight: Some(0), .. }));
+                assert!(matches!(
+                    &children[1],
+                    Widget::List {
+                        highlight: Some(0),
+                        ..
+                    }
+                ));
             }
             other => panic!("expected column, got {other:?}"),
         }
@@ -1549,4 +1698,68 @@ end
         cleanup("panel");
     }
 
+    // ---------- plugin.commands ----------
+
+    #[test]
+    fn commands_list_and_invoke_with_dialog() {
+        let dir = fixture(
+            "commands",
+            r##"
+plugin = {}
+local M = {}
+
+function M.select()
+  local flavors = { "rose-pine", "moon", "dawn" }
+  local idx = cord.ui.pick{ title = "Flavor", items = flavors }
+  if not idx then return "cancelled" end
+  cord.g.style.primary("#ebbcba")
+  return "switched to " .. flavors[idx]
+end
+
+plugin.commands = {
+  ["rose-pine.select"] = { run = M.select, desc = "Pick a flavor" },
+  ["broken.no-run"] = { desc = "no run fn - must be skipped" },
+}
+"##,
+        );
+        let host = Arc::new(QueueHost::default());
+        (*host.queue.lock().unwrap()).push(UiResponse::Choice(Some(1)));
+        let plugin = LuaPlugin::load(
+            &dir,
+            "commands",
+            None,
+            HostHooks::new()
+                .with_styles(host.clone())
+                .with_ui(host.clone()),
+        )
+        .unwrap();
+
+        // Registry listing: the run-less entry is skipped, sorted by name.
+        let cmds = plugin.list_commands();
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name, "rose-pine.select");
+        assert_eq!(cmds[0].desc, "Pick a flavor");
+
+        // Invoke: the awaited pick is answered by the mock queue.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let msg = rt
+            .block_on(plugin.call_command("rose-pine.select"))
+            .unwrap();
+        assert_eq!(msg.as_deref(), Some("switched to moon"));
+        // The command restyled through cord.g.
+        assert_eq!(
+            host.persistent.lock().unwrap().get("primary"),
+            Some(&"#ebbcba".to_string())
+        );
+
+        // Unknown names are clean errors.
+        let err = rt
+            .block_on(plugin.call_command("rose-pine.does-not-exist"))
+            .unwrap_err();
+        assert!(err.to_string().contains("no command named"), "{err}");
+        cleanup("commands");
+    }
 }

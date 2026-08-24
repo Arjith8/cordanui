@@ -83,6 +83,18 @@ impl PanelHost for PluginUiBridge {
     }
 }
 
+/// The standard host hooks for TUI-loaded Lua plugins: styling bridge,
+/// dialog/notify bridge, and panel commands all through one bridge.
+pub fn plugin_runtime_hooks(
+    styles: &std::sync::Arc<crate::style::StyleBridge>,
+    ui: &std::sync::Arc<PluginUiBridge>,
+) -> cordanui_plugin_runtime::HostHooks {
+    cordanui_plugin_runtime::HostHooks::new()
+        .with_styles(styles.clone())
+        .with_ui(ui.clone())
+        .with_panels(ui.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,7 +173,13 @@ end
         std::thread::scope(|scope| {
             let styles = app.styles.clone();
             let ui = app.plugin_ui.clone();
-            let plugin = LuaPlugin::load(&plug_dir, "asker", None, HostHooks::new().with_styles(styles).with_ui(ui)).unwrap();
+            let plugin = LuaPlugin::load(
+                &plug_dir,
+                "asker",
+                None,
+                HostHooks::new().with_styles(styles).with_ui(ui),
+            )
+            .unwrap();
 
             let answer = scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -257,7 +275,13 @@ end
         std::thread::scope(|scope| {
             let styles = app.styles.clone();
             let ui = app.plugin_ui.clone();
-            let plugin = LuaPlugin::load(&plug_dir, "asker", None, HostHooks::new().with_styles(styles).with_ui(ui)).unwrap();
+            let plugin = LuaPlugin::load(
+                &plug_dir,
+                "asker",
+                None,
+                HostHooks::new().with_styles(styles).with_ui(ui),
+            )
+            .unwrap();
 
             let answer = scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -353,7 +377,13 @@ end
         std::thread::scope(|scope| {
             let styles = app.styles.clone();
             let ui = app.plugin_ui.clone();
-            let plugin = LuaPlugin::load(&plug_dir, "asker", None, HostHooks::new().with_styles(styles).with_ui(ui)).unwrap();
+            let plugin = LuaPlugin::load(
+                &plug_dir,
+                "asker",
+                None,
+                HostHooks::new().with_styles(styles).with_ui(ui),
+            )
+            .unwrap();
 
             let answer = scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -426,8 +456,10 @@ end
         )
         .unwrap();
 
-        let db_dir = std::env::temp_dir()
-            .join(format!("cordanui-plugin-ui-app-{}", cordanui_schema::new_id()));
+        let db_dir = std::env::temp_dir().join(format!(
+            "cordanui-plugin-ui-app-{}",
+            cordanui_schema::new_id()
+        ));
         std::fs::create_dir_all(&db_dir).unwrap();
         let db = Database::open(&SyncConfig {
             db_path: db_dir.join("test.db"),
@@ -485,4 +517,123 @@ end
         let _ = std::fs::remove_dir_all(&plug_dir);
     }
 
+    /// The full user story: `<leader>;` -> type to filter -> Enter runs
+    /// `rose_pine.select()` -> the awaited pick dialog opens -> answered ->
+    /// the returned message lands on the status line and the cord.g style
+    /// write is committed to the db.
+    #[test]
+    fn command_mode_runs_plugin_command_with_dialog() {
+        use crate::app::{App, Mode};
+        use cordanui_plugin_runtime::{HostHooks, LuaPlugin};
+
+        let plug_dir = std::env::temp_dir()
+            .join("cordanui-plugin-ui-test")
+            .join(cordanui_schema::new_id());
+        std::fs::create_dir_all(&plug_dir).unwrap();
+        std::fs::write(
+            plug_dir.join("main.lua"),
+            r##"
+plugin = {}
+local function select()
+  local flavors = { "rose-pine", "moon", "dawn" }
+  local idx = cord.ui.pick{ title = "Flavor", items = flavors }
+  if not idx then return "cancelled" end
+  cord.g.style.primary("#ebbcba")
+  return "switched to " .. flavors[idx]
+end
+
+plugin.commands = {
+  ["rose-pine.select"] = { run = select, desc = "Pick a flavor" },
+}
+"##,
+        )
+        .unwrap();
+
+        let db_dir = std::env::temp_dir().join(format!(
+            "cordanui-cmd-mode-app-{}",
+            cordanui_schema::new_id()
+        ));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(db).unwrap();
+
+        // Simulate an installed, active lua plugin by injecting its state.
+        let plugin = LuaPlugin::load(
+            &plug_dir,
+            "rose-pine",
+            None,
+            HostHooks::new()
+                .with_styles(app.styles.clone())
+                .with_ui(app.plugin_ui.clone())
+                .with_panels(app.plugin_ui.clone()),
+        )
+        .unwrap();
+        app.plugin_states
+            .lock()
+            .unwrap()
+            .insert("rose-pine".to_string(), plugin);
+        app.plugin_commands.push(crate::app::PluginCommand {
+            plugin_name: "rose-pine".into(),
+            name: "rose-pine.select".into(),
+            desc: "Pick a flavor".into(),
+        });
+
+        // Open the command line and filter.
+        app.open_command_mode();
+        assert!(matches!(app.mode, Mode::Command));
+        for c in "select".chars() {
+            app.input.push_char(c);
+        }
+        assert_eq!(app.command_matches().len(), 1);
+
+        // Run it; the awaited pick appears as a modal.
+        let cmd = app.command_matches().remove(0);
+        app.execute_plugin_command(&cmd);
+        for _ in 0..200 {
+            app.poll_plugin_ui_requests();
+            if matches!(app.mode, Mode::PluginModal) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            matches!(app.mode, Mode::PluginModal),
+            "pick dialog should be open"
+        );
+
+        // Answer: choose item 2 ("moon", 0-based 1).
+        if let Some(modal) = &mut app.plugin_modal {
+            if let crate::app::PluginModalKind::Pick { selected } = &mut modal.kind {
+                *selected = 1;
+            }
+        }
+        app.submit_plugin_modal();
+
+        // Worker finishes; poll until the status message lands.
+        for _ in 0..200 {
+            app.poll_command_results();
+            if !app.command_running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.message.as_deref(), Some("switched to moon"));
+        assert!(!app.command_running);
+
+        // The cord.g write from inside the command was committed.
+        app.apply_style_updates().unwrap();
+        let overrides = crate::db::get_style_overrides(&app.db).unwrap();
+        assert_eq!(
+            overrides.get("primary").map(String::as_str),
+            Some("#ebbcba"),
+            "cord.g.style.primary from inside the command should persist"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&plug_dir);
+    }
 }

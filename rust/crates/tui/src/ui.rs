@@ -82,6 +82,50 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Mode::PluginPanel = &app.mode {
         render_plugin_panel(app, frame);
     }
+    if let Mode::Command = &app.mode {
+        render_command_matches(app, frame);
+    }
+}
+
+/// The command-line match list: up to 8 commands filtered by the input.
+fn render_command_matches(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let matches = app.command_matches();
+    if matches.is_empty() {
+        return;
+    }
+    let rows = matches.len().min(8);
+    let area = centered_rect(60, 30, frame.area());
+    let area = Rect {
+        x: area.x,
+        y: area.y.saturating_sub(20), // sit just above the status line
+        width: area.width,
+        height: rows as u16 + 2,
+    };
+    frame.render_widget(Clear, area);
+
+    let lines: Vec<Line> = matches
+        .iter()
+        .take(8)
+        .map(|cmd| {
+            Line::from(vec![
+                Span::styled(cmd.name.clone(), Style::default().fg(c.primary)),
+                Span::styled(
+                    format!("  — {}", cmd.desc),
+                    Style::default().fg(c.outline_variant),
+                ),
+            ])
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Commands ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(c.outline)),
+        ),
+        area,
+    );
 }
 
 /// A plugin-owned panel (`cord.ui.show_panel`): the plugin returns a
@@ -107,8 +151,10 @@ fn render_plugin_panel(app: &App, frame: &mut Frame) {
     fn flatten(w: &Widget, c: &Palette, out: &mut Vec<Line>) {
         match w {
             Widget::Text { content, fg, bold } => {
-                let mut style = Style::default()
-                    .fg(fg.as_deref().and_then(|role| c.get(role)).unwrap_or(c.on_background));
+                let mut style = Style::default().fg(fg
+                    .as_deref()
+                    .and_then(|role| c.get(role))
+                    .unwrap_or(c.on_background));
                 if *bold {
                     style = style.add_modifier(Modifier::BOLD);
                 }
@@ -121,10 +167,7 @@ fn render_plugin_panel(app: &App, frame: &mut Frame) {
                     } else {
                         Style::default().fg(c.on_background)
                     };
-                    out.push(Line::from(Span::styled(
-                        format!("  {item}"),
-                        style,
-                    )));
+                    out.push(Line::from(Span::styled(format!("  {item}"), style)));
                 }
             }
             Widget::Column { children } => {
@@ -428,6 +471,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
             (" PLUGIN DIALOG ".to_string(), text.to_string())
         }
         Mode::PluginPanel => (" PLUGIN PANEL ".to_string(), String::new()),
+        Mode::Command => (" COMMAND ".to_string(), app.input.text.clone()),
     };
 
     let label_style = match &app.mode {
@@ -442,6 +486,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::AgentRunning { .. }
         | Mode::PluginModal
         | Mode::PluginPanel => Style::default().fg(c.primary),
+        Mode::Command => Style::default().fg(c.secondary),
         Mode::ConfirmDelete { .. } => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
     };
@@ -502,6 +547,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::AgentPicker { .. } => "↑↓ model · Enter run · Esc close".into(),
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
         Mode::PluginPanel => "plugin panel — keys go to the plugin".into(),
+        Mode::Command => "type to filter · Enter run · Esc close".into(),
         Mode::PluginModal => match app.plugin_modal.as_ref().map(|m| &m.kind) {
             Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
             Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),

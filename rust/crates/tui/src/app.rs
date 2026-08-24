@@ -12,8 +12,8 @@ use cordanui_schema::{CreateGoalInput, Goal, GoalStatus, UpdateGoalInput};
 use cordanui_sync::Database;
 
 use crate::db;
-use cordanui_plugin_runtime::{UiRequest, UiResponse};
 use crate::plugin_ui::PanelCommand;
+use cordanui_plugin_runtime::{UiRequest, UiResponse};
 
 /// What the TUI is currently doing. Determines how input is handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,9 @@ pub enum Mode {
     /// A plugin owns the screen via `cord.ui.show_panel`. Payload in
     /// [`App::plugin_panel`].
     PluginPanel,
+    /// The user-facing command line (`<leader>;`) listing every command
+    /// registered by active Lua plugins via `plugin.commands`.
+    Command,
 }
 
 /// A plugin-requested modal currently on screen.
@@ -82,6 +85,21 @@ pub enum PluginModalKind {
         buffer: String,
         placeholder: Option<String>,
     },
+}
+
+/// A command registered by an installed Lua plugin.
+#[derive(Debug, Clone)]
+pub struct PluginCommand {
+    pub plugin_name: String,
+    pub name: String,
+    pub desc: String,
+}
+
+/// Sent back from the worker thread when a plugin command finishes.
+pub struct PluginCommandOutcome {
+    pub plugin_name: String,
+    pub state: cordanui_plugin_runtime::LuaPlugin,
+    pub result: anyhow::Result<Option<String>>,
 }
 
 /// One selectable (provider plugin, model) pair in the agent picker.
@@ -198,6 +216,16 @@ pub struct App {
     /// The open plugin panel, if any. Always paired with
     /// [`Mode::PluginPanel`].
     pub plugin_panel: Option<cordanui_plugin_runtime::PanelSpec>,
+    /// Loaded Lua plugin states, keyed by manifest name. States are moved
+    /// out to a worker thread while a command runs and re-inserted on
+    /// completion.
+    pub(crate) plugin_states: std::sync::Mutex<HashMap<String, cordanui_plugin_runtime::LuaPlugin>>,
+    /// Every command exposed by loaded plugins (name + description +
+    /// owning plugin), refreshed when states load.
+    pub plugin_commands: Vec<PluginCommand>,
+    /// In-flight plugin command result channel + guard.
+    pub(crate) command_rx: Option<std::sync::mpsc::Receiver<PluginCommandOutcome>>,
+    pub command_running: bool,
     /// All goals loaded from the DB.
     pub goals: Vec<Goal>,
     /// IDs of expanded nodes in the tree.
@@ -253,7 +281,7 @@ impl App {
         if !goals.is_empty() {
             list_state.select(Some(0));
         }
-        Ok(Self {
+        let mut app = Self {
             db,
             keybinds: crate::config::Keybinds::default(),
             theme,
@@ -261,6 +289,10 @@ impl App {
             plugin_ui,
             plugin_modal: None,
             plugin_panel: None,
+            plugin_states: std::sync::Mutex::new(HashMap::new()),
+            plugin_commands: Vec::new(),
+            command_rx: None,
+            command_running: false,
             goals,
             expanded: HashSet::new(),
             detailed: None,
@@ -282,7 +314,9 @@ impl App {
             agent_rx: None,
             agent_log: Vec::new(),
             agent_goal: None,
-        })
+        };
+        app.load_plugin_states();
+        Ok(app)
     }
 
     /// Index into `flat_rows()` of the currently selected row.
@@ -1227,6 +1261,137 @@ impl App {
         self.plugin_panel = None;
         if self.mode == Mode::PluginPanel {
             self.cancel();
+        }
+    }
+
+    /// Load (or reload) every active Lua-runtime plugin's state and
+    /// rebuild the command registry. Called at startup; install/activate
+    /// flows can call it again to pick up new commands.
+    pub fn load_plugin_states(&mut self) {
+        let Ok(plugins) = db::list_plugins(&self.db) else {
+            return;
+        };
+        let mut states = self.plugin_states.lock().unwrap();
+        states.clear();
+        self.plugin_commands.clear();
+
+        for row in plugins {
+            if !row.active {
+                continue;
+            }
+            let dir = std::path::PathBuf::from(&row.dir);
+            let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
+                continue;
+            };
+            if !manifest.is_lua() {
+                continue;
+            }
+            // Settings collected from the plugin's Configure form.
+            let config = db::settings_to_config(
+                &db::get_plugin_settings(&self.db, &manifest.plugin.name).unwrap_or_default(),
+            );
+            let name = manifest.plugin.name.clone();
+            match cordanui_plugin_runtime::LuaPlugin::load(
+                &dir,
+                &name,
+                config,
+                crate::plugin_ui::plugin_runtime_hooks(&self.styles, &self.plugin_ui),
+            ) {
+                Ok(state) => {
+                    for cmd in state.list_commands() {
+                        self.plugin_commands.push(PluginCommand {
+                            plugin_name: name.clone(),
+                            name: cmd.name,
+                            desc: cmd.desc,
+                        });
+                    }
+                    states.insert(name, state);
+                }
+                Err(e) => eprintln!("cordanui: loading plugin '{name}' failed: {e}"),
+            }
+        }
+        self.plugin_commands.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+
+    /// Open the command line over loaded plugin commands.
+    pub fn open_command_mode(&mut self) {
+        self.input.clear();
+        self.mode = Mode::Command;
+    }
+
+    /// Commands matching the current input text (substring, case-insensitive).
+    pub fn command_matches(&self) -> Vec<PluginCommand> {
+        let q = self.input.text.trim().to_lowercase();
+        self.plugin_commands
+            .iter()
+            .filter(|c| {
+                q.is_empty()
+                    || c.name.to_lowercase().contains(&q)
+                    || c.desc.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Run the named command on a worker thread. Its Lua state is moved
+    /// out of the cache until it finishes — dialogs/panels it opens are
+    /// answered through the normal event loop while we keep drawing.
+    pub fn execute_plugin_command(&mut self, cmd: &PluginCommand) {
+        if self.command_running {
+            self.set_message("a command is already running");
+            return;
+        }
+        let Some(mut state) = self.plugin_states.lock().unwrap().remove(&cmd.plugin_name) else {
+            self.set_message("plugin not loaded");
+            return;
+        };
+        self.command_running = true;
+        // Leave the command line so dialogs can open (they require Normal).
+        self.cancel();
+        let plugin_name = cmd.plugin_name.clone();
+        let name = cmd.name.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.command_rx = Some(rx);
+        std::thread::spawn(move || {
+            // cordanui-sync's blocking DB API must stay off this thread,
+            // so the worker gets its own single-purpose runtime.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = rt.block_on(state.call_command(&name));
+            let _ = tx.send(PluginCommandOutcome {
+                plugin_name,
+                state,
+                result,
+            });
+        });
+    }
+
+    /// Drain finished command outcomes. Non-blocking.
+    pub fn poll_command_results(&mut self) {
+        let Some(rx) = &self.command_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(outcome) => {
+                self.command_rx = None;
+                self.command_running = false;
+                self.plugin_states
+                    .lock()
+                    .unwrap()
+                    .insert(outcome.plugin_name, outcome.state);
+                match outcome.result {
+                    Ok(Some(msg)) => self.set_message(&msg),
+                    Ok(None) => self.set_message("done"),
+                    Err(e) => self.set_message(&format!("✖ {e:#}")),
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.command_rx = None;
+                self.command_running = false;
+            }
         }
     }
 

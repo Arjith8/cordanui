@@ -674,3 +674,40 @@ Contract:
   a second `show_panel` replaces the first. Close via
   `cord.ui.close_panel()` or unhandled Esc. Your Lua state (upvalues)
   persists across frames, so plain locals are your view model.
+
+---
+
+## 14. Commands (`plugin.commands`) — user-invocable functions
+
+Register functions users can run from the TUI's command line
+(`<leader>;` — type to filter, Enter to run):
+
+```lua
+local M = {}
+
+function M.select()
+  local flavors = { "rose-pine", "rose-pine-moon", "rose-pine-dawn" }
+  local idx = cord.ui.pick{ title = "Flavor", items = flavors }
+  if not idx then return "cancelled" end          -- shown on the status line
+  cord.g.style.background("#191724")
+  return "switched to " .. flavors[idx]
+end
+
+plugin.commands = {
+  ["rose-pine.select"] = { run = M.select, desc = "Pick a flavor" },
+}
+```
+
+Contract:
+
+- **Naming**: prefix with your plugin name (`"<plugin>.<action>"`) — all
+  commands across plugins share one namespace.
+- **Entry**: `{ run = function, desc = string }`. Entries without `run`
+  are skipped. `desc` shows in the filterable command list.
+- **Anything goes inside `run`**: dialogs (`cord.ui.*`), panels, style
+  writes — your Lua state is long-lived (loaded once at startup and kept),
+  so upvalues persist between invocations.
+- **Return value**: a string is shown on the host status line; anything
+  else is ignored. Errors surface as `✖ <message>` on the status line.
+- **Capabilities**: set `command = true` under `[capabilities]` if your
+  plugin exists primarily to provide commands.
