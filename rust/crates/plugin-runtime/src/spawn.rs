@@ -20,10 +20,7 @@ use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteRespo
 ///
 /// Spawns the plugin binary with `complete` subcommand, writes the request
 /// as JSON to stdin, reads a single JSON response from stdout.
-pub async fn run_one_shot(
-    binary: &Path,
-    request: &CompleteRequest,
-) -> Result<CompleteResponse> {
+pub async fn run_one_shot(binary: &Path, request: &CompleteRequest) -> Result<CompleteResponse> {
     let request_json = serde_json::to_string(request).context("serializing request")?;
 
     let mut child = Command::new(binary)
@@ -55,15 +52,12 @@ pub async fn run_one_shot(
     let status = child.wait().await?;
 
     if !status.success() {
-        anyhow::bail!(
-            "plugin exited with status {status}\nstderr: {stderr_output}"
-        );
+        anyhow::bail!("plugin exited with status {status}\nstderr: {stderr_output}");
     }
 
-    let response: CompleteResponse =
-        serde_json::from_str(output.trim()).context(format!(
-            "parsing plugin response. stdout: {output}\nstderr: {stderr_output}"
-        ))?;
+    let response: CompleteResponse = serde_json::from_str(output.trim()).context(format!(
+        "parsing plugin response. stdout: {output}\nstderr: {stderr_output}"
+    ))?;
 
     Ok(response)
 }
@@ -116,10 +110,8 @@ where
         }
         match serde_json::from_str::<AgentEvent>(line) {
             Ok(event) => {
-                let is_terminal = matches!(
-                    event,
-                    AgentEvent::Result { .. } | AgentEvent::Error { .. }
-                );
+                let is_terminal =
+                    matches!(event, AgentEvent::Result { .. } | AgentEvent::Error { .. });
                 on_event(&event);
                 if is_terminal {
                     final_event = Some(event);
@@ -189,6 +181,7 @@ mod tests {
             system: None,
             max_tokens: None,
             temperature: None,
+            config: None,
         };
 
         let response = run_one_shot(&binary, &request).await.unwrap();

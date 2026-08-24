@@ -31,3 +31,6 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
+
+# plugin-runtime — embedded Lua runtime for script plugins
+mlua = { version = "0.12", features = ["lua54", "vendored", "async", "send", "serde"] }

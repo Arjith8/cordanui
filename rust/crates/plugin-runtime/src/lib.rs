@@ -9,14 +9,24 @@
 //!   object on stdout.
 //! - **streaming**: `plugin agent-run --task-id X < config.json` →
 //!   newline-delimited JSON events (progress / result) on stdout.
+//!
+//! Plugins with `runtime = "lua"` in their manifest skip the build step
+//! entirely: they are Lua scripts (`main.lua`) executed in-process by the
+//! embedded Lua runtime ([`LuaPlugin`]), calling the host through the
+//! injected `cordanui.*` API.
 
+pub mod lua;
 pub mod manifest;
 pub mod protocol;
 pub mod spawn;
+pub mod style;
 
-pub use manifest::{PluginManifest, PluginCapability, ProviderConfig, BuildConfig};
+pub use lua::LuaPlugin;
+pub use manifest::{
+    BuildConfig, PluginCapability, PluginManifest, ProviderConfig, UiField, UiSpec,
+};
 pub use protocol::{
-    CompleteRequest, CompleteResponse,
-    AgentRunConfig, AgentEvent, AgentEventType, AgentResult,
+    AgentEvent, AgentEventType, AgentResult, AgentRunConfig, CompleteRequest, CompleteResponse,
 };
 pub use spawn::{run_one_shot, run_streaming};
+pub use style::{parse_color, NullStyleHost, StyleHost, CORE_VARS, LEGACY_ALIASES};

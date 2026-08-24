@@ -1,0 +1,34 @@
+# Runs in-process on the embedded Lua runtime. No cargo, no build step:
+# installing this plugin = clone + activate.
+runtime = "lua"
+
+[plugin]
+name = "provider-zen"
+version = "0.1.0"
+description = "OpenCode Zen provider (Lua) — GPT, Claude, Gemini, Qwen and more"
+
+[capabilities]
+provider = true
+
+[provider]
+models = ["grok-code", "qwen3-coder", "claude-sonnet-4-5", "gpt-5", "gemini-3-pro"]
+api_key_env = "OPENCODE_API_KEY"
+
+[[field]]
+key = "api_key"
+label = "API Key"
+type = "secret"
+required = true
+
+[[field]]
+key = "base_url"
+label = "Base URL"
+type = "text"
+default = "https://opencode.ai/zen/v1"
+
+[[field]]
+key = "default_model"
+label = "Default model"
+type = "select"
+options = ["grok-code", "qwen3-coder", "claude-sonnet-4-5", "gpt-5", "gemini-3-pro"]
+default = "grok-code"

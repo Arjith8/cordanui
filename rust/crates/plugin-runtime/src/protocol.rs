@@ -31,10 +31,14 @@ pub struct CompleteRequest {
     /// Optional temperature.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    /// Plugin settings collected by the host from its declarative `[ui]`
+    /// form (namespaced keys stripped to bare field keys).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
 }
 
 /// Response from a provider plugin for a one-shot completion.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompleteResponse {
     /// The generated content.
     pub content: String,
@@ -43,7 +47,7 @@ pub struct CompleteResponse {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -176,6 +180,7 @@ mod tests {
             system: Some("You are a poet".to_string()),
             max_tokens: Some(100),
             temperature: Some(0.7),
+            config: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let back: CompleteRequest = serde_json::from_str(&json).unwrap();

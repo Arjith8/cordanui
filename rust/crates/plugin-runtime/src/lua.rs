@@ -1,0 +1,811 @@
+//! Embedded Lua plugin runtime.
+//!
+//! Plugins with `runtime = "lua"` in their manifest are executed in-process
+//! by the host. The plugin repo root contains a `main.lua` script that must
+//! define a global `plugin` table with handler functions:
+//!
+//! ```lua
+//! -- provider example
+//! plugin = {}
+//!
+//! function plugin.complete(request)
+//!   -- request: { model, prompt, system?, max_tokens?, temperature?, config? }
+//!   local res = cordanui.http.request({
+//!     url = "https://example.com/v1/chat/completions",
+//!     method = "POST",
+//!     headers = { ["authorization"] = "Bearer " .. cordanui.config.api_key },
+//!     body = cordanui.json.encode({ model = request.model, messages = { ... } }),
+//!   })
+//!   if res.status ~= 200 then error("upstream returned " .. res.status) end
+//!   local body = cordanui.json.decode(res.body)
+//!   return { content = body.choices[1].message.content }
+//! end
+//!
+//! function plugin.agent_run(config, emit)
+//!   -- config: AgentRunConfig table; emit(event) streams NDJSON events
+//!   emit({ type = "progress", message = "working..." })
+//!   emit({ type = "result", content = "done", files = {} })
+//! end
+//! ```
+//!
+//! The host injects a `cordanui` global (the exported API surface):
+//!
+//! - `cordanui.plugin.name` — plugin name from the manifest
+//! - `cordanui.config` — settings collected from the manifest's `[[field]]`
+//!   form, namespaced keys stripped to bare field keys
+//! - `cordanui.log.info/warn/error(msg)` — host log stream
+//! - `cordanui.json.encode(value)` / `.decode(str)` — JSON bridge
+//! - `cordanui.http.request{url, method?, headers?, body?}` →
+//!   `{status, body}` — HTTP via the host (reqwest), awaitable
+//!
+//! A second global, `cord`, restyles the UI live (see [`crate::style`]):
+//!
+//! ```lua
+//! cord.g.style.primary("#ff8800")          -- persist at DB level (syncs)
+//! cord["local"].style.primary("#ff8800")   -- this session only
+//! ```
+//!
+//! Rendering is declarative: plugins never touch the terminal directly.
+//! A `cordanui.ui` widget-builder module is planned; the settings-form
+//! contract (`[[field]]`) already follows this model.
+
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use anyhow::{bail, Context, Result};
+use mlua::{Function, Lua, LuaSerdeExt, Table, Value as LuaValue};
+
+use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
+use crate::style::{parse_color, SharedStyleHost};
+
+/// An in-process Lua plugin: a loaded and initialized `main.lua`.
+pub struct LuaPlugin {
+    lua: Arc<Lua>,
+    pub name: String,
+}
+
+impl std::fmt::Debug for LuaPlugin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LuaPlugin")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl LuaPlugin {
+    /// Load a Lua plugin from its directory, injecting collected settings
+    /// as `cordanui.config`. `styles` backs the `cord.g` / `cord.local`
+    /// styling API — pass `None` when the host has no style storage and
+    /// those calls will error for the plugin.
+    pub fn load(
+        dir: &Path,
+        name: &str,
+        config: Option<serde_json::Value>,
+        styles: Option<SharedStyleHost>,
+    ) -> Result<Self> {
+        let entry = dir.join(crate::manifest::PluginManifest::LUA_ENTRY);
+        let source = std::fs::read_to_string(&entry)
+            .with_context(|| format!("reading {}", entry.display()))?;
+
+        let lua = Arc::new(Lua::new());
+        register_api(&lua, dir, name, config).context("registering cordanui API")?;
+        register_cord(&lua, styles).context("registering cord styling API")?;
+
+        // Let scripts require sibling files relative to the plugin root.
+        let package: Table = lua.globals().get("package")?;
+        let path: String = package.get("path")?;
+        package.set(
+            "path",
+            format!(
+                "{}/?.lua;{}/?/init.lua;{}",
+                dir.display(),
+                dir.display(),
+                path
+            ),
+        )?;
+
+        lua.load(source)
+            .set_name("main.lua")
+            .exec()
+            .with_context(|| format!("loading {}", entry.display()))?;
+
+        // Fail fast if the entry point doesn't define what we need.
+        let plugin: Table = lua
+            .globals()
+            .get("plugin")
+            .context("main.lua must define a global `plugin` table")?;
+        if !plugin.contains_key("complete")? && !plugin.contains_key("agent_run")? {
+            bail!("plugin table defines neither complete nor agent_run");
+        }
+
+        Ok(Self {
+            lua,
+            name: name.to_string(),
+        })
+    }
+
+    /// One-shot completion: calls `plugin.complete(request)`, converts the
+    /// returned table into a [`CompleteResponse`].
+    pub async fn complete(&self, request: &CompleteRequest) -> Result<CompleteResponse> {
+        let plugin: Table = self.lua.globals().get("plugin")?;
+        let func: Function = plugin
+            .get("complete")
+            .context("plugin.complete not defined")?;
+
+        let arg = to_lua(&self.lua, serde_json::to_value(request)?)?;
+        let ret: LuaValue = func
+            .call_async(arg)
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin.complete failed: {e}"))?;
+
+        let response = serde_json::from_value(to_json(ret)?)
+            .context("plugin.complete returned an invalid response shape")?;
+        Ok(response)
+    }
+
+    /// Streaming agent run: calls `plugin.agent_run(config, emit)` where
+    /// `emit` forwards events to `on_event` synchronously as they happen.
+    /// Returns the terminal event (result or error); errors if the run
+    /// ended without one.
+    pub async fn agent_run<F>(&self, cfg: &AgentRunConfig, on_event: F) -> Result<AgentEvent>
+    where
+        F: FnMut(&AgentEvent) + Send + 'static,
+    {
+        let plugin: Table = self.lua.globals().get("plugin")?;
+        let func: Function = plugin
+            .get("agent_run")
+            .context("plugin.agent_run not defined")?;
+
+        // create_function needs Fn, on_event is FnMut — share through a mutex.
+        let handler: Arc<Mutex<F>> = Arc::new(Mutex::new(on_event));
+        let last_terminal: Arc<Mutex<Option<AgentEvent>>> = Arc::new(Mutex::new(None));
+
+        let terminal = last_terminal.clone();
+        let emit = self.lua.create_function(move |_, ev: LuaValue| {
+            let event: AgentEvent =
+                serde_json::from_value(to_json(ev).map_err(mlua::Error::external)?)
+                    .map_err(mlua::Error::external)?;
+            if matches!(event, AgentEvent::Result { .. } | AgentEvent::Error { .. }) {
+                *terminal.lock().expect("terminal lock") = Some(event.clone());
+            }
+            (handler.lock().expect("handler lock"))(&event);
+            Ok(())
+        })?;
+
+        let arg = to_lua(&self.lua, serde_json::to_value(cfg)?)?;
+        func.call_async::<()>((arg, emit))
+            .await
+            .map_err(|e| anyhow::anyhow!("plugin.agent_run failed: {e}"))?;
+
+        let final_event = last_terminal.lock().expect("terminal lock").take();
+        match final_event {
+            Some(event) => Ok(event),
+            None => bail!("agent_run ended without a result or error event"),
+        }
+    }
+}
+
+// ---------- cordanui.* API surface ----------
+
+fn register_api(
+    lua: &Lua,
+    plugin_dir: &Path,
+    name: &str,
+    config: Option<serde_json::Value>,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    // cordanui.plugin
+    let meta = lua.create_table()?;
+    meta.set("name", name)?;
+    api.set("plugin", meta)?;
+
+    // cordanui.config — injected settings (empty table when none).
+    let config = match config {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        _ => serde_json::Value::Object(Default::default()),
+    };
+    api.set("config", to_lua(lua, config)?)?;
+
+    // cordanui.log.{info,warn,error}
+    let log = lua.create_table()?;
+    log.set(
+        "info",
+        lua.create_function(|_, msg: String| {
+            tracing::info!(target: "plugin", "{msg}");
+            Ok(())
+        })?,
+    )?;
+    log.set(
+        "warn",
+        lua.create_function(|_, msg: String| {
+            tracing::warn!(target: "plugin", "{msg}");
+            Ok(())
+        })?,
+    )?;
+    log.set(
+        "error",
+        lua.create_function(|_, msg: String| {
+            tracing::error!(target: "plugin", "{msg}");
+            Ok(())
+        })?,
+    )?;
+    api.set("log", log)?;
+
+    // cordanui.json.{encode,decode}
+    let json = lua.create_table()?;
+    json.set(
+        "encode",
+        lua.create_function(|_, v: LuaValue| {
+            serde_json::to_string(&v).map_err(mlua::Error::external)
+        })?,
+    )?;
+    json.set(
+        "decode",
+        lua.create_function(|lua, s: String| {
+            let v: serde_json::Value = serde_json::from_str(&s).map_err(mlua::Error::external)?;
+            to_lua(lua, v)
+        })?,
+    )?;
+    api.set("json", json)?;
+
+    // cordanui.array(tbl) — marks a table as a JSON array. Needed because
+    // Lua cannot distinguish {} (empty array) from {} (empty map); without
+    // this, `files = {}` serializes as a JSON object and fails to decode.
+    api.set(
+        "array",
+        lua.create_function(|lua, t: Table| {
+            t.set_metatable(Some(lua.array_metatable()))?;
+            Ok(t)
+        })?,
+    )?;
+
+    // cordanui.http.request — HTTP through the host. Awaitable from Lua.
+    let http = lua.create_table()?;
+    http.set(
+        "request",
+        lua.create_async_function(|lua, params: Table| {
+            let lua = lua.clone();
+            async move {
+                let url: String = params.get("url")?;
+                let method: Option<String> = params.get("method")?;
+                let headers: Option<Table> = params.get("headers")?;
+                let body: Option<String> = params.get("body")?;
+
+                let mut req = http_client().request(method_from(&method), &url);
+                if let Some(hs) = headers {
+                    for pair in hs.pairs::<String, String>() {
+                        let (k, v) = pair?;
+                        req = req.header(k, v);
+                    }
+                }
+                if let Some(b) = body {
+                    req = req.body(b);
+                }
+
+                let resp = req.send().await.map_err(mlua::Error::external)?;
+                let status = resp.status().as_u16();
+                let text = resp.text().await.map_err(mlua::Error::external)?;
+
+                let out = lua.create_table()?;
+                out.set("status", status)?;
+                out.set("body", text)?;
+                Ok(out)
+            }
+        })?,
+    )?;
+    api.set("http", http)?;
+
+    // cordanui.plugin_dir — where this plugin lives on disk.
+    api.set("plugin_dir", plugin_dir.display().to_string())?;
+
+    lua.globals().set("cordanui", api)?;
+    Ok(())
+}
+
+/// The `cord` global — live restyling.
+///
+/// ```lua
+/// cord.g.style.primary("#ff8800")          -- persist (DB-level, syncs)
+/// cord["local"].style.primary("#ff8800")   -- this session only
+/// -- ("local" is a Lua keyword, so bracket indexing is required)
+/// cord.g.style.reset("primary")            -- clear one override
+/// cord.g.style.resetAll()                  -- clear all overrides in scope
+/// cord.style.get("primary")                -- effective value (hex) or ""
+/// ```
+///
+/// Any variable name works: the 18 core roles plus whatever custom names
+/// plugins introduce. Colors accept `#rgb`, `#rrggbb`, `rgb(r,g,b)` and
+/// `rgba(r,g,b,a)` (alpha is dropped).
+fn register_cord(lua: &Lua, styles: Option<SharedStyleHost>) -> mlua::Result<()> {
+    let cord = lua.create_table()?;
+
+    for scope in ["g", "local"] {
+        let persistent = scope == "g";
+        let namespace = lua.create_table()?;
+        let style = lua.create_table()?;
+
+        // Dynamic variables: style.<any-name> resolves to a setter.
+        let mt = lua.create_table()?;
+        mt.set(
+            "__index",
+            lua.create_function({
+                let styles = styles.clone();
+                move |lua, (_tbl, var): (Table, String)| {
+                    let styles = styles.clone();
+                    Ok(lua.create_function(move |_, value: String| {
+                        let Some(host) = styles.as_ref() else {
+                            return Err(mlua::Error::runtime(
+                                "styling is not available in this host",
+                            ));
+                        };
+                        let Some(hex) = parse_color(&value) else {
+                            return Err(mlua::Error::runtime(format!(
+                                "invalid color '{value}' — use #rgb, #rrggbb or rgb(r,g,b)"
+                            )));
+                        };
+                        host.set(persistent, &var, &hex);
+                        Ok(())
+                    })?)
+                }
+            })?,
+        )?;
+        style.set_metatable(Some(mt));
+
+        // style.reset(var) / style.resetAll()
+        style.set(
+            "reset",
+            lua.create_function({
+                let styles = styles.clone();
+                move |_, var: String| {
+                    let Some(host) = styles.as_ref() else {
+                        return Err(mlua::Error::runtime(
+                            "styling is not available in this host",
+                        ));
+                    };
+                    host.clear(persistent, &var);
+                    Ok(())
+                }
+            })?,
+        )?;
+        style.set(
+            "resetAll",
+            lua.create_function({
+                let styles = styles.clone();
+                move |_, ()| {
+                    let Some(host) = styles.as_ref() else {
+                        return Err(mlua::Error::runtime(
+                            "styling is not available in this host",
+                        ));
+                    };
+                    host.clear_all(persistent);
+                    Ok(())
+                }
+            })?,
+        )?;
+
+        namespace.set("style", style)?;
+        cord.set(scope, namespace)?;
+    }
+
+    // cord.style.get(var) — the effective override, if any.
+    let lookup = lua.create_table()?;
+    lookup.set(
+        "get",
+        lua.create_function(move |_, var: String| {
+            Ok(styles
+                .as_ref()
+                .and_then(|h| h.resolved(&var))
+                .unwrap_or_default())
+        })?,
+    )?;
+    cord.set("style", lookup)?;
+
+    lua.globals().set("cord", cord)?;
+    Ok(())
+}
+
+fn http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("building shared HTTP client")
+    })
+}
+
+fn method_from(m: &Option<String>) -> reqwest::Method {
+    match m.as_deref().map(|s| s.to_uppercase()).as_deref() {
+        Some("POST") => reqwest::Method::POST,
+        Some("PUT") => reqwest::Method::PUT,
+        Some("PATCH") => reqwest::Method::PATCH,
+        Some("DELETE") => reqwest::Method::DELETE,
+        _ => reqwest::Method::GET,
+    }
+}
+
+// ---------- JSON <-> Lua conversion ----------
+
+/// Convert a JSON value into an equivalent Lua value. Arrays become
+/// 1-indexed tables; objects become string-keyed tables.
+fn to_lua(lua: &Lua, v: serde_json::Value) -> mlua::Result<LuaValue> {
+    use serde_json::Value as J;
+    Ok(match v {
+        J::Null => LuaValue::Nil,
+        J::Bool(b) => LuaValue::Boolean(b),
+        J::Number(n) => match n.as_i64() {
+            Some(i) => LuaValue::Integer(i),
+            None => LuaValue::Number(n.as_f64().unwrap_or(f64::NAN)),
+        },
+        J::String(s) => LuaValue::String(lua.create_string(&s)?),
+        J::Array(items) => {
+            let t = lua.create_table()?;
+            for (i, item) in items.into_iter().enumerate() {
+                t.set(i + 1, to_lua(lua, item)?)?;
+            }
+            LuaValue::Table(t)
+        }
+        J::Object(map) => {
+            let t = lua.create_table()?;
+            for (k, val) in map {
+                t.set(k, to_lua(lua, val)?)?;
+            }
+            LuaValue::Table(t)
+        }
+    })
+}
+
+fn to_json(v: LuaValue) -> Result<serde_json::Value> {
+    serde_json::to_value(&v).context("converting Lua value to JSON")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::Usage;
+
+    const TMP: &str = "cordanui-lua-plugin-test";
+
+    fn fixture(name: &str, main_lua: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(TMP).join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.lua"), main_lua).unwrap();
+        dir
+    }
+
+    fn cleanup(name: &str) {
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join(TMP).join(name));
+    }
+
+    #[tokio::test]
+    async fn complete_round_trip() {
+        let dir = fixture(
+            "echo",
+            r#"
+plugin = {}
+function plugin.complete(req)
+  return {
+    content = "echo:" .. req.prompt .. ":" .. req.model,
+    usage = { prompt_tokens = 1, completion_tokens = 2, total_tokens = 3 },
+  }
+end
+"#,
+        );
+        let plugin = LuaPlugin::load(&dir, "echo", None, None).unwrap();
+        let resp = plugin
+            .complete(&CompleteRequest {
+                model: "test-model".into(),
+                prompt: "hello".into(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                config: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.content, "echo:hello:test-model");
+        assert_eq!(
+            resp.usage,
+            Some(Usage {
+                prompt_tokens: 1,
+                completion_tokens: 2,
+                total_tokens: Some(3)
+            })
+        );
+        cleanup("echo");
+    }
+
+    #[tokio::test]
+    async fn config_injection() {
+        let dir = fixture(
+            "cfg",
+            r#"
+plugin = {}
+function plugin.complete(req)
+  return { content = "key=" .. (cordanui.config.api_key or "MISSING") }
+end
+"#,
+        );
+        let config = serde_json::json!({ "api_key": "sk-test-123" });
+        let plugin = LuaPlugin::load(&dir, "cfg", Some(config), None).unwrap();
+        let resp = plugin
+            .complete(&CompleteRequest {
+                model: "m".into(),
+                prompt: "p".into(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                config: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(resp.content, "key=sk-test-123");
+        cleanup("cfg");
+    }
+
+    #[tokio::test]
+    async fn agent_run_streams_events() {
+        // Local HTTP server so the script's http.request round-trips for real.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut sock, &mut buf); // read the request head
+            let body = br#"{"ok":true}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                String::from_utf8_lossy(body)
+            );
+            use std::io::Write;
+            let _ = sock.write_all(resp.as_bytes());
+        });
+
+        let dir = fixture(
+            "stream",
+            &format!(
+                r#"
+plugin = {{}}
+function plugin.agent_run(cfg, emit)
+  emit({{ type = "progress", message = "checking upstream" }})
+  local res = cordanui.http.request({{ url = "http://127.0.0.1:{port}/", method = "GET" }})
+  assert(res.status == 200, "expected 200, got " .. tostring(res.status))
+  local body = cordanui.json.decode(res.body)
+  emit({{ type = "progress", message = "upstream said ok=" .. tostring(body.ok) }})
+  emit({{ type = "result", content = "done for task " .. cfg.task_id, files = cordanui.array({{}}) }})
+end
+"#
+            ),
+        );
+
+        let plugin = LuaPlugin::load(&dir, "stream", None, None).unwrap();
+
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let sink = messages.clone();
+        let result = plugin
+            .agent_run(
+                &AgentRunConfig {
+                    task_id: "t-42".into(),
+                    title: "Test".into(),
+                    description: None,
+                    model: None,
+                    config: None,
+                },
+                move |e| {
+                    if let AgentEvent::Progress { message, .. } = e {
+                        sink.lock().unwrap().push(message.clone());
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(
+            *messages.lock().unwrap(),
+            vec!["checking upstream", "upstream said ok=true"]
+        );
+        match result {
+            AgentEvent::Result(r) => {
+                assert_eq!(r.content, "done for task t-42");
+                assert!(r.files.is_empty());
+            }
+            other => panic!("expected Result, got {:?}", other.event_type()),
+        }
+        cleanup("stream");
+    }
+
+    #[tokio::test]
+    async fn missing_entry_script_is_a_clean_error() {
+        let dir = std::env::temp_dir().join(TMP).join("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = LuaPlugin::load(&dir, "empty", None, None).unwrap_err();
+        assert!(err.to_string().contains("main.lua"));
+        cleanup("empty");
+    }
+
+    #[tokio::test]
+    async fn missing_terminal_event_errors() {
+        let dir = fixture(
+            "noterminal",
+            r#"
+plugin = {}
+function plugin.agent_run(cfg, emit)
+  emit({ type = "progress", message = "forever" })
+end
+"#,
+        );
+        let plugin = LuaPlugin::load(&dir, "noterminal", None, None).unwrap();
+        let err = plugin
+            .agent_run(
+                &AgentRunConfig {
+                    task_id: "t".into(),
+                    title: "T".into(),
+                    description: None,
+                    model: None,
+                    config: None,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("without a result or error event"));
+        cleanup("noterminal");
+    }
+
+    /// The reference provider-zen repo must parse as a Lua plugin and its
+    /// main.lua must load cleanly (syntax + API references checked at load).
+    #[test]
+    fn reference_provider_zen_round_trips() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/provider-zen");
+        let manifest = crate::PluginManifest::from_dir(&dir).unwrap();
+        assert!(manifest.is_lua());
+        assert!(manifest.capabilities.provider);
+        assert_eq!(
+            manifest.validate(),
+            Vec::<String>::new(),
+            "reference plugin manifest has problems"
+        );
+        let config = serde_json::json!({
+            "api_key": "test-key",
+            "base_url": "http://127.0.0.1:1", // unreachable; we only load
+            "default_model": "grok-code",
+        });
+        let _plugin = LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), None)
+            .expect("provider-zen should load");
+    }
+
+    // ---------- cord.* styling ----------
+
+    #[derive(Default)]
+    struct MockStyles {
+        persistent: Mutex<std::collections::BTreeMap<String, String>>,
+        session: Mutex<std::collections::BTreeMap<String, String>>,
+    }
+
+    impl crate::style::StyleHost for MockStyles {
+        fn set(&self, persistent: bool, var: &str, hex: &str) {
+            let map = if persistent {
+                &self.persistent
+            } else {
+                &self.session
+            };
+            map.lock().unwrap().insert(var.into(), hex.into());
+        }
+        fn clear(&self, persistent: bool, var: &str) {
+            let map = if persistent {
+                &self.persistent
+            } else {
+                &self.session
+            };
+            map.lock().unwrap().remove(var);
+        }
+        fn clear_all(&self, persistent: bool) {
+            let map = if persistent {
+                &self.persistent
+            } else {
+                &self.session
+            };
+            map.lock().unwrap().clear();
+        }
+        fn resolved(&self, var: &str) -> Option<String> {
+            self.session
+                .lock()
+                .unwrap()
+                .get(var)
+                .cloned()
+                .or_else(|| self.persistent.lock().unwrap().get(var).cloned())
+        }
+    }
+
+    const STYLES_LUA: &str = r##"
+plugin = {}
+function plugin.complete(req)
+  -- exercise the whole API surface
+  cord.g.style.background("#112233")
+  cord.g.style.primary("rgb(255, 136, 0)")
+  cord["local"].style.background("#abcdef")
+  return { content = cord.style.get("background") or "" }
+end
+"##;
+
+    #[tokio::test]
+    async fn cord_styling_routes_g_and_local() {
+        let dir = fixture("styles", STYLES_LUA);
+        let host = Arc::new(MockStyles::default());
+        let plugin = LuaPlugin::load(&dir, "styles", None, Some(host.clone())).unwrap();
+
+        let resp = plugin
+            .complete(&CompleteRequest {
+                model: "m".into(),
+                prompt: "p".into(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                config: None,
+            })
+            .await
+            .unwrap();
+
+        // `get` sees the session value first (local wins over global).
+        assert_eq!(resp.content, "#abcdef");
+
+        // g landed in persistent storage, normalized from rgb().
+        assert_eq!(
+            host.persistent.lock().unwrap().get("background"),
+            Some(&"#112233".to_string())
+        );
+        assert_eq!(
+            host.persistent.lock().unwrap().get("primary"),
+            Some(&"#ff8800".to_string())
+        );
+        // local landed in session storage only.
+        assert_eq!(
+            host.session.lock().unwrap().get("background"),
+            Some(&"#abcdef".to_string())
+        );
+        cleanup("styles");
+    }
+
+    #[tokio::test]
+    async fn cord_reset_and_invalid_colors() {
+        let dir = fixture(
+            "styles-reset",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  cord.g.style.primary("#ff0000")
+  local err = select(2, pcall(function() cord["local"].style.primary("hotpink") end))
+  cord.g.style.reset("primary")
+  return { content = tostring(err) }
+end
+"##,
+        );
+        let host = Arc::new(MockStyles::default());
+        let plugin = LuaPlugin::load(&dir, "styles-reset", None, Some(host.clone())).unwrap();
+        let resp = plugin
+            .complete(&CompleteRequest {
+                model: "m".into(),
+                prompt: "p".into(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                config: None,
+            })
+            .await
+            .unwrap();
+
+        // invalid color raised with a helpful message
+        assert!(
+            resp.content.contains("invalid color 'hotpink'"),
+            "unexpected: {}",
+            resp.content
+        );
+        // reset cleared it
+        assert!(host.persistent.lock().unwrap().get("primary").is_none());
+        cleanup("styles-reset");
+    }
+}
