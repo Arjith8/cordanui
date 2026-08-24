@@ -350,7 +350,7 @@ fn register_cord(lua: &Lua, styles: Option<SharedStyleHost>) -> mlua::Result<()>
                 }
             })?,
         )?;
-        style.set_metatable(Some(mt));
+        style.set_metatable(Some(mt))?;
 
         // style.reset(var) / style.resetAll()
         style.set(
