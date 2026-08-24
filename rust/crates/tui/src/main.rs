@@ -11,13 +11,16 @@ mod app;
 mod config;
 mod db;
 mod plugins;
+mod style;
 mod theme;
 mod ui;
 
 use std::io::{self, stdout};
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -86,11 +89,16 @@ fn run(
                 }
             }
             Mode::PluginHelp => handle_plugin_help_key(app, key),
+            Mode::PluginConfigure { plugin } => handle_configure_key(app, key, &plugin)?,
+            Mode::AgentPicker { .. } => handle_agent_picker_key(app, key)?,
+            Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
 
-        // Non-blocking drain of any in-flight plugin task.
+        // Non-blocking drain of any in-flight plugin task, then commit
+        // any pending style changes (cord.g / cord["local"] restyling).
         app.poll_plugin_search()?;
+        app.apply_style_updates()?;
 
         // Clear transient message after any key in normal mode
         if app.mode == Mode::Normal && !app.leader_pending && app.message.is_some() {
@@ -133,15 +141,13 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
     if app.leader_pending {
         app.leader_pending = false;
         match key.code {
-            KeyCode::Esc => {} // cancel leader
+            KeyCode::Esc => {}                     // cancel leader
             KeyCode::Char('q') => return Ok(true), // <leader>q — quit
             _ if binds.new_goal.matches(key) => {
                 // If the selected goal is expanded (leader + show_details),
                 // add a subgoal under it; otherwise a new root goal.
                 let parent_id = match app.selected_row() {
-                    Some(row) if app.expanded.contains(&row.goal.id) => {
-                        Some(row.goal.id.clone())
-                    }
+                    Some(row) if app.expanded.contains(&row.goal.id) => Some(row.goal.id.clone()),
                     _ => None,
                 };
                 app.start_add_goal(parent_id);
@@ -149,6 +155,11 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             _ if binds.show_details.matches(key) => app.toggle_details(),
             _ if binds.help.matches(key) => app.mode = Mode::Help,
             _ if binds.plugins.matches(key) => app.open_plugin_manager()?,
+            _ if binds.run_agent.matches(key) => {
+                if let Some(row) = app.selected_row() {
+                    app.open_agent_picker(row.goal.id.clone())?;
+                }
+            }
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -224,7 +235,9 @@ fn handle_plugin_manager_key(
         PluginPane::Install => match key.code {
             KeyCode::Esc => {
                 app.input.clear();
-                app.mode = Mode::PluginManager { pane: PluginPane::List };
+                app.mode = Mode::PluginManager {
+                    pane: PluginPane::List,
+                };
             }
             KeyCode::Enter => {
                 if !app.input.text.trim().is_empty() {
@@ -269,6 +282,8 @@ fn handle_plugin_manager_key(
             }
             // Uninstall (files + registry row).
             KeyCode::Char('d') | KeyCode::Delete => app.uninstall_selected_plugin()?,
+            // Configure (declarative [ui] settings form).
+            KeyCode::Char('c') => app.open_configure()?,
             _ => {}
         },
     }
@@ -290,6 +305,75 @@ fn handle_plugin_help_key(app: &mut app::App, key: KeyEvent) {
     }
 }
 
+/// Keys inside a plugin's configure form.
+///
+/// Navigation: ↑/↓ move between fields. Enter (or any printable key) on a
+/// field starts editing that field's value; Enter commits, Esc cancels the
+/// edit. Esc with no active edit returns to the plugin list.
+fn handle_configure_key(app: &mut app::App, key: KeyEvent, plugin: &str) -> anyhow::Result<()> {
+    use crossterm::event::KeyModifiers;
+
+    // Editing a field value.
+    if let Some(_) = &app.config_editing {
+        match key.code {
+            KeyCode::Enter => app.commit_config_field(plugin)?,
+            KeyCode::Esc => app.config_editing = None,
+            KeyCode::Backspace => {
+                if let Some(buf) = &mut app.config_editing {
+                    if let Some(prev) = buf.char_indices().last().map(|(i, _)| i) {
+                        buf.truncate(prev);
+                    }
+                }
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                if let Some(buf) = &mut app.config_editing {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    let Some(spec) = app.config_spec.clone() else {
+        return Ok(());
+    };
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.mode = Mode::PluginManager {
+                pane: app::PluginPane::List,
+            };
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.config_selected > 0 {
+                app.config_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.config_selected + 1 < spec.fields.len() {
+                app.config_selected += 1;
+            }
+        }
+        // Start editing: seed the buffer with the current value (secrets
+        // too — the user is already past any shoulder-surfers here).
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let key_name = spec.fields[app.config_selected].key.clone();
+            app.config_editing = Some(
+                app.config_values
+                    .get(&key_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            app.config_editing = Some(c.to_string());
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle_help_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
@@ -303,11 +387,41 @@ fn handle_help_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
 fn handle_confirm_delete_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete()?,
-        KeyCode::Char('n')
-        | KeyCode::Char('N')
-        | KeyCode::Esc
-        | KeyCode::Char('q') => app.cancel(),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => app.cancel(),
         _ => {}
     }
     Ok(())
+}
+
+/// Keys in the provider/model picker.
+fn handle_agent_picker_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.agent_selected > 0 {
+                app.agent_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.agent_selected + 1 < app.agent_choices.len() {
+                app.agent_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if let Mode::AgentPicker { goal_id } = &app.mode {
+                let goal_id = goal_id.clone();
+                app.start_agent_run(goal_id)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Keys while an agent streams. Esc leaves the view — the run keeps going
+/// in the background and lands in the DB when done.
+fn handle_agent_running_key(app: &mut app::App, key: KeyEvent) {
+    if key.code == KeyCode::Esc {
+        app.mode = Mode::Normal;
+    }
 }

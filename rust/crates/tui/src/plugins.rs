@@ -10,7 +10,6 @@
 //! Every step emits [`TaskEvent::Log`] lines so the UI can show what's
 //! happening instead of a bare spinner.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -63,7 +62,8 @@ pub enum TaskEvent {
         name: String,
         dir: String,
         themes: Vec<ThemeFile>,
-    },}
+    },
+}
 
 /// Lifecycle of one task started from the plugin manager popup.
 #[derive(Debug, Clone, Default)]
@@ -128,7 +128,8 @@ enum SearchOutcome {
     Error(String),
 }
 
-/// Install flow: straight to clone/pull — git's own errors tell us if a
+/// Install flow: clone/pull → build (if the plugin type needs a binary) →
+/// manifest validation → theme collection. Git's own errors tell us if a
 /// repo doesn't exist, so there's nothing to validate up front.
 fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
     let _ = tx.send(TaskEvent::Log(format!("Fetching {slug}…")));
@@ -138,7 +139,7 @@ fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
         let _ = tx.send(TaskEvent::Log(
             "Already installed — pulling updates (--progress)…".into(),
         ));
-        if let Err(e) = stream_git(
+        if let Err(e) = stream_process(
             tx,
             Command::new("git")
                 .args(["-C"])
@@ -146,6 +147,7 @@ fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
                 .args(["pull", "--ff-only", "--progress"]),
         ) {
             let _ = tx.send(TaskEvent::Error(format!("update failed: {e}")));
+            return;
         }
     } else {
         let _ = tx.send(TaskEvent::Log(format!(
@@ -155,7 +157,7 @@ fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
         let url = format!("https://github.com/{slug}.git");
         // --progress: git silences its progress stream when stderr is not a
         // TTY (our case — it's a pipe), this flag forces it back on.
-        if let Err(e) = stream_git(
+        if let Err(e) = stream_process(
             tx,
             Command::new("git")
                 .args(["clone", "--progress"])
@@ -179,6 +181,49 @@ fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
             return;
         }
     };
+    let _ = tx.send(TaskEvent::Log(format!(
+        "Manifest OK — {} v{} ({})",
+        manifest.plugin.name,
+        manifest.plugin.version,
+        caps_label(&manifest)
+    )));
+
+    // Build if the plugin type ships an executable. Theme packs and
+    // Lua-runtime plugins are data-only and skip this entirely — a Lua
+    // plugin is just `main.lua` + manifest, run in-process by the host.
+    let needs_binary = !manifest.is_lua()
+        && (manifest.capabilities.provider
+            || manifest.capabilities.tool
+            || manifest.capabilities.agent
+            || manifest.capabilities.command);
+
+    if needs_binary {
+        let build_cmd = manifest
+            .build
+            .as_ref()
+            .map(|b| b.cmd.clone())
+            .unwrap_or_else(|| "cargo build --release".to_string());
+        let _ = tx.send(TaskEvent::Log(format!("Building — `{build_cmd}`…")));
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&build_cmd).current_dir(&dest);
+        if let Err(e) = stream_process(tx, &mut cmd) {
+            let _ = tx.send(TaskEvent::Error(format!("build failed: {e}")));
+            return;
+        }
+
+        let bin = manifest.binary_path(&dest);
+        if !bin.exists() {
+            let _ = tx.send(TaskEvent::Error(format!(
+                "build succeeded but binary missing at {}",
+                bin.display()
+            )));
+            return;
+        }
+        let _ = tx.send(TaskEvent::Log("Build complete.".into()));
+    } else {
+        let _ = tx.send(TaskEvent::Log("Data-only plugin — skipping build.".into()));
+    }
 
     // Collect theme packs (if any) for the host to import.
     let themes = scan_theme_files(&dest);
@@ -191,15 +236,14 @@ fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
             "  {} theme pack{}: {}",
             themes.len(),
             if themes.len() == 1 { "" } else { "s" },
-            themes.iter().map(|t| t.name.clone()).collect::<Vec<_>>().join(", ")
+            themes
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
 
-    let _ = tx.send(TaskEvent::Log(format!(
-        "Manifest OK — {} v{} ({})",
-        manifest.plugin.name, manifest.plugin.version,
-        caps_label(&manifest)
-    )));
     let _ = tx.send(TaskEvent::Installed {
         name: manifest.plugin.name,
         dir: dest.to_string_lossy().into_owned(),
@@ -269,35 +313,61 @@ fn caps_label(m: &cordanui_plugin_runtime::PluginManifest) -> String {
     }
 }
 
-/// Run a git command, streaming its stderr to the activity log. Returns
-/// `Err` with the last meaningful error line on failure.
-fn stream_git(tx: &Sender<TaskEvent>, cmd: &mut Command) -> Result<(), String> {
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+/// Run a process, streaming stdout AND stderr to the activity log.
+/// Returns `Err` with the last meaningful error line on failure.
+fn stream_process(tx: &Sender<TaskEvent>, cmd: &mut Command) -> Result<(), String> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Never let git prompt for credentials — with our TTY stdin it would
+    // block invisibly at a hidden username/password prompt forever.
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "");
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return Err("git not found".into()),
+        Err(_) => return Err("command not found".into()),
     };
+
     let mut last_error: Option<String> = None;
+
+    // stdout and stderr must drain concurrently or the child can block on a
+    // full pipe. A reader thread forwards stdout; stderr is read inline
+    // (it's where git progress and cargo errors live).
+    let out_tx = tx.clone();
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            while let Some(frame) = next_frame(&mut out, &mut buf) {
+                let line = frame.trim().to_string();
+                if !line.is_empty() {
+                    let _ = out_tx.send(TaskEvent::Log(format!("  {}", truncate(&line, 60))));
+                }
+            }
+        })
+    });
+
+    // Drain stderr inline: git progress and cargo errors live here.
     if let Some(mut stderr) = child.stderr.take() {
-        // Frames arrive \r-terminated (progress rewrites) or \n-terminated
-        // (regular messages). Byte-wise scan so progress shows live.
         let mut buf = Vec::new();
         while let Some(frame) = next_frame(&mut stderr, &mut buf) {
             let line = frame.trim();
             if line.is_empty() {
                 continue;
             }
-            // Forward everything — every step should be visible.
             let _ = tx.send(TaskEvent::Log(format!("  {}", truncate(line, 60))));
-            if line.contains("fatal") || line.contains("error") {
+            if line.contains("fatal") || line.contains("error") || line.contains("error[") {
                 last_error = Some(line.to_string());
             }
         }
     }
+
+    let _ = stdout_handle.map(|h| h.join());
+
     match child.wait() {
         Ok(s) if s.success() => Ok(()),
-        Ok(_) => Err(last_error.unwrap_or_else(|| "git exited with an error".into())),
-        Err(_) => Err("git was terminated".into()),
+        Ok(_) => Err(last_error.unwrap_or_else(|| "process exited with an error".into())),
+        Err(_) => Err("process was terminated".into()),
     }
 }
 
@@ -467,7 +537,9 @@ mod tests {
     fn summaries_truncate() {
         let r = RepoInfo {
             full_name: "foo/bar".into(),
-            description: Some("a very long description that keeps going way past the limit!!".into()),
+            description: Some(
+                "a very long description that keeps going way past the limit!!".into(),
+            ),
             stars: 3,
         };
         let s = r.summary();
@@ -483,7 +555,8 @@ mod tests {
 
     #[test]
     fn scans_theme_files_and_skips_junk() {
-        let dir = std::env::temp_dir().join(format!("cordanui-theme-scan-{}", cordanui_schema::new_id()));
+        let dir =
+            std::env::temp_dir().join(format!("cordanui-theme-scan-{}", cordanui_schema::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("my-theme.json"),

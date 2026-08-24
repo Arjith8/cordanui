@@ -61,7 +61,10 @@ impl KeyBinding {
                         "down" => KeyCode::Down,
                         "left" => KeyCode::Left,
                         "right" => KeyCode::Right,
-                        f if f.len() == 2 && f.starts_with('f') && f[1..].bytes().all(|b| b.is_ascii_digit()) => {
+                        f if f.len() == 2
+                            && f.starts_with('f')
+                            && f[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                        {
                             KeyCode::F(f[1..].parse().ok()?)
                         }
                         c if c.chars().count() == 1 => {
@@ -134,6 +137,8 @@ pub struct Keybinds {
     pub help: KeyBinding,
     /// `<leader> + this` opens the plugin manager popup.
     pub plugins: KeyBinding,
+    /// `<leader> + this` runs the selected goal through a provider plugin.
+    pub run_agent: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -145,6 +150,7 @@ impl Default for Keybinds {
             cycle_status: KeyBinding::parse("tab").unwrap(),
             help: KeyBinding::parse("h").unwrap(),
             plugins: KeyBinding::parse("p").unwrap(),
+            run_agent: KeyBinding::parse("r").unwrap(),
         }
     }
 }
@@ -185,6 +191,7 @@ impl Keybinds {
             cycle_status: get("cycle_status", &defaults.cycle_status),
             help: get("help", &defaults.help),
             plugins: get("plugins", &defaults.plugins),
+            run_agent: get("run_agent", &defaults.run_agent),
         }
     }
 
@@ -193,23 +200,52 @@ impl Keybinds {
     pub fn entries(&self) -> Vec<BindingEntry> {
         let d = Self::default();
         let mut v = Vec::new();
-        let mut push = |name: &'static str,
-                        bind: &KeyBinding,
-                        def: &KeyBinding,
-                        desc: &'static str| {
-            v.push(BindingEntry {
-                name,
-                binding: bind.clone(),
-                desc,
-                is_default: bind == def,
-            });
-        };
+        let mut push =
+            |name: &'static str, bind: &KeyBinding, def: &KeyBinding, desc: &'static str| {
+                v.push(BindingEntry {
+                    name,
+                    binding: bind.clone(),
+                    desc,
+                    is_default: bind == def,
+                });
+            };
         push("leader", &self.leader, &d.leader, "arm leader mode");
-        push("new_goal", &self.new_goal, &d.new_goal, "<leader> + key — add a goal (subgoal if selection expanded)");
-        push("show_details", &self.show_details, &d.show_details, "<leader> + key — toggle description + subgoals");
-        push("cycle_status", &self.cycle_status, &d.cycle_status, "bare key — cycle pending → in progress → done");
-        push("help", &self.help, &d.help, "<leader> + key — open this help page");
-        push("plugins", &self.plugins, &d.plugins, "<leader> + key — open the plugin manager");
+        push(
+            "new_goal",
+            &self.new_goal,
+            &d.new_goal,
+            "<leader> + key — add a goal (subgoal if selection expanded)",
+        );
+        push(
+            "show_details",
+            &self.show_details,
+            &d.show_details,
+            "<leader> + key — toggle description + subgoals",
+        );
+        push(
+            "cycle_status",
+            &self.cycle_status,
+            &d.cycle_status,
+            "bare key — cycle pending → in progress → done",
+        );
+        push(
+            "help",
+            &self.help,
+            &d.help,
+            "<leader> + key — open this help page",
+        );
+        push(
+            "plugins",
+            &self.plugins,
+            &d.plugins,
+            "<leader> + key — open the plugin manager",
+        );
+        push(
+            "run_agent",
+            &self.run_agent,
+            &d.run_agent,
+            "<leader> + key — run goal with an agent",
+        );
         v
     }
 }
@@ -280,14 +316,13 @@ mod tests {
 
     #[test]
     fn loads_from_toml_section() {
-        let dir = std::env::temp_dir().join(format!("cordanui-keybind-test-{}", cordanui_schema::new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "cordanui-keybind-test-{}",
+            cordanui_schema::new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "[keybinds]\nleader = \"ctrl+g\"\nnew_goal = \"m\"\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "[keybinds]\nleader = \"ctrl+g\"\nnew_goal = \"m\"\n").unwrap();
 
         let k = Keybinds::from_toml_path(&path);
         assert_eq!(k.leader.code, KeyCode::Char('g'));
@@ -299,7 +334,10 @@ mod tests {
 
     #[test]
     fn falls_back_on_bad_values() {
-        let dir = std::env::temp_dir().join(format!("cordanui-keybind-test-{}", cordanui_schema::new_id()));
+        let dir = std::env::temp_dir().join(format!(
+            "cordanui-keybind-test-{}",
+            cordanui_schema::new_id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "[keybinds]\nleader = \"@@garbage@@\"\n").unwrap();

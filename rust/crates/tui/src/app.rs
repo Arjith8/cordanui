@@ -19,21 +19,13 @@ pub enum Mode {
     /// Normal navigation mode.
     Normal,
     /// Adding a goal. `parent_id` is None for a root goal, Some for a subgoal.
-    AddGoal {
-        parent_id: Option<String>,
-    },
+    AddGoal { parent_id: Option<String> },
     /// Editing an existing goal's title.
-    EditTitle {
-        goal_id: String,
-    },
+    EditTitle { goal_id: String },
     /// Editing an existing goal's description.
-    EditDescription {
-        goal_id: String,
-    },
+    EditDescription { goal_id: String },
     /// Confirmation prompt for deleting a goal.
-    ConfirmDelete {
-        goal_id: String,
-    },
+    ConfirmDelete { goal_id: String },
     /// Help overlay.
     Help,
     /// Plugin manager popup (installed list + install input).
@@ -43,6 +35,21 @@ pub enum Mode {
     },
     /// Plugin manager's own help page.
     PluginHelp,
+    /// Configure form for one plugin (declarative [ui] manifest section).
+    PluginConfigure { plugin: String },
+    /// Pick a provider+model to run the selected goal with.
+    AgentPicker { goal_id: String },
+    /// An agent run is streaming for this goal.
+    AgentRunning { goal_id: String },
+}
+
+/// One selectable (provider plugin, model) pair in the agent picker.
+#[derive(Debug, Clone)]
+pub struct AgentChoice {
+    pub plugin: String,
+    pub model: String,
+    pub binary: std::path::PathBuf,
+    pub config: Option<serde_json::Value>,
 }
 
 /// Focus within the plugin manager popup.
@@ -136,8 +143,11 @@ pub struct App {
     pub db: Database,
     /// Configured key bindings ([keybinds] in config.toml).
     pub keybinds: crate::config::Keybinds,
-    /// Resolved theme (from the shared `themes` table) used by the render path.
+    /// Resolved style palette (builtin ← theme ← global ← session).
+    /// Re-resolved whenever [`Self::styles`] reports changes.
     pub theme: crate::theme::Theme,
+    /// Live style overrides — the host side of `cord.g` / `cord["local"]`.
+    pub styles: std::sync::Arc<crate::style::StyleBridge>,
     /// All goals loaded from the DB.
     pub goals: Vec<Goal>,
     /// IDs of expanded nodes in the tree.
@@ -163,12 +173,31 @@ pub struct App {
     pub installed_plugins: Vec<db::PluginRow>,
     /// Selection index into `installed_plugins`.
     pub plugin_selected: usize,
+    /// Configure form: the [ui] spec of the plugin being configured.
+    pub config_spec: Option<cordanui_plugin_runtime::UiSpec>,
+    /// Configure form: current editable values (bare field key → value).
+    pub config_values: std::collections::BTreeMap<String, String>,
+    /// Configure form: selected field index.
+    pub config_selected: usize,
+    /// Configure form: in-progress edit buffer (None = not editing).
+    pub config_editing: Option<String>,
+    /// Agent picker choices (provider × model) for the current picker.
+    pub agent_choices: Vec<AgentChoice>,
+    /// Agent picker selection index.
+    pub agent_selected: usize,
+    /// In-flight agent run event channel.
+    pub agent_rx: Option<std::sync::mpsc::Receiver<cordanui_plugin_runtime::AgentEvent>>,
+    /// Live log of the running agent's progress events.
+    pub agent_log: Vec<String>,
+    /// Goal the in-flight agent run belongs to (survives navigation).
+    pub agent_goal: Option<String>,
 }
 
 impl App {
     pub fn new(db: Database) -> anyhow::Result<Self> {
         let goals = db::get_all(&db)?;
-        let theme = crate::theme::Theme::load(&db);
+        let styles = std::sync::Arc::new(crate::style::StyleBridge::new());
+        let theme = crate::theme::Theme::resolve(&db, &styles.session_snapshot());
         let mut list_state = ListState::default();
         if !goals.is_empty() {
             list_state.select(Some(0));
@@ -177,6 +206,7 @@ impl App {
             db,
             keybinds: crate::config::Keybinds::default(),
             theme,
+            styles,
             goals,
             expanded: HashSet::new(),
             detailed: None,
@@ -189,6 +219,15 @@ impl App {
             plugin_state: crate::plugins::TaskState::Idle,
             installed_plugins: Vec::new(),
             plugin_selected: 0,
+            config_spec: None,
+            config_values: Default::default(),
+            config_selected: 0,
+            config_editing: None,
+            agent_choices: Vec::new(),
+            agent_selected: 0,
+            agent_rx: None,
+            agent_log: Vec::new(),
+            agent_goal: None,
         })
     }
 
@@ -219,7 +258,11 @@ impl App {
             by_parent.entry(g.parent_id.clone()).or_default().push(g);
         }
         for list in by_parent.values_mut() {
-            list.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.created_at.cmp(&b.created_at)));
+            list.sort_by(|a, b| {
+                a.sort_order
+                    .cmp(&b.sort_order)
+                    .then(a.created_at.cmp(&b.created_at))
+            });
         }
 
         let mut rows = Vec::new();
@@ -279,11 +322,7 @@ impl App {
             let done = goal.status == GoalStatus::Completed
                 && by_parent
                     .get(&Some(goal.id.clone()))
-                    .map(|children| {
-                        children
-                            .iter()
-                            .all(|c| all_done(c, by_parent, memo))
-                    })
+                    .map(|children| children.iter().all(|c| all_done(c, by_parent, memo)))
                     .unwrap_or(true);
             memo.insert(goal.id.clone(), done);
             done
@@ -292,10 +331,7 @@ impl App {
         let mut memo = HashMap::new();
         self.goals
             .iter()
-            .filter(|g| {
-                g.status == GoalStatus::Completed
-                    && !all_done(g, &by_parent, &mut memo)
-            })
+            .filter(|g| g.status == GoalStatus::Completed && !all_done(g, &by_parent, &mut memo))
             .map(|g| g.id.clone())
             .collect()
     }
@@ -557,6 +593,289 @@ impl App {
         };
     }
 
+    /// `c` on a selected plugin: load its [ui] spec + stored settings and
+    /// open the configure form. Plugins without a [ui] section just report
+    /// that there's nothing to configure.
+    pub fn open_configure(&mut self) -> anyhow::Result<()> {
+        let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
+            return Ok(());
+        };
+        let dir = std::path::PathBuf::from(&p.dir);
+        let manifest = match cordanui_plugin_runtime::PluginManifest::from_dir(&dir) {
+            Ok(m) => m,
+            Err(e) => {
+                self.set_message(&format!("cannot read manifest: {e}"));
+                return Ok(());
+            }
+        };
+        let Some(spec) = manifest.ui else {
+            self.set_message("this plugin has nothing to configure");
+            return Ok(());
+        };
+        let problems = spec.validate();
+        if !problems.is_empty() {
+            self.set_message(&format!("bad plugin [ui]: {}", problems[0]));
+            return Ok(());
+        }
+
+        // Existing stored values win; otherwise fall back to defaults.
+        let mut values = db::get_plugin_settings(&self.db, &p.id)?;
+        for f in &spec.fields {
+            values
+                .entry(f.key.clone())
+                .or_insert_with(|| spec.initial_value(&f.key));
+        }
+
+        self.config_spec = Some(spec);
+        self.config_values = values;
+        self.config_selected = 0;
+        self.config_editing = None;
+        self.mode = Mode::PluginConfigure {
+            plugin: p.id.clone(),
+        };
+        Ok(())
+    }
+
+    /// Commit the in-progress edit for the selected field.
+    pub fn commit_config_field(&mut self, plugin: &str) -> anyhow::Result<()> {
+        let (Some(spec), Some(buf)) = (&self.config_spec, &self.config_editing) else {
+            return Ok(());
+        };
+        let Some(field) = spec.fields.get(self.config_selected) else {
+            return Ok(());
+        };
+
+        // Per-type validation before saving.
+        let value = buf.trim().to_string();
+        if field.required && value.is_empty() {
+            self.set_message(&format!("'{}' is required", field.key));
+            return Ok(());
+        }
+        if field.r#type == "number" && !value.is_empty() && value.parse::<f64>().is_err() {
+            self.set_message(&format!("'{}' must be numeric", field.key));
+            return Ok(());
+        }
+        if field.r#type == "select" && !value.is_empty() && !field.options.contains(&value) {
+            self.set_message(&format!(
+                "'{}' must be one of: {}",
+                field.key,
+                field.options.join(", ")
+            ));
+            return Ok(());
+        }
+
+        db::set_plugin_setting(&self.db, plugin, &field.key, &value)?;
+        self.config_values.insert(field.key.clone(), value);
+        self.config_editing = None;
+        // Move to the next field for fast entry.
+        let max = spec.fields.len().saturating_sub(1);
+        if self.config_selected < max {
+            self.config_selected += 1;
+        }
+        self.set_message("saved");
+        Ok(())
+    }
+
+    // ---------- agent runs ----------
+
+    /// Leader + run_agent: collect (active provider × model) choices and
+    /// open the picker for the selected goal.
+    pub fn open_agent_picker(&mut self, goal_id: String) -> anyhow::Result<()> {
+        self.reload_installed_plugins()?;
+        let mut choices = Vec::new();
+
+        for p in self.installed_plugins.iter().filter(|p| p.active) {
+            let dir = std::path::PathBuf::from(&p.dir);
+            let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
+                continue;
+            };
+            if !manifest.capabilities.provider {
+                continue;
+            }
+            let binary = manifest.binary_path(&dir);
+            if !binary.exists() {
+                continue;
+            }
+            let Some(provider) = &manifest.provider else {
+                continue;
+            };
+            let values = db::get_plugin_settings(&self.db, &manifest.plugin.name)?;
+            let config = db::settings_to_config(&values);
+
+            for model in &provider.models {
+                choices.push(AgentChoice {
+                    plugin: manifest.plugin.name.clone(),
+                    model: model.clone(),
+                    binary: binary.clone(),
+                    config: config.clone(),
+                });
+            }
+        }
+
+        if choices.is_empty() {
+            self.set_message("no active provider plugins with a built binary");
+            return Ok(());
+        }
+
+        self.agent_choices = choices;
+        self.agent_selected = 0;
+        self.mode = Mode::AgentPicker { goal_id };
+        Ok(())
+    }
+
+    /// Spawn the chosen provider in a background thread and mark the goal
+    /// as running.
+    pub fn start_agent_run(&mut self, goal_id: String) -> anyhow::Result<()> {
+        let Some(choice) = self.agent_choices.get(self.agent_selected).cloned() else {
+            return Ok(());
+        };
+        let Some(goal) = self.goals.iter().find(|g| g.id == goal_id) else {
+            return Ok(());
+        };
+        let title = goal.title.clone();
+        let description = goal.description.clone();
+
+        db::update(
+            &self.db,
+            &goal_id,
+            UpdateGoalInput {
+                agent_status: Some(Some(cordanui_schema::AgentStatus::Running)),
+                ..Default::default()
+            },
+        )?;
+        self.reload()?;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cfg = cordanui_plugin_runtime::AgentRunConfig {
+            task_id: goal_id.clone(),
+            title,
+            description,
+            model: Some(choice.model.clone()),
+            config: choice.config.clone(),
+        };
+        let binary = choice.binary.clone();
+
+        std::thread::spawn(move || {
+            use cordanui_plugin_runtime::spawn::run_streaming;
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let Ok(rt) = rt else {
+                let _ = tx.send(cordanui_plugin_runtime::AgentEvent::Error {
+                    message: "failed to start runtime".into(),
+                    detail: None,
+                });
+                return;
+            };
+            let result = rt.block_on(async {
+                run_streaming(&binary, &cfg, |ev| {
+                    let _ = tx.send(ev.clone());
+                })
+                .await
+            });
+            if let Err(e) = result {
+                let _ = tx.send(cordanui_plugin_runtime::AgentEvent::Error {
+                    message: "plugin invocation failed".into(),
+                    detail: Some(e.to_string()),
+                });
+            }
+        });
+
+        self.agent_rx = Some(rx);
+        self.agent_goal = Some(goal_id.clone());
+        self.agent_log.clear();
+        self.agent_log
+            .push(format!("{} — {}", choice.plugin, choice.model));
+        self.set_message("agent running");
+        self.mode = Mode::AgentRunning { goal_id };
+        Ok(())
+    }
+
+    /// Drain in-flight agent events (non-blocking), called every loop
+    /// iteration regardless of mode so completion lands even if the user
+    /// navigated away.
+    pub fn poll_agent_events(&mut self) -> anyhow::Result<()> {
+        if self.agent_rx.is_none() {
+            return Ok(());
+        }
+        let rx = self.agent_rx.take().unwrap();
+        loop {
+            match rx.try_recv() {
+                Ok(cordanui_plugin_runtime::AgentEvent::Progress { message, detail }) => {
+                    self.agent_log.push(match detail {
+                        Some(d) => format!("{message} — {d}"),
+                        None => message,
+                    });
+                    if self.agent_log.len() > 60 {
+                        self.agent_log.drain(..self.agent_log.len() - 40);
+                    }
+                    // Best-effort live progress on the goal row.
+                    if let Some(goal_id) = self.agent_goal.clone() {
+                        let last = self.agent_log.last().cloned().unwrap_or_default();
+                        let _ = db::update(
+                            &self.db,
+                            &goal_id,
+                            UpdateGoalInput {
+                                agent_progress: Some(Some(last)),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                Ok(cordanui_plugin_runtime::AgentEvent::Result(r)) => {
+                    self.finish_agent_run("completed", r.content)?;
+                    break;
+                }
+                Ok(cordanui_plugin_runtime::AgentEvent::Error { message, detail }) => {
+                    let text = match detail {
+                        Some(d) => format!("{message}: {d}"),
+                        None => message,
+                    };
+                    self.finish_agent_run("failed", text)?;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.agent_rx = Some(rx);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_agent_run("failed", "agent thread died".into())?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_agent_run(&mut self, status: &str, content: String) -> anyhow::Result<()> {
+        // The run belongs to the tracked goal, wherever the user is now.
+        let Some(goal_id) = self.agent_goal.take() else {
+            self.agent_rx = None;
+            return Ok(());
+        };
+
+        let status_val = match status {
+            "completed" => cordanui_schema::AgentStatus::Completed,
+            _ => cordanui_schema::AgentStatus::Failed,
+        };
+        db::update(
+            &self.db,
+            &goal_id,
+            UpdateGoalInput {
+                agent_status: Some(Some(status_val)),
+                agent_result: Some(Some(content.clone())),
+                ..Default::default()
+            },
+        )?;
+        self.reload()?;
+        self.set_message(&format!("agent {status}"));
+        self.agent_rx = None;
+        if matches!(self.mode, Mode::AgentRunning { .. }) {
+            self.mode = Mode::Normal;
+        }
+        Ok(())
+    }
+
     /// Re-read the plugins registry from the DB.
     pub fn reload_installed_plugins(&mut self) -> anyhow::Result<()> {
         self.installed_plugins = db::list_plugins(&self.db)?;
@@ -596,14 +915,16 @@ impl App {
                 let themes = crate::plugins::scan_theme_files(&dir);
                 if let Some(t) = themes.first() {
                     db::set_active_theme(&self.db, &t.id)?;
-                    self.theme = crate::theme::Theme::load(&self.db);
+                    self.theme =
+                        crate::theme::Theme::resolve(&self.db, &self.styles.session_snapshot());
                     msg = format!("{id} activated — theme '{}' applied", t.name);
                 } else {
                     msg = format!("{id} activated (no theme packs found)");
                 }
             } else {
                 db::clear_theme_selection(&self.db)?;
-                self.theme = crate::theme::Theme::load(&self.db);
+                self.theme =
+                    crate::theme::Theme::resolve(&self.db, &self.styles.session_snapshot());
                 msg = format!("{id} deactivated — reverted to builtin dark");
             }
         }
@@ -619,8 +940,7 @@ impl App {
         };
         let dir = std::path::PathBuf::from(&p.dir);
         if dir.exists() {
-            std::fs::remove_dir_all(&dir)
-                .with_context(|| format!("removing {}", dir.display()))?;
+            std::fs::remove_dir_all(&dir).with_context(|| format!("removing {}", dir.display()))?;
         }
         db::remove_plugin_row(&self.db, &p.id)?;
         self.set_message("plugin uninstalled");
@@ -636,6 +956,31 @@ impl App {
         }
         self.plugin_rx = Some(crate::plugins::spawn_plugin_task(&query));
         self.plugin_state = crate::plugins::TaskState::Working(Vec::new());
+    }
+
+    /// Commit any pending style changes and re-resolve the palette if
+    /// something changed. Called every loop iteration so `cord.g` /
+    /// `cord["local"]` restyles land within a frame or two.
+    pub fn apply_style_updates(&mut self) -> anyhow::Result<()> {
+        if !self.styles.dirty() {
+            return Ok(());
+        }
+        for op in self.styles.drain_pending() {
+            match op {
+                crate::style::PendingStyle::Set { var, hex } => {
+                    db::set_style_override(&self.db, &var, &hex)?;
+                }
+                crate::style::PendingStyle::Clear { var } => {
+                    db::clear_style_override(&self.db, &var)?;
+                }
+                crate::style::PendingStyle::ClearAll => {
+                    db::clear_all_style_overrides(&self.db)?;
+                }
+            }
+        }
+        self.theme = crate::theme::Theme::resolve(&self.db, &self.styles.session_snapshot());
+        self.styles.clear_dirty();
+        Ok(())
     }
 
     /// Drain the in-flight plugin task (non-blocking). Called every loop
@@ -658,8 +1003,7 @@ impl App {
                             }
                         }
                         _ => {
-                            self.plugin_state =
-                                crate::plugins::TaskState::Working(vec![line]);
+                            self.plugin_state = crate::plugins::TaskState::Working(vec![line]);
                         }
                     }
                     // Keep draining; the task may still be running.
@@ -690,17 +1034,28 @@ impl App {
                     let msg = if themes.is_empty() {
                         format!("installed {name}")
                     } else {
-                        format!("installed {name} (+{} theme{})", themes.len(), if themes.len() == 1 { "" } else { "s" })
+                        format!(
+                            "installed {name} (+{} theme{})",
+                            themes.len(),
+                            if themes.len() == 1 { "" } else { "s" }
+                        )
                     };
                     self.set_message(&msg);
-                    self.plugin_state =
-                        crate::plugins::TaskState::Installed { name, dir, theme_count: themes.len() };
+                    self.plugin_state = crate::plugins::TaskState::Installed {
+                        name,
+                        dir,
+                        theme_count: themes.len(),
+                    };
                     // Done — hand control back to the list.
                     if matches!(
                         self.mode,
-                        Mode::PluginManager { pane: PluginPane::Install }
+                        Mode::PluginManager {
+                            pane: PluginPane::Install
+                        }
                     ) {
-                        self.mode = Mode::PluginManager { pane: PluginPane::List };
+                        self.mode = Mode::PluginManager {
+                            pane: PluginPane::List,
+                        };
                         self.input.clear();
                     }
                     break;
@@ -711,8 +1066,7 @@ impl App {
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    self.plugin_state =
-                        crate::plugins::TaskState::Error("task thread died".into());
+                    self.plugin_state = crate::plugins::TaskState::Error("task thread died".into());
                     break;
                 }
             }

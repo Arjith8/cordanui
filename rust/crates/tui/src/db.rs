@@ -178,10 +178,7 @@ pub fn uncomplete(db: &Database, id: &str) -> anyhow::Result<Option<Goal>> {
 
 /// Delete a goal. `ON DELETE CASCADE` removes all subgoals.
 pub fn delete(db: &Database, id: &str) -> anyhow::Result<()> {
-    db.execute(
-        "DELETE FROM goals WHERE id = ?",
-        vec![Value::from(id)],
-    )?;
+    db.execute("DELETE FROM goals WHERE id = ?", vec![Value::from(id)])?;
     Ok(())
 }
 
@@ -222,7 +219,11 @@ mod tests {
         )
         .unwrap();
         // Root: plain uuid, no dots.
-        assert!(!root.id.contains('.'), "root id should have no dots: {}", root.id);
+        assert!(
+            !root.id.contains('.'),
+            "root id should have no dots: {}",
+            root.id
+        );
 
         let child = create(
             &db,
@@ -278,16 +279,18 @@ mod tests {
 }
 
 pub fn get_roots(db: &Database) -> anyhow::Result<Vec<Goal>> {
-    let result = db.query_simple(
-        &format!("SELECT {SELECT_COLS} FROM goals WHERE parent_id IS NULL ORDER BY sort_order, created_at"),
-    )?;
+    let result = db.query_simple(&format!(
+        "SELECT {SELECT_COLS} FROM goals WHERE parent_id IS NULL ORDER BY sort_order, created_at"
+    ))?;
     Ok(result.rows().iter().map(values_to_goal).collect())
 }
 
 /// Fetch immediate children of a goal.
 pub fn get_children(db: &Database, parent_id: &str) -> anyhow::Result<Vec<Goal>> {
     let result = db.query(
-        &format!("SELECT {SELECT_COLS} FROM goals WHERE parent_id = ? ORDER BY sort_order, created_at"),
+        &format!(
+            "SELECT {SELECT_COLS} FROM goals WHERE parent_id = ? ORDER BY sort_order, created_at"
+        ),
         vec![Value::from(parent_id)],
     )?;
     Ok(result.rows().iter().map(values_to_goal).collect())
@@ -409,6 +412,110 @@ pub fn clear_theme_selection(db: &Database) -> anyhow::Result<()> {
         vec![],
     )?;
     Ok(())
+}
+
+// ---------- plugin settings (declarative [ui] forms) ----------
+
+/// All values stored for one plugin, with the namespace prefix stripped.
+/// Returns a map of bare field key → stored value.
+pub fn get_plugin_settings(
+    db: &Database,
+    plugin: &str,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let result = db.query_simple(&format!(
+        "SELECT key, value FROM settings WHERE key LIKE '{}.%'",
+        escape_like(plugin)
+    ))?;
+    let mut map = std::collections::BTreeMap::new();
+    let prefix = format!("{plugin}.");
+    for row in result.rows() {
+        if let (Some(Value::Text(k)), Some(Value::Text(v))) = (row.first(), row.get(1)) {
+            if let Some(bare) = k.strip_prefix(&prefix) {
+                map.insert(bare.to_string(), v.clone());
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Store one setting under the plugin's namespace.
+pub fn set_plugin_setting(
+    db: &Database,
+    plugin: &str,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        vec![Value::from(format!("{plugin}.{key}")), Value::from(value)],
+    )?;
+    Ok(())
+}
+
+/// The full namespaced key for a plugin field (for diagnostics).
+pub fn plugin_setting_key(plugin: &str, key: &str) -> String {
+    format!("{plugin}.{key}")
+}
+
+fn escape_like(s: &str) -> String {
+    s.replace('\'', "''")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+// ---------- style overrides (cord.g.style.*) ----------
+
+/// All global style overrides, keyed by bare variable name (the
+/// `style.` prefix is stripped). These sync to every client via Turso.
+pub fn get_style_overrides(
+    db: &Database,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let result = db.query_simple("SELECT key, value FROM settings WHERE key LIKE 'style.%'")?;
+    let mut map = std::collections::BTreeMap::new();
+    for row in result.rows() {
+        if let (Some(Value::Text(k)), Some(Value::Text(v))) = (row.first(), row.get(1)) {
+            if let Some(bare) = k.strip_prefix("style.") {
+                map.insert(bare.to_string(), v.clone());
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Persist one global style override (`settings` key `style.<var>`).
+pub fn set_style_override(db: &Database, var: &str, hex: &str) -> anyhow::Result<()> {
+    set_plugin_setting(db, "style", var, hex)
+}
+
+/// Remove one global style override.
+pub fn clear_style_override(db: &Database, var: &str) -> anyhow::Result<()> {
+    db.execute(
+        "DELETE FROM settings WHERE key = ?",
+        vec![Value::from(format!("style.{var}"))],
+    )?;
+    Ok(())
+}
+
+/// Remove all global style overrides.
+pub fn clear_all_style_overrides(db: &Database) -> anyhow::Result<()> {
+    db.execute("DELETE FROM settings WHERE key LIKE 'style.%'", vec![])?;
+    Ok(())
+}
+
+/// Serialize a plugin's settings into the `config` JSON object handed to
+/// subprocess invocations. Empty map → None (field omitted on the wire).
+pub fn settings_to_config(
+    values: &std::collections::BTreeMap<String, String>,
+) -> Option<serde_json::Value> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut obj = serde_json::Map::new();
+    for (k, v) in values {
+        obj.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    Some(serde_json::Value::Object(obj))
 }
 
 fn values_to_plugin(row: &Vec<Value>) -> PluginRow {
