@@ -13,7 +13,7 @@
 
 use std::sync::{mpsc, Mutex};
 
-use cordanui_plugin_runtime::{PendingUi, UiHost, UiLevel, UiResponse};
+use cordanui_plugin_runtime::{PanelHost, PanelSpec, PendingUi, UiHost, UiLevel, UiResponse};
 
 /// Everything a plugin can put in front of the user.
 pub enum PluginUiEvent {
@@ -23,18 +23,29 @@ pub enum PluginUiEvent {
     Notify { level: UiLevel, message: String },
 }
 
+/// Panel lifecycle commands.
+pub enum PanelCommand {
+    Open(PanelSpec),
+    Close,
+}
+
 /// Bridge shared with plugin Lua states via `Arc`.
 pub struct PluginUiBridge {
     tx: mpsc::Sender<PluginUiEvent>,
     rx: Mutex<mpsc::Receiver<PluginUiEvent>>,
+    panel_tx: mpsc::Sender<PanelCommand>,
+    panel_rx: Mutex<mpsc::Receiver<PanelCommand>>,
 }
 
 impl PluginUiBridge {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel();
+        let (panel_tx, panel_rx) = mpsc::channel();
         Self {
             tx,
             rx: Mutex::new(rx),
+            panel_tx,
+            panel_rx: Mutex::new(panel_rx),
         }
     }
 
@@ -42,6 +53,11 @@ impl PluginUiBridge {
     /// event-loop iteration.
     pub fn try_take_event(&self) -> Option<PluginUiEvent> {
         self.rx.lock().unwrap().try_recv().ok()
+    }
+
+    /// Take the next queued panel command, if any.
+    pub fn try_take_panel_command(&self) -> Option<PanelCommand> {
+        self.panel_rx.lock().unwrap().try_recv().ok()
     }
 }
 
@@ -54,6 +70,16 @@ impl UiHost for PluginUiBridge {
 
     fn notify(&self, level: UiLevel, message: String) {
         let _ = self.tx.send(PluginUiEvent::Notify { level, message });
+    }
+}
+
+impl PanelHost for PluginUiBridge {
+    fn open_panel(&self, spec: PanelSpec) {
+        let _ = self.panel_tx.send(PanelCommand::Open(spec));
+    }
+
+    fn close_panel(&self) {
+        let _ = self.panel_tx.send(PanelCommand::Close);
     }
 }
 
@@ -101,7 +127,7 @@ mod tests {
     #[test]
     fn lua_input_dialog_round_trips_through_app() {
         use crate::app::{App, Mode};
-        use cordanui_plugin_runtime::{CompleteRequest, LuaPlugin};
+        use cordanui_plugin_runtime::{CompleteRequest, HostHooks, LuaPlugin};
 
         // Plugin fixture: asks for a name, echoes it back.
         let plug_dir = std::env::temp_dir()
@@ -135,7 +161,7 @@ end
         std::thread::scope(|scope| {
             let styles = app.styles.clone();
             let ui = app.plugin_ui.clone();
-            let plugin = LuaPlugin::load(&plug_dir, "asker", None, Some(styles), Some(ui)).unwrap();
+            let plugin = LuaPlugin::load(&plug_dir, "asker", None, HostHooks::new().with_styles(styles).with_ui(ui)).unwrap();
 
             let answer = scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -191,7 +217,7 @@ end
     #[test]
     fn lua_multiselect_and_notify_flow() {
         use crate::app::{App, Mode};
-        use cordanui_plugin_runtime::{CompleteRequest, LuaPlugin};
+        use cordanui_plugin_runtime::{CompleteRequest, HostHooks, LuaPlugin};
 
         let plug_dir = std::env::temp_dir()
             .join("cordanui-plugin-ui-test")
@@ -231,7 +257,7 @@ end
         std::thread::scope(|scope| {
             let styles = app.styles.clone();
             let ui = app.plugin_ui.clone();
-            let plugin = LuaPlugin::load(&plug_dir, "asker", None, Some(styles), Some(ui)).unwrap();
+            let plugin = LuaPlugin::load(&plug_dir, "asker", None, HostHooks::new().with_styles(styles).with_ui(ui)).unwrap();
 
             let answer = scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -294,7 +320,7 @@ end
     #[test]
     fn lua_confirm_dialog_cancel_resolves_false() {
         use crate::app::{App, Mode};
-        use cordanui_plugin_runtime::{CompleteRequest, LuaPlugin};
+        use cordanui_plugin_runtime::{CompleteRequest, HostHooks, LuaPlugin};
 
         let plug_dir = std::env::temp_dir()
             .join("cordanui-plugin-ui-test")
@@ -327,7 +353,7 @@ end
         std::thread::scope(|scope| {
             let styles = app.styles.clone();
             let ui = app.plugin_ui.clone();
-            let plugin = LuaPlugin::load(&plug_dir, "asker", None, Some(styles), Some(ui)).unwrap();
+            let plugin = LuaPlugin::load(&plug_dir, "asker", None, HostHooks::new().with_styles(styles).with_ui(ui)).unwrap();
 
             let answer = scope.spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -366,4 +392,97 @@ end
         let _ = std::fs::remove_dir_all(&db_dir);
         let _ = std::fs::remove_dir_all(&plug_dir);
     }
+
+    /// Panel lifecycle through the App: show_panel opens Mode::PluginPanel,
+    /// keys route to on_key, unhandled esc closes it.
+    #[test]
+    fn lua_panel_lifecycle_through_app() {
+        use crate::app::{App, Mode};
+        use cordanui_plugin_runtime::{CompleteRequest, HostHooks, LuaPlugin};
+
+        let plug_dir = std::env::temp_dir()
+            .join("cordanui-plugin-ui-test")
+            .join(cordanui_schema::new_id());
+        std::fs::create_dir_all(&plug_dir).unwrap();
+        std::fs::write(
+            plug_dir.join("main.lua"),
+            r##"
+plugin = {}
+local count = 0
+function plugin.complete(req)
+  cord.ui.show_panel{
+    title = "Counter",
+    draw = function()
+      return { { content = "count=" .. count } }
+    end,
+    on_key = function(key)
+      if key == "+" then count = count + 1; return true end
+      return false
+    end,
+  }
+  return { content = "panel-closed:" .. count }
+end
+"##,
+        )
+        .unwrap();
+
+        let db_dir = std::env::temp_dir()
+            .join(format!("cordanui-plugin-ui-app-{}", cordanui_schema::new_id()));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(db).unwrap();
+
+        let plugin = LuaPlugin::load(
+            &plug_dir,
+            "paneleer",
+            None,
+            HostHooks::new()
+                .with_styles(app.styles.clone())
+                .with_ui(app.plugin_ui.clone())
+                .with_panels(app.plugin_ui.clone()),
+        )
+        .unwrap();
+
+        // complete() returns immediately (show_panel is non-blocking).
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp = rt.block_on(async {
+            plugin
+                .complete(&CompleteRequest {
+                    model: "m".into(),
+                    prompt: "p".into(),
+                    system: None,
+                    max_tokens: None,
+                    temperature: None,
+                    config: None,
+                })
+                .await
+                .unwrap()
+        });
+
+        app.poll_plugin_panel();
+        assert!(matches!(app.mode, Mode::PluginPanel));
+        assert!(app.plugin_panel.is_some());
+
+        // Keys reach the plugin and mutate its state.
+        assert!((app.plugin_panel.as_ref().unwrap().on_key)("+"));
+        assert!((app.plugin_panel.as_ref().unwrap().on_key)("+"));
+        let drawn = format!("{:?}", (app.plugin_panel.as_ref().unwrap().draw)());
+        assert!(drawn.contains("count=2"), "draw saw stale state: {drawn}");
+
+        // Unhandled esc closes the panel.
+        app.close_plugin_panel();
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(resp.content, "panel-closed:0");
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&plug_dir);
+    }
+
 }

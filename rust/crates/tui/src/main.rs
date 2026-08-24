@@ -93,6 +93,7 @@ fn run(
             Mode::PluginConfigure { plugin } => handle_configure_key(app, key, &plugin)?,
             Mode::AgentPicker { .. } => handle_agent_picker_key(app, key)?,
             Mode::PluginModal => handle_plugin_modal_key(app, key),
+            Mode::PluginPanel => handle_plugin_panel_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
@@ -102,6 +103,7 @@ fn run(
         app.poll_plugin_search()?;
         app.apply_style_updates()?;
         app.poll_plugin_ui_requests();
+        app.poll_plugin_panel();
 
         // Clear transient message after any key in normal mode
         if app.mode == Mode::Normal && !app.leader_pending && app.message.is_some() {
@@ -394,6 +396,46 @@ fn handle_confirm_delete_key(app: &mut app::App, key: KeyEvent) -> anyhow::Resul
         _ => {}
     }
     Ok(())
+}
+
+/// Keys in a plugin-owned panel (`cord.ui.show_panel`). Keys are forwarded
+/// to the plugin's `on_key` by name; an unhandled Esc closes the panel.
+fn handle_plugin_panel_key(app: &mut app::App, key: KeyEvent) {
+    let name = match key.code {
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "shift+tab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Char(c) => {
+            let base = c.to_string();
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                format!("ctrl+{base}")
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                c.to_ascii_uppercase().to_string()
+            } else {
+                base
+            }
+        }
+        _ => return,
+    };
+
+    let handled = app
+        .plugin_panel
+        .as_ref()
+        .map(|spec| (spec.on_key)(&name))
+        .unwrap_or(false);
+    if !handled && name == "esc" {
+        app.close_plugin_panel();
+    }
 }
 
 /// Keys in a plugin-requested modal (`cord.ui.input/confirm/pick`).

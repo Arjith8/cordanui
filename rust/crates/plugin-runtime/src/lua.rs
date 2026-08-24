@@ -54,9 +54,41 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
-use crate::ui::{SharedUiHost, UiLevel, UiRequest, UiResponse};
+use crate::ui::{PanelSpec, SharedPanelHost, SharedUiHost, UiLevel, UiRequest, UiResponse, Widget};
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
+
+/// Host capabilities handed to a plugin at load time. Everything is
+/// optional: absent surfaces make the corresponding `cord.*` calls error
+/// cleanly instead of existing silently.
+#[derive(Default, Clone)]
+pub struct HostHooks {
+    pub styles: Option<SharedStyleHost>,
+    pub ui: Option<SharedUiHost>,
+    pub panels: Option<SharedPanelHost>,
+}
+
+impl HostHooks {
+    /// No host capabilities attached.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_styles(mut self, styles: SharedStyleHost) -> Self {
+        self.styles = Some(styles);
+        self
+    }
+
+    pub fn with_ui(mut self, ui: SharedUiHost) -> Self {
+        self.ui = Some(ui);
+        self
+    }
+
+    pub fn with_panels(mut self, panels: SharedPanelHost) -> Self {
+        self.panels = Some(panels);
+        self
+    }
+}
 
 /// An in-process Lua plugin: a loaded and initialized `main.lua`.
 pub struct LuaPlugin {
@@ -81,8 +113,7 @@ impl LuaPlugin {
         dir: &Path,
         name: &str,
         config: Option<serde_json::Value>,
-        styles: Option<SharedStyleHost>,
-        ui: Option<SharedUiHost>,
+        hooks: HostHooks,
     ) -> Result<Self> {
         let entry = dir.join(crate::manifest::PluginManifest::LUA_ENTRY);
         let source = std::fs::read_to_string(&entry)
@@ -90,7 +121,8 @@ impl LuaPlugin {
 
         let lua = Arc::new(Lua::new());
         register_api(&lua, dir, name, config).context("registering cordanui API")?;
-        register_cord(&lua, styles, ui).context("registering cord styling API")?;
+        register_cord(&lua, hooks.styles, hooks.ui, hooks.panels)
+            .context("registering cord styling API")?;
 
         // Let scripts require sibling files relative to the plugin root.
         let package: Table = lua.globals().get("package")?;
@@ -322,9 +354,10 @@ fn register_cord(
     lua: &Lua,
     styles: Option<SharedStyleHost>,
     ui: Option<SharedUiHost>,
+    panels: Option<SharedPanelHost>,
 ) -> mlua::Result<()> {
     let cord = lua.create_table()?;
-    register_cord_ui(lua, &cord, ui)?;
+    register_cord_ui(lua, &cord, ui, panels)?;
 
     for scope in ["g", "local"] {
         let persistent = scope == "g";
@@ -422,7 +455,12 @@ fn register_cord(
 /// All three await the user's answer; the host keeps its event loop (and
 /// other plugins) running while a plugin waits. Cancel resolves to
 /// `nil`/`false`; a host that cannot show the dialog raises an error.
-fn register_cord_ui(lua: &Lua, cord: &Table, ui: Option<SharedUiHost>) -> mlua::Result<()> {
+fn register_cord_ui(
+    lua: &Lua,
+    cord: &Table,
+    ui: Option<SharedUiHost>,
+    panels: Option<SharedPanelHost>,
+) -> mlua::Result<()> {
     let api = lua.create_table()?;
 
     // cord.ui.input{title?, placeholder?, prefill?} -> string | nil
@@ -635,6 +673,70 @@ fn register_cord_ui(lua: &Lua, cord: &Table, ui: Option<SharedUiHost>) -> mlua::
         })?,
     )?;
 
+    // cord.ui.show_panel{title?, draw = fn, on_key = fn?} -> true
+    // Opens a persistent panel. draw() returns a widget tree each frame;
+    // on_key(keyname) -> bool (true = handled). Returns immediately; the
+    // panel lives until closed.
+    api.set(
+        "show_panel",
+        lua.create_function({
+            let panels = panels.clone();
+            move |_, params: Table| {
+                let Some(host) = panels.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.ui is not available in this host",
+                    ));
+                };
+                let title: String = params.get("title").unwrap_or_default();
+                let draw_fn: Function = params
+                    .get("draw")
+                    .map_err(|_| mlua::Error::runtime("show_panel needs a draw function"))?;
+                let on_key_fn: Option<Function> = params.get("on_key").ok();
+
+                let draw_fn_for_draw = draw_fn.clone();
+                let draw = Box::new(move || -> Widget {
+                    match draw_fn_for_draw.call::<LuaValue>(()) {
+                        Ok(v) => Widget::from_lua(&v)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(Widget::empty),
+                        Err(e) => {
+                            tracing::error!(target: "plugin", "panel draw failed: {e}");
+                            Widget::empty()
+                        }
+                    }
+                });
+
+                let on_key = Box::new(move |key: &str| -> bool {
+                    on_key_fn
+                        .as_ref()
+                        .and_then(|f| f.call::<bool>(key).ok())
+                        .unwrap_or(false)
+                });
+
+                host.open_panel(PanelSpec { title, draw, on_key });
+                Ok(true)
+            }
+        })?,
+    )?;
+
+    // cord.ui.close_panel() -> true
+    api.set(
+        "close_panel",
+        lua.create_function({
+            let panels = panels.clone();
+            move |_, ()| {
+                let Some(host) = panels.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.ui is not available in this host",
+                    ));
+                };
+                host.close_panel();
+                Ok(true)
+            }
+        })?,
+    )?;
+
     cord.set("ui", api)?;
     Ok(())
 }
@@ -752,7 +854,7 @@ function plugin.complete(req)
 end
 "#,
         );
-        let plugin = LuaPlugin::load(&dir, "echo", None, None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "echo", None, HostHooks::new()).unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "test-model".into(),
@@ -788,7 +890,7 @@ end
 "#,
         );
         let config = serde_json::json!({ "api_key": "sk-test-123" });
-        let plugin = LuaPlugin::load(&dir, "cfg", Some(config), None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "cfg", Some(config), HostHooks::new()).unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "m".into(),
@@ -840,7 +942,7 @@ end
             ),
         );
 
-        let plugin = LuaPlugin::load(&dir, "stream", None, None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "stream", None, HostHooks::new()).unwrap();
 
         let messages = Arc::new(Mutex::new(Vec::new()));
         let sink = messages.clone();
@@ -881,7 +983,7 @@ end
     async fn missing_entry_script_is_a_clean_error() {
         let dir = std::env::temp_dir().join(TMP).join("empty");
         std::fs::create_dir_all(&dir).unwrap();
-        let err = LuaPlugin::load(&dir, "empty", None, None, None).unwrap_err();
+        let err = LuaPlugin::load(&dir, "empty", None, HostHooks::new()).unwrap_err();
         assert!(err.to_string().contains("main.lua"));
         cleanup("empty");
     }
@@ -897,7 +999,7 @@ function plugin.agent_run(cfg, emit)
 end
 "#,
         );
-        let plugin = LuaPlugin::load(&dir, "noterminal", None, None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "noterminal", None, HostHooks::new()).unwrap();
         let err = plugin
             .agent_run(
                 &AgentRunConfig {
@@ -934,8 +1036,9 @@ end
             "base_url": "http://127.0.0.1:1", // unreachable; we only load
             "default_model": "grok-code",
         });
-        let _plugin = LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), None, None)
-            .expect("provider-zen should load");
+        let _plugin =
+            LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), HostHooks::new())
+                .expect("provider-zen should load");
     }
 
     // ---------- cord.* styling ----------
@@ -996,7 +1099,7 @@ end
     async fn cord_styling_routes_g_and_local() {
         let dir = fixture("styles", STYLES_LUA);
         let host = Arc::new(MockStyles::default());
-        let plugin = LuaPlugin::load(&dir, "styles", None, Some(host.clone()), None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "styles", None, HostHooks::new().with_styles(host.clone())).unwrap();
 
         let resp = plugin
             .complete(&CompleteRequest {
@@ -1045,7 +1148,7 @@ end
 "##,
         );
         let host = Arc::new(MockStyles::default());
-        let plugin = LuaPlugin::load(&dir, "styles-reset", None, Some(host.clone()), None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "styles-reset", None, HostHooks::new().with_styles(host.clone())).unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "m".into(),
@@ -1132,8 +1235,7 @@ end
             &dir,
             "ui-input",
             None,
-            None,
-            Some(MockUi::answering(UiResponse::Text(Some("hello".into())))),
+            HostHooks::new().with_ui(MockUi::answering(UiResponse::Text(Some("hello".into())))),
         )
         .unwrap();
         let resp = complete_simple(&plugin).await;
@@ -1162,8 +1264,7 @@ end
             &dir,
             "ui-cancel",
             None,
-            None,
-            Some(MockUi::answering(UiResponse::Text(None))),
+            HostHooks::new().with_ui(MockUi::answering(UiResponse::Text(None))),
         )
         .unwrap();
         let resp = complete_simple(&plugin).await;
@@ -1189,8 +1290,7 @@ end
             &dir,
             "ui-pick",
             None,
-            None,
-            Some(MockUi::answering(UiResponse::Choice(Some(1)))),
+            HostHooks::new().with_ui(MockUi::answering(UiResponse::Choice(Some(1)))),
         )
         .unwrap();
         let resp = complete_simple(&plugin).await;
@@ -1269,7 +1369,13 @@ end
         // Popped LIFO — push in reverse answer order.
         (*host.queue.lock().unwrap()).push(UiResponse::Text(Some("line1\nline2".into())));
         (*host.queue.lock().unwrap()).push(UiResponse::Choices(Some(vec![1, 2])));
-        let plugin = LuaPlugin::load(&dir, "ui-more", None, None, Some(host.clone() as _)).unwrap();
+        let plugin = LuaPlugin::load(
+            &dir,
+            "ui-more",
+            None,
+            HostHooks::new().with_ui(host.clone() as _),
+        )
+        .unwrap();
 
         let resp = complete_simple(&plugin).await;
 
@@ -1299,8 +1405,7 @@ end
             &dir,
             "ui-refused",
             None,
-            None,
-            Some(MockUi::answering(UiResponse::Refused(
+            HostHooks::new().with_ui(MockUi::answering(UiResponse::Refused(
                 "another dialog is open".into(),
             ))),
         )
@@ -1328,7 +1433,7 @@ function plugin.complete(req)
 end
 "##,
         );
-        let plugin = LuaPlugin::load(&dir, "ui-nohost", None, None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "ui-nohost", None, HostHooks::new()).unwrap();
         let resp = complete_simple(&plugin).await;
         assert!(
             resp.content.contains("not available"),
@@ -1337,4 +1442,111 @@ end
         );
         cleanup("ui-nohost");
     }
+
+    // ---------- cord.ui.show_panel ----------
+
+    #[derive(Default)]
+    struct CapturedPanel {
+        spec: Mutex<Option<crate::ui::PanelSpec>>,
+        closed: std::sync::atomic::AtomicBool,
+    }
+    impl crate::ui::PanelHost for CapturedPanel {
+        fn open_panel(&self, spec: crate::ui::PanelSpec) {
+            *self.spec.lock().unwrap() = Some(spec);
+        }
+        fn close_panel(&self) {
+            self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn ui_panel_draw_and_key_round_trip() {
+        use super::*; // HostHooks in scope via crate::lua; Widget via plugin_runtime root
+
+        let dir = fixture(
+            "panel",
+            r##"
+plugin = {}
+local sel = 1
+function plugin.complete(req)
+  cord.ui.show_panel{
+    title = "My dashboard",
+    draw = function()
+      return {
+        { content = "sel=" .. sel },
+        { items = { "one", "two", "three" }, highlight = sel },
+      }
+    end,
+    on_key = function(key)
+      if key == "down" then sel = math.min(sel + 1, 3); return true end
+      if key == "up" then sel = math.max(sel - 1, 1); return true end
+      if key == "q" then cord.ui.close_panel(); return true end
+      return false
+    end,
+  }
+  return { content = "closed" }
+end
+"##,
+        );
+        let host = std::sync::Arc::new(CapturedPanel::default());
+        let plugin =
+            LuaPlugin::load(&dir, "panel", None, HostHooks::new().with_panels(host.clone()))
+                .unwrap();
+
+        // Drive complete() to completion on this thread's runtime; the
+        // panel call itself is non-blocking, so complete() finishes only
+        // when the script's function returns.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp = rt.block_on(async {
+            plugin
+                .complete(&CompleteRequest {
+                    model: "m".into(),
+                    prompt: "p".into(),
+                    system: None,
+                    max_tokens: None,
+                    temperature: None,
+                    config: None,
+                })
+                .await
+                .unwrap()
+        });
+        assert_eq!(resp.content, "closed");
+
+        let spec = host.spec.lock().unwrap().take().expect("panel opened");
+        assert_eq!(spec.title, "My dashboard");
+
+        // Frame 1: highlight on item 0.
+        match (spec.draw)() {
+            Widget::Column { children } => {
+                assert!(matches!(&children[0],
+                    Widget::Text { content, .. } if content == "sel=1"));
+                assert!(matches!(&children[1],
+                    Widget::List { highlight: Some(0), .. }));
+            }
+            other => panic!("expected column, got {other:?}"),
+        }
+
+        // Keys mutate plugin state; unhandled keys report pass-through.
+        assert!(!(spec.on_key)("left"));
+        assert!((spec.on_key)("down"));
+        assert!((spec.on_key)("down"));
+
+        // Frame 2 after two downs: highlight moved to index 2.
+        match (spec.draw)() {
+            Widget::Column { children } => {
+                assert!(matches!(&children[1],
+                    Widget::List { highlight: Some(2), items } if items.len() == 3));
+            }
+            other => panic!("expected column, got {other:?}"),
+        }
+
+        // Plugin closes its own panel.
+        assert!((spec.on_key)("q"));
+        assert!(host.closed.load(std::sync::atomic::Ordering::Relaxed));
+        cleanup("panel");
+    }
+
 }

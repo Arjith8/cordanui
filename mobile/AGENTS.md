@@ -619,3 +619,58 @@ Contract:
   its own dialog in turn. Only one dialog is on screen at a time.
 - **Timeouts**: there are none — a dialog stays open until answered or
   cancelled. Don't block an agent run behind a question unless you mean it.
+
+---
+
+## 13. Panels (`cord.ui.show_panel`) — plugin-owned screens
+
+For long-lived UI (dashboards, live views), a panel is a persistent
+window the host renders from your widget tree every frame. You never
+touch the terminal: you return declarative widgets and receive key names.
+
+```lua
+local sel = 1
+local items = { "alpha", "beta", "gamma" }
+
+cord.ui.show_panel{
+  title = "My dashboard",
+  draw = function()
+    return {
+      { content = "selected " .. sel, fg = "primary", bold = true },
+      { items = items, highlight = sel },
+      { children = {                                   -- vertical stack
+          { content = "footer" },
+      } },
+    }
+  end,
+  on_key = function(key)
+    if key == "down" or key == "j" then
+      sel = math.min(sel + 1, #items); return true     -- handled → redraw
+    elseif key == "up" or key == "k" then
+      sel = math.max(sel - 1, 1); return true
+    elseif key == "esc" then
+      cord.ui.close_panel(); return true               -- close it yourself
+    end
+    return false                                       -- pass through to host
+  end,
+}
+```
+
+Contract:
+
+- **Widget shapes** (detected by fields):
+  - `{ content = "..", fg = "role"?, bold = bool? }` — a text line; `fg`
+    is any style variable name (section 11 vocabulary).
+  - `{ items = {".."}, highlight = n? }` — a list; `highlight` is a
+    1-based index.
+  - `{ children = {widget, ...} }` — vertical column.
+  - The `draw` return may be a single widget or an array of widgets.
+- **Key names**: single characters arrive as themselves (`"j"`, `"+"`),
+  named keys as `"up"`, `"down"`, `"enter"`, `"esc"`, `"tab"`,
+  `"backspace"`, `"pageup"`, etc.; control chords as `"ctrl+x"`.
+  Returning `true` means handled (host redraws); `false`/`nil` passes
+  the key through. **Unhandled Esc closes the panel.**
+- **Lifecycle**: `show_panel` returns immediately. One panel at a time —
+  a second `show_panel` replaces the first. Close via
+  `cord.ui.close_panel()` or unhandled Esc. Your Lua state (upvalues)
+  persists across frames, so plain locals are your view model.

@@ -22,7 +22,7 @@ pub mod spawn;
 pub mod style;
 pub mod ui;
 
-pub use lua::LuaPlugin;
+pub use lua::{HostHooks, LuaPlugin};
 pub use manifest::{
     BuildConfig, PluginCapability, PluginManifest, ProviderConfig, UiField, UiSpec,
 };
@@ -31,4 +31,4 @@ pub use protocol::{
 };
 pub use spawn::{run_one_shot, run_streaming};
 pub use style::{parse_color, NullStyleHost, StyleHost, CORE_VARS, LEGACY_ALIASES};
-pub use ui::{NoUiHost, PendingUi, SharedUiHost, UiHost, UiLevel, UiRequest, UiResponse};
+pub use ui::{NoUiHost, PanelHost, PanelSpec, PendingUi, SharedPanelHost, SharedUiHost, UiHost, UiLevel, UiRequest, UiResponse, Widget};

@@ -79,6 +79,64 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Mode::PluginModal = &app.mode {
         render_plugin_modal(app, frame);
     }
+    if let Mode::PluginPanel = &app.mode {
+        render_plugin_panel(app, frame);
+    }
+}
+
+/// A plugin-owned panel (`cord.ui.show_panel`): the plugin returns a
+/// widget tree each frame; we render it into a centered window and route
+/// keys back to it.
+fn render_plugin_panel(app: &App, frame: &mut Frame) {
+    use cordanui_plugin_runtime::Widget;
+
+    let Some(spec) = app.plugin_panel.as_ref() else {
+        return;
+    };
+    let c = &app.theme.colors;
+    let area = centered_rect(60, 70, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" {} ", spec.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+
+    // Flatten the widget tree into lines.
+    let mut lines: Vec<Line> = Vec::new();
+    fn flatten(w: &Widget, c: &Palette, out: &mut Vec<Line>) {
+        match w {
+            Widget::Text { content, fg, bold } => {
+                let mut style = Style::default()
+                    .fg(fg.as_deref().and_then(|role| c.get(role)).unwrap_or(c.on_background));
+                if *bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                out.push(Line::from(Span::styled(content.clone(), style)));
+            }
+            Widget::List { items, highlight } => {
+                for (i, item) in items.iter().enumerate() {
+                    let style = if Some(i) == *highlight {
+                        Style::default().fg(c.on_primary).bg(c.primary)
+                    } else {
+                        Style::default().fg(c.on_background)
+                    };
+                    out.push(Line::from(Span::styled(
+                        format!("  {item}"),
+                        style,
+                    )));
+                }
+            }
+            Widget::Column { children } => {
+                for child in children {
+                    flatten(child, c, out);
+                }
+            }
+        }
+    }
+    flatten(&(spec.draw)(), c, &mut lines);
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// A plugin-requested dialog (`cord.ui.input/confirm/pick`), rendered as
@@ -369,6 +427,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
             let text = app.plugin_modal_text().unwrap_or_default();
             (" PLUGIN DIALOG ".to_string(), text.to_string())
         }
+        Mode::PluginPanel => (" PLUGIN PANEL ".to_string(), String::new()),
     };
 
     let label_style = match &app.mode {
@@ -381,7 +440,8 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::PluginConfigure { .. }
         | Mode::AgentPicker { .. }
         | Mode::AgentRunning { .. }
-        | Mode::PluginModal => Style::default().fg(c.primary),
+        | Mode::PluginModal
+        | Mode::PluginPanel => Style::default().fg(c.primary),
         Mode::ConfirmDelete { .. } => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
     };
@@ -441,6 +501,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::PluginConfigure { .. } => "↑↓ field · Enter edit · Enter save · Esc back".into(),
         Mode::AgentPicker { .. } => "↑↓ model · Enter run · Esc close".into(),
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
+        Mode::PluginPanel => "plugin panel — keys go to the plugin".into(),
         Mode::PluginModal => match app.plugin_modal.as_ref().map(|m| &m.kind) {
             Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
             Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),

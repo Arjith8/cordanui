@@ -101,6 +101,117 @@ impl UiLevel {
     }
 }
 
+// ---------- tier 2: persistent panels ----------
+
+/// One node of a declarative widget tree. Plugins never touch the
+/// terminal — they return these from their `draw` callback and the host
+/// renders them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Widget {
+    /// A styled line of text.
+    Text {
+        content: String,
+        /// Style variable name (e.g. "primary"); None = default foreground.
+        fg: Option<String>,
+        bold: bool,
+    },
+    /// Items rendered top-to-bottom, one per line, with an optional
+    /// highlighted row.
+    List {
+        items: Vec<String>,
+        highlight: Option<usize>,
+    },
+    /// Vertical stack of children.
+    Column { children: Vec<Widget> },
+}
+
+impl Widget {
+    pub fn text(content: impl Into<String>) -> Self {
+        Self::Text { content: content.into(), fg: None, bold: false }
+    }
+
+    /// An empty tree (renders nothing).
+    pub fn empty() -> Self {
+        Self::Column { children: Vec::new() }
+    }
+
+    /// Extract a widget tree from a Lua value. Accepted shapes:
+    /// - `{ content = "..", fg = "role?", bold = bool? }`      → Text
+    /// - `{ items = {..}, highlight = n? }`                    → List (1-based)
+    /// - `{ children = {widget,...} }`                         → Column
+    /// - an array of any of the above                          → Column
+    /// - `nil`                                                 → None
+    pub fn from_lua(value: &LuaValue) -> mlua::Result<Option<Widget>> {
+        let LuaValue::Table(t) = value else {
+            return Ok(match value {
+                LuaValue::Nil => None,
+                LuaValue::String(s) => Some(Self::text(s.to_string_lossy())),
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "cannot render {} as a widget",
+                        other.type_name()
+                    )))
+                }
+            });
+        };
+
+        if let Ok(items) = t.get::<Vec<String>>("items") {
+            let highlight: Option<usize> = t.get::<mlua::Integer>("highlight").ok().map(|n| (n - 1).max(0) as usize);
+            return Ok(Some(Self::List { items, highlight }));
+        }
+        if let Ok(children_values) = t.get::<Vec<LuaValue>>("children") {
+            let mut children = Vec::new();
+            for child in &children_values {
+                if let Some(w) = Self::from_lua(child)? {
+                    children.push(w);
+                }
+            }
+            return Ok(Some(Self::Column { children }));
+        }
+        if let Ok(content) = t.get::<String>("content") {
+            let fg: Option<String> = t.get("fg").ok();
+            let bold: bool = t.get("bold").unwrap_or(false);
+            return Ok(Some(Self::Text { content, fg, bold }));
+        }
+        // Plain array of widgets.
+        let pairs: Vec<(LuaValue, LuaValue)> = t.pairs().collect::<Result<_, _>>()?;
+        if !pairs.is_empty() && pairs.iter().all(|(k, _)| matches!(k, LuaValue::Integer(_))) {
+            let mut children = Vec::new();
+            for (_, v) in pairs {
+                if let Some(w) = Self::from_lua(&v)? {
+                    children.push(w);
+                }
+            }
+            return Ok(Some(Self::Column { children }));
+        }
+        Err(mlua::Error::runtime(
+            "widget needs one of: content, items, children",
+        ))
+    }
+}
+
+use mlua::Value as LuaValue;
+
+/// A long-lived panel: `draw` runs every frame, `on_key` receives key
+/// names ("a", "up", "enter", "esc", ...). Returning `true` from `on_key`
+/// means "handled, redraw"; `false` passes the key through to the host
+/// (Esc pass-through closes the panel).
+pub struct PanelSpec {
+    pub title: String,
+    pub draw: Box<dyn Fn() -> Widget + Send>,
+    pub on_key: Box<dyn Fn(&str) -> bool + Send>,
+}
+
+/// Host side of `cord.ui.show_panel` / `cord.ui.close_panel`.
+pub trait PanelHost: Send + Sync {
+    fn open_panel(&self, spec: PanelSpec);
+    /// No-op if no panel is open.
+    fn close_panel(&self);
+}
+
+/// Convenience alias for hosts sharing one bridge across runtimes.
+pub type SharedPanelHost = std::sync::Arc<dyn PanelHost>;
+
 /// A request plus the channel the host answers on.
 ///
 /// Hosts that drop a `PendingUi` without responding cause the waiting

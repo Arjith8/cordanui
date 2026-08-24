@@ -13,6 +13,7 @@ use cordanui_sync::Database;
 
 use crate::db;
 use cordanui_plugin_runtime::{UiRequest, UiResponse};
+use crate::plugin_ui::PanelCommand;
 
 /// What the TUI is currently doing. Determines how input is handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,9 @@ pub enum Mode {
     /// lives in [`App::plugin_modal`] because it carries a non-comparable
     /// responder channel.
     PluginModal,
+    /// A plugin owns the screen via `cord.ui.show_panel`. Payload in
+    /// [`App::plugin_panel`].
+    PluginPanel,
 }
 
 /// A plugin-requested modal currently on screen.
@@ -191,6 +195,9 @@ pub struct App {
     /// The open plugin modal, if any. Always paired with
     /// [`Mode::PluginModal`].
     pub plugin_modal: Option<ActivePluginModal>,
+    /// The open plugin panel, if any. Always paired with
+    /// [`Mode::PluginPanel`].
+    pub plugin_panel: Option<cordanui_plugin_runtime::PanelSpec>,
     /// All goals loaded from the DB.
     pub goals: Vec<Goal>,
     /// IDs of expanded nodes in the tree.
@@ -253,6 +260,7 @@ impl App {
             styles,
             plugin_ui,
             plugin_modal: None,
+            plugin_panel: None,
             goals,
             expanded: HashSet::new(),
             detailed: None,
@@ -1197,6 +1205,29 @@ impl App {
             _ => UiResponse::Text(None),
         };
         self.answer_plugin_modal(response);
+    }
+
+    /// Take the next queued `show_panel` / `close_panel` command.
+    /// Called every loop iteration after [`Self::poll_plugin_ui_requests`].
+    pub fn poll_plugin_panel(&mut self) {
+        match self.plugin_ui.try_take_panel_command() {
+            Some(PanelCommand::Open(spec)) => {
+                // One panel at a time; a second replaces the first (the
+                // old spec is dropped, which is the documented behavior).
+                self.plugin_panel = Some(spec);
+                self.mode = Mode::PluginPanel;
+            }
+            Some(PanelCommand::Close) => self.close_plugin_panel(),
+            None => {}
+        }
+    }
+
+    /// Close the plugin panel (Esc pass-through or `cord.ui.close_panel`).
+    pub fn close_plugin_panel(&mut self) {
+        self.plugin_panel = None;
+        if self.mode == Mode::PluginPanel {
+            self.cancel();
+        }
     }
 
     /// Commit any pending style changes and re-resolve the palette if
