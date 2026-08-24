@@ -11,7 +11,8 @@ use ratatui::{
 
 use cordanui_schema::GoalStatus;
 
-use crate::app::{App, Mode, PluginPane};
+use crate::app::{ActivePluginModal, App, Mode, PluginModalKind, PluginPane};
+use cordanui_plugin_runtime::UiRequest;
 
 /// Status glyph + color for each goal status. Colors are addressed by
 /// style-variable name (not fixed fields) so themes and `cord.*`
@@ -75,6 +76,84 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Mode::AgentRunning { goal_id } = &app.mode {
         render_agent_running(app, goal_id, frame);
     }
+    if let Mode::PluginModal = &app.mode {
+        render_plugin_modal(app, frame);
+    }
+}
+
+/// A plugin-requested dialog (`cord.ui.input/confirm/pick`), rendered as
+/// a centered overlay. The host owns the widgets; plugins only ever see
+/// the answer.
+fn render_plugin_modal(app: &App, frame: &mut Frame) {
+    let Some(modal) = app.plugin_modal.as_ref() else {
+        return;
+    };
+    let ActivePluginModal { request, kind, .. } = modal;
+    let c = &app.theme.colors;
+
+    // Size the box to its content.
+    let (pct_w, pct_h) = match kind {
+        PluginModalKind::Pick { .. } => (45, 40),
+        _ => (50, 22),
+    };
+    let area = centered_rect(pct_w, pct_h, frame.area());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .title(format!(" {} ", request.title()))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+
+    let lines: Vec<Line> = match (kind, request) {
+        (
+            PluginModalKind::Input {
+                buffer,
+                placeholder,
+            },
+            UiRequest::Input { .. },
+        ) => {
+            let shown = if buffer.is_empty() {
+                placeholder.clone().unwrap_or_default()
+            } else {
+                buffer.clone()
+            };
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(c.primary)),
+                    if buffer.is_empty() {
+                        Span::styled(shown, Style::default().fg(c.outline_variant))
+                    } else {
+                        Span::styled(shown, Style::default().fg(c.on_background))
+                    },
+                    Span::styled("▏", Style::default().fg(c.primary)),
+                ]),
+            ]
+        }
+        (PluginModalKind::Confirm, UiRequest::Confirm { message, .. }) => vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("  {message}"),
+                Style::default().fg(c.on_background),
+            )),
+        ],
+        (PluginModalKind::Pick { selected }, UiRequest::Pick { items, .. }) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let style = if i == *selected {
+                    Style::default().fg(c.on_primary).bg(c.primary)
+                } else {
+                    Style::default().fg(c.on_background)
+                };
+                let marker = if i == *selected { "▸ " } else { "  " };
+                Line::from(Span::styled(format!("  {marker}{item}"), style))
+            })
+            .collect(),
+        _ => vec![Line::from("")],
+    };
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -245,6 +324,10 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::AgentPicker { .. } | Mode::AgentRunning { .. } => {
             (" AGENT ".to_string(), String::new())
         }
+        Mode::PluginModal => {
+            let text = app.plugin_modal_text().unwrap_or_default();
+            (" PLUGIN DIALOG ".to_string(), text.to_string())
+        }
     };
 
     let label_style = match &app.mode {
@@ -256,7 +339,8 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::PluginHelp
         | Mode::PluginConfigure { .. }
         | Mode::AgentPicker { .. }
-        | Mode::AgentRunning { .. } => Style::default().fg(c.primary),
+        | Mode::AgentRunning { .. }
+        | Mode::PluginModal => Style::default().fg(c.primary),
         Mode::ConfirmDelete { .. } => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
     };
@@ -316,6 +400,12 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::PluginConfigure { .. } => "↑↓ field · Enter edit · Enter save · Esc back".into(),
         Mode::AgentPicker { .. } => "↑↓ model · Enter run · Esc close".into(),
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
+        Mode::PluginModal => match app.plugin_modal.as_ref().map(|m| &m.kind) {
+            Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
+            Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),
+            Some(PluginModalKind::Pick { .. }) => "↑↓ select · Enter pick · Esc cancel".into(),
+            None => String::new(),
+        },
     };
 
     let line = Line::from(vec![Span::styled(

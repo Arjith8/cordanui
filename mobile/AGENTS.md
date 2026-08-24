@@ -562,3 +562,44 @@ Contract:
   touches storage.
 - Changes apply live — the host re-resolves the palette within a frame or
   two; plugins do not need to trigger a redraw.
+
+---
+
+## 12. Dialogs (`cord.ui.*`) — plugins that need user input at runtime
+
+The settings form (section 9) is static and host-initiated. When a plugin
+needs an answer *now* — mid agent-run, on a command — it awaits one of the
+host-rendered modals. Plugins never draw to the terminal; the host owns
+the widgets, layout, and keystrokes. All three calls are awaitable: the
+host's event loop keeps running (and other plugins keep working) while
+one waits.
+
+```lua
+-- Single-line text. Returns the string, or nil if cancelled.
+local name = cord.ui.input{ title = "Goal name", placeholder = "what?", prefill = nil }
+
+-- Yes/no. Returns true / false.
+local ok = cord.ui.confirm{ title = "Delete", message = "remove this goal?" }
+
+-- Pick one of N. Returns the 1-based index, or nil if cancelled.
+local items = { "grok-code", "claude-sonnet-4-5" }
+local idx = cord.ui.pick{ title = "Model", items = items }
+if idx then use_model(items[idx]) end
+```
+
+Contract:
+
+- **Keys**: `title` is always optional. `input` takes `placeholder` and
+  `prefill`; `confirm` takes `message`; `pick` requires a non-empty
+  `items` array of strings.
+- **Cancel semantics**: Esc always resolves to `nil` for input/pick and
+  `false` for confirm — never an error. An empty input submitted with
+  Enter also resolves to `nil`.
+- **Refusals are errors**: if the host cannot show the dialog right now
+  (another dialog is open), the call raises a Lua error carrying the
+  reason. Wrap in `pcall` when a refusal is acceptable:
+  `local ok, val = pcall(cord.ui.input, { title = "..." })`.
+- **Concurrency**: multiple plugins can wait simultaneously; each gets
+  its own dialog in turn. Only one dialog is on screen at a time.
+- **Timeouts**: there are none — a dialog stays open until answered or
+  cancelled. Don't block an agent run behind a question unless you mean it.

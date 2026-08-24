@@ -12,6 +12,7 @@ use cordanui_schema::{CreateGoalInput, Goal, GoalStatus, UpdateGoalInput};
 use cordanui_sync::Database;
 
 use crate::db;
+use cordanui_plugin_runtime::{UiRequest, UiResponse};
 
 /// What the TUI is currently doing. Determines how input is handled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,31 @@ pub enum Mode {
     AgentPicker { goal_id: String },
     /// An agent run is streaming for this goal.
     AgentRunning { goal_id: String },
+    /// A plugin requested a modal dialog via `cord.ui.*`. The payload
+    /// lives in [`App::plugin_modal`] because it carries a non-comparable
+    /// responder channel.
+    PluginModal,
+}
+
+/// A plugin-requested modal currently on screen.
+#[derive(Debug)]
+pub struct ActivePluginModal {
+    pub request: cordanui_plugin_runtime::UiRequest,
+    pub kind: PluginModalKind,
+    pub respond: tokio::sync::oneshot::Sender<cordanui_plugin_runtime::UiResponse>,
+}
+
+/// Per-kind interactive state of an open plugin modal.
+#[derive(Debug)]
+pub enum PluginModalKind {
+    Input {
+        buffer: String,
+        placeholder: Option<String>,
+    },
+    Confirm,
+    Pick {
+        selected: usize,
+    },
 }
 
 /// One selectable (provider plugin, model) pair in the agent picker.
@@ -148,6 +174,12 @@ pub struct App {
     pub theme: crate::theme::Theme,
     /// Live style overrides — the host side of `cord.g` / `cord["local"]`.
     pub styles: std::sync::Arc<crate::style::StyleBridge>,
+    /// Host side of the `cord.ui.*` dialog API. Plugins submit requests
+    /// here; the loop drains them into [`Self::plugin_modal`].
+    pub plugin_ui: std::sync::Arc<crate::plugin_ui::PluginUiBridge>,
+    /// The open plugin modal, if any. Always paired with
+    /// [`Mode::PluginModal`].
+    pub plugin_modal: Option<ActivePluginModal>,
     /// All goals loaded from the DB.
     pub goals: Vec<Goal>,
     /// IDs of expanded nodes in the tree.
@@ -198,6 +230,7 @@ impl App {
         let goals = db::get_all(&db)?;
         let styles = std::sync::Arc::new(crate::style::StyleBridge::new());
         let theme = crate::theme::Theme::resolve(&db, &styles.session_snapshot());
+        let plugin_ui = std::sync::Arc::new(crate::plugin_ui::PluginUiBridge::new());
         let mut list_state = ListState::default();
         if !goals.is_empty() {
             list_state.select(Some(0));
@@ -207,6 +240,8 @@ impl App {
             keybinds: crate::config::Keybinds::default(),
             theme,
             styles,
+            plugin_ui,
+            plugin_modal: None,
             goals,
             expanded: HashSet::new(),
             detailed: None,
@@ -956,6 +991,130 @@ impl App {
         }
         self.plugin_rx = Some(crate::plugins::spawn_plugin_task(&query));
         self.plugin_state = crate::plugins::TaskState::Working(Vec::new());
+    }
+
+    /// Drain queued `cord.ui.*` requests and open the first as a modal.
+    /// Called every loop iteration. A request arriving while anything else
+    /// is on screen is refused — plugins get a clean error instead of a
+    /// surprise dialog.
+    pub fn poll_plugin_ui_requests(&mut self) {
+        let Some(pending) = self.plugin_ui.try_take_request() else {
+            return;
+        };
+        if self.mode != Mode::Normal || self.plugin_modal.is_some() {
+            let _ = pending
+                .respond
+                .send(cordanui_plugin_runtime::UiResponse::Refused(
+                    "another dialog is open".into(),
+                ));
+            return;
+        }
+        let kind = match &pending.request {
+            UiRequest::Input { placeholder, .. } => PluginModalKind::Input {
+                buffer: String::new(),
+                placeholder: placeholder.clone(),
+            },
+            UiRequest::Confirm { .. } => PluginModalKind::Confirm,
+            UiRequest::Pick { items, .. } => PluginModalKind::Pick { selected: 0 },
+        };
+        self.plugin_modal = Some(ActivePluginModal {
+            kind,
+            request: pending.request,
+            respond: pending.respond,
+        });
+        self.mode = Mode::PluginModal;
+    }
+
+    /// Answer the open plugin modal and close it.
+    pub fn answer_plugin_modal(&mut self, response: UiResponse) {
+        if let Some(modal) = self.plugin_modal.take() {
+            let _ = modal.respond.send(response);
+        }
+        if self.mode == Mode::PluginModal {
+            self.cancel();
+        }
+    }
+
+    /// The text currently typed into an open input modal.
+    pub fn plugin_modal_text(&self) -> Option<&str> {
+        match &self.plugin_modal {
+            Some(ActivePluginModal {
+                kind: PluginModalKind::Input { buffer, .. },
+                ..
+            }) => Some(buffer),
+            _ => None,
+        }
+    }
+
+    /// Feed a character into an open input modal.
+    pub fn plugin_modal_push_char(&mut self, c: char) {
+        if let Some(ActivePluginModal {
+            kind: PluginModalKind::Input { buffer, .. },
+            ..
+        }) = &mut self.plugin_modal
+        {
+            buffer.push(c);
+        }
+    }
+
+    /// Remove the last character from an open input modal.
+    pub fn plugin_modal_backspace(&mut self) {
+        if let Some(ActivePluginModal {
+            kind: PluginModalKind::Input { buffer, .. },
+            ..
+        }) = &mut self.plugin_modal
+        {
+            buffer.pop();
+        }
+    }
+
+    /// Move the picker selection in an open pick modal.
+    pub fn plugin_modal_move_selection(&mut self, delta: i32) {
+        let max_items = match &self.plugin_modal {
+            Some(ActivePluginModal {
+                request: UiRequest::Pick { items, .. },
+                ..
+            }) => items.len(),
+            _ => return,
+        };
+        if let Some(ActivePluginModal {
+            kind: PluginModalKind::Pick { selected },
+            ..
+        }) = &mut self.plugin_modal
+        {
+            *selected =
+                ((*selected as i64) + (delta as i64)).clamp(0, max_items as i64 - 1) as usize;
+        }
+    }
+
+    /// Submit the open modal with its current state (Enter).
+    pub fn submit_plugin_modal(&mut self) {
+        let Some(modal) = &self.plugin_modal else {
+            return;
+        };
+        let response = match &modal.kind {
+            PluginModalKind::Input { buffer, .. } => {
+                let text = buffer.trim().to_string();
+                UiResponse::Text(if text.is_empty() { None } else { Some(text) })
+            }
+            PluginModalKind::Confirm => UiResponse::Confirmed(true),
+            PluginModalKind::Pick { selected } => UiResponse::Choice(Some(*selected)),
+        };
+        self.answer_plugin_modal(response);
+    }
+
+    /// Cancel the open modal (Esc / 'n').
+    pub fn cancel_plugin_modal(&mut self) {
+        let is_confirm = matches!(
+            self.plugin_modal.as_ref().map(|m| &m.kind),
+            Some(PluginModalKind::Confirm)
+        );
+        let response = if is_confirm {
+            UiResponse::Confirmed(false)
+        } else {
+            UiResponse::Text(None)
+        };
+        self.answer_plugin_modal(response);
     }
 
     /// Commit any pending style changes and re-resolve the palette if

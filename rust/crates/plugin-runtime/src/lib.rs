@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod protocol;
 pub mod spawn;
 pub mod style;
+pub mod ui;
 
 pub use lua::LuaPlugin;
 pub use manifest::{
@@ -30,3 +31,4 @@ pub use protocol::{
 };
 pub use spawn::{run_one_shot, run_streaming};
 pub use style::{parse_color, NullStyleHost, StyleHost, CORE_VARS, LEGACY_ALIASES};
+pub use ui::{NoUiHost, PendingUi, SharedUiHost, UiHost, UiRequest, UiResponse};

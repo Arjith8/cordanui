@@ -57,6 +57,7 @@ use mlua::{Function, Lua, LuaSerdeExt, Table, Value as LuaValue};
 
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
+use crate::ui::{SharedUiHost, UiRequest, UiResponse};
 
 /// An in-process Lua plugin: a loaded and initialized `main.lua`.
 pub struct LuaPlugin {
@@ -82,6 +83,7 @@ impl LuaPlugin {
         name: &str,
         config: Option<serde_json::Value>,
         styles: Option<SharedStyleHost>,
+        ui: Option<SharedUiHost>,
     ) -> Result<Self> {
         let entry = dir.join(crate::manifest::PluginManifest::LUA_ENTRY);
         let source = std::fs::read_to_string(&entry)
@@ -89,7 +91,7 @@ impl LuaPlugin {
 
         let lua = Arc::new(Lua::new());
         register_api(&lua, dir, name, config).context("registering cordanui API")?;
-        register_cord(&lua, styles).context("registering cord styling API")?;
+        register_cord(&lua, styles, ui).context("registering cord styling API")?;
 
         // Let scripts require sibling files relative to the plugin root.
         let package: Table = lua.globals().get("package")?;
@@ -317,8 +319,13 @@ fn register_api(
 /// Any variable name works: the 18 core roles plus whatever custom names
 /// plugins introduce. Colors accept `#rgb`, `#rrggbb`, `rgb(r,g,b)` and
 /// `rgba(r,g,b,a)` (alpha is dropped).
-fn register_cord(lua: &Lua, styles: Option<SharedStyleHost>) -> mlua::Result<()> {
+fn register_cord(
+    lua: &Lua,
+    styles: Option<SharedStyleHost>,
+    ui: Option<SharedUiHost>,
+) -> mlua::Result<()> {
     let cord = lua.create_table()?;
+    register_cord_ui(lua, &cord, ui)?;
 
     for scope in ["g", "local"] {
         let persistent = scope == "g";
@@ -403,6 +410,135 @@ fn register_cord(lua: &Lua, styles: Option<SharedStyleHost>) -> mlua::Result<()>
 
     lua.globals().set("cord", cord)?;
     Ok(())
+}
+
+/// The `cord.ui` table — host-rendered modal dialogs.
+///
+/// ```lua
+/// local name  = cord.ui.input{ title = "Goal", placeholder = "..." }
+/// local ok    = cord.ui.confirm{ title = "Delete", message = "sure?" }
+/// local idx   = cord.ui.pick{ title = "Pick", items = { "a", "b" } } -- 1-based
+/// ```
+///
+/// All three await the user's answer; the host keeps its event loop (and
+/// other plugins) running while a plugin waits. Cancel resolves to
+/// `nil`/`false`; a host that cannot show the dialog raises an error.
+fn register_cord_ui(lua: &Lua, cord: &Table, ui: Option<SharedUiHost>) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    // cord.ui.input{title?, placeholder?, prefill?} -> string | nil
+    api.set(
+        "input",
+        lua.create_async_function({
+            let ui = ui.clone();
+            move |_, params: Table| {
+                let ui = ui.clone();
+                async move {
+                    let title: Option<String> = params.get("title").ok();
+                    let placeholder: Option<String> = params.get("placeholder").ok();
+                    let prefill: Option<String> = params.get("prefill").ok();
+                    match ui_answer(
+                        ui.as_ref(),
+                        UiRequest::Input {
+                            title: title.unwrap_or_default(),
+                            placeholder,
+                            prefill,
+                        },
+                    )
+                    .await?
+                    {
+                        UiResponse::Text(v) => Ok(v),
+                        _ => Err(mlua::Error::runtime("unexpected response to input")),
+                    }
+                }
+            }
+        })?,
+    )?;
+
+    // cord.ui.confirm{title?, message} -> boolean
+    api.set(
+        "confirm",
+        lua.create_async_function({
+            let ui = ui.clone();
+            move |_, params: Table| {
+                let ui = ui.clone();
+                async move {
+                    let title: Option<String> = params.get("title").ok();
+                    let message: String = params.get("message").unwrap_or_default();
+                    match ui_answer(
+                        ui.as_ref(),
+                        UiRequest::Confirm {
+                            title: title.unwrap_or_default(),
+                            message,
+                        },
+                    )
+                    .await?
+                    {
+                        UiResponse::Confirmed(v) => Ok(v),
+                        _ => Err(mlua::Error::runtime("unexpected response to confirm")),
+                    }
+                }
+            }
+        })?,
+    )?;
+
+    // cord.ui.pick{title?, items = {...}} -> index (1-based) | nil
+    api.set(
+        "pick",
+        lua.create_async_function(move |_, params: Table| {
+            let ui = ui.clone();
+            async move {
+                let title: Option<String> = params.get("title").ok();
+                let items: Vec<String> = params.get("items").unwrap_or_default();
+                if items.is_empty() {
+                    return Err(mlua::Error::runtime(
+                        "cord.ui.pick needs a non-empty items list",
+                    ));
+                }
+                match ui_answer(
+                    ui.as_ref(),
+                    UiRequest::Pick {
+                        title: title.unwrap_or_default(),
+                        items,
+                    },
+                )
+                .await?
+                {
+                    UiResponse::Choice(idx) => Ok(idx.map(|i| i as mlua::Integer + 1)),
+                    _ => Err(mlua::Error::runtime("unexpected response to pick")),
+                }
+            }
+        })?,
+    )?;
+
+    cord.set("ui", api)?;
+    Ok(())
+}
+
+/// Submit a request and wait for the host's answer. No host, refused
+/// request, or dropped channel all surface here:
+/// - no host attached → error ("UI is not available in this host")
+/// - `Refused(reason)` → error carrying the reason
+/// - dropped responder → treated as cancel (`None`)
+async fn ui_answer(ui: Option<&SharedUiHost>, request: UiRequest) -> mlua::Result<UiResponse> {
+    let Some(host) = ui else {
+        return Err(mlua::Error::runtime(
+            "cord.ui is not available in this host",
+        ));
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    host.submit(crate::ui::PendingUi {
+        request,
+        respond: tx,
+    });
+    match rx.await {
+        Ok(UiResponse::Refused(reason)) => Err(mlua::Error::runtime(format!(
+            "the host refused the dialog: {reason}"
+        ))),
+        Ok(response) => Ok(response),
+        // Host dropped the channel without answering — treat as cancel.
+        Err(_) => Ok(UiResponse::Text(None)),
+    }
 }
 
 fn http_client() -> &'static reqwest::Client {
@@ -492,7 +628,7 @@ function plugin.complete(req)
 end
 "#,
         );
-        let plugin = LuaPlugin::load(&dir, "echo", None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "echo", None, None, None).unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "test-model".into(),
@@ -528,7 +664,7 @@ end
 "#,
         );
         let config = serde_json::json!({ "api_key": "sk-test-123" });
-        let plugin = LuaPlugin::load(&dir, "cfg", Some(config), None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "cfg", Some(config), None, None).unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "m".into(),
@@ -580,7 +716,7 @@ end
             ),
         );
 
-        let plugin = LuaPlugin::load(&dir, "stream", None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "stream", None, None, None).unwrap();
 
         let messages = Arc::new(Mutex::new(Vec::new()));
         let sink = messages.clone();
@@ -621,7 +757,7 @@ end
     async fn missing_entry_script_is_a_clean_error() {
         let dir = std::env::temp_dir().join(TMP).join("empty");
         std::fs::create_dir_all(&dir).unwrap();
-        let err = LuaPlugin::load(&dir, "empty", None, None).unwrap_err();
+        let err = LuaPlugin::load(&dir, "empty", None, None, None).unwrap_err();
         assert!(err.to_string().contains("main.lua"));
         cleanup("empty");
     }
@@ -637,7 +773,7 @@ function plugin.agent_run(cfg, emit)
 end
 "#,
         );
-        let plugin = LuaPlugin::load(&dir, "noterminal", None, None).unwrap();
+        let plugin = LuaPlugin::load(&dir, "noterminal", None, None, None).unwrap();
         let err = plugin
             .agent_run(
                 &AgentRunConfig {
@@ -674,7 +810,7 @@ end
             "base_url": "http://127.0.0.1:1", // unreachable; we only load
             "default_model": "grok-code",
         });
-        let _plugin = LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), None)
+        let _plugin = LuaPlugin::load(&dir, &manifest.plugin.name, Some(config), None, None)
             .expect("provider-zen should load");
     }
 
@@ -736,7 +872,7 @@ end
     async fn cord_styling_routes_g_and_local() {
         let dir = fixture("styles", STYLES_LUA);
         let host = Arc::new(MockStyles::default());
-        let plugin = LuaPlugin::load(&dir, "styles", None, Some(host.clone())).unwrap();
+        let plugin = LuaPlugin::load(&dir, "styles", None, Some(host.clone()), None).unwrap();
 
         let resp = plugin
             .complete(&CompleteRequest {
@@ -785,7 +921,7 @@ end
 "##,
         );
         let host = Arc::new(MockStyles::default());
-        let plugin = LuaPlugin::load(&dir, "styles-reset", None, Some(host.clone())).unwrap();
+        let plugin = LuaPlugin::load(&dir, "styles-reset", None, Some(host.clone()), None).unwrap();
         let resp = plugin
             .complete(&CompleteRequest {
                 model: "m".into(),
@@ -807,5 +943,190 @@ end
         // reset cleared it
         assert!(host.persistent.lock().unwrap().get("primary").is_none());
         cleanup("styles-reset");
+    }
+
+    // ---------- cord.ui.* modal dialogs ----------
+
+    /// One-shot complete with a minimal request, for tests.
+    async fn complete_simple(plugin: &LuaPlugin) -> CompleteResponse {
+        plugin
+            .complete(&CompleteRequest {
+                model: "m".into(),
+                prompt: "p".into(),
+                system: None,
+                max_tokens: None,
+                temperature: None,
+                config: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    /// A host that answers every dialog with a canned response.
+    #[derive(Default)]
+    struct MockUi {
+        next: Mutex<Option<UiResponse>>,
+    }
+
+    impl MockUi {
+        fn answering(response: UiResponse) -> Arc<Self> {
+            Arc::new(Self {
+                next: Mutex::new(Some(response)),
+            })
+        }
+    }
+
+    impl crate::ui::UiHost for MockUi {
+        fn submit(&self, pending: crate::ui::PendingUi) {
+            let canned = self.next.lock().unwrap().take();
+            // No canned answer left: respond with each dialog kind's
+            // documented cancel value.
+            let response = canned.unwrap_or_else(|| match &pending.request {
+                UiRequest::Input { .. } => UiResponse::Text(None),
+                UiRequest::Confirm { .. } => UiResponse::Confirmed(false),
+                UiRequest::Pick { .. } => UiResponse::Choice(None),
+            });
+            let _ = pending.respond.send(response);
+        }
+    }
+
+    #[tokio::test]
+    async fn ui_input_returns_text() {
+        let dir = fixture(
+            "ui-input",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  local name = cord.ui.input{ title = "Goal name", placeholder = "what?" }
+  if name == nil then return { content = "cancelled" } end
+  return { content = "typed:" .. name }
+end
+"##,
+        );
+        let plugin = LuaPlugin::load(
+            &dir,
+            "ui-input",
+            None,
+            None,
+            Some(MockUi::answering(UiResponse::Text(Some("hello".into())))),
+        )
+        .unwrap();
+        let resp = complete_simple(&plugin).await;
+        assert_eq!(resp.content, "typed:hello");
+        cleanup("ui-input");
+    }
+
+    #[tokio::test]
+    async fn ui_cancel_resolves_to_nil() {
+        // The mock answers the first dialog with Text(None) (cancel), then
+        // falls through to its default Text(None) for the rest.
+        let dir = fixture(
+            "ui-cancel",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  local a = cord.ui.input{ title = "t" }
+  local ok = cord.ui.confirm{ title = "t", message = "m" }
+  local idx = cord.ui.pick{ title = "t", items = { "x", "y" } }
+  local desc = (a == nil and "nil" or a) .. "/" .. tostring(ok) .. "/" .. tostring(idx)
+  return { content = desc }
+end
+"##,
+        );
+        let plugin = LuaPlugin::load(
+            &dir,
+            "ui-cancel",
+            None,
+            None,
+            Some(MockUi::answering(UiResponse::Text(None))),
+        )
+        .unwrap();
+        let resp = complete_simple(&plugin).await;
+        // input -> nil; confirm -> false; pick -> nil (all cancels)
+        assert_eq!(resp.content, "nil/false/nil");
+        cleanup("ui-cancel");
+    }
+
+    #[tokio::test]
+    async fn ui_pick_returns_one_based_index() {
+        let dir = fixture(
+            "ui-pick",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  local items = { "grok-code", "claude-sonnet-4-5", "gpt-5" }
+  local idx = cord.ui.pick{ title = "Model", items = items }
+  return { content = items[idx] }
+end
+"##,
+        );
+        let plugin = LuaPlugin::load(
+            &dir,
+            "ui-pick",
+            None,
+            None,
+            Some(MockUi::answering(UiResponse::Choice(Some(1)))),
+        )
+        .unwrap();
+        let resp = complete_simple(&plugin).await;
+        assert_eq!(resp.content, "claude-sonnet-4-5");
+        cleanup("ui-pick");
+    }
+
+    #[tokio::test]
+    async fn ui_refusal_is_a_lua_error() {
+        let dir = fixture(
+            "ui-refused",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  local ok, err = pcall(function()
+    return cord.ui.input{ title = "t" }
+  end)
+  return { content = tostring(err) }
+end
+"##,
+        );
+        let plugin = LuaPlugin::load(
+            &dir,
+            "ui-refused",
+            None,
+            None,
+            Some(MockUi::answering(UiResponse::Refused(
+                "another dialog is open".into(),
+            ))),
+        )
+        .unwrap();
+        let resp = complete_simple(&plugin).await;
+        assert!(
+            resp.content.contains("refused the dialog"),
+            "unexpected: {}",
+            resp.content
+        );
+        cleanup("ui-refused");
+    }
+
+    #[tokio::test]
+    async fn ui_without_host_errors_cleanly() {
+        let dir = fixture(
+            "ui-nohost",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  local ok, err = pcall(function()
+    return cord.ui.pick{ title = "t", items = { "a" } }
+  end)
+  return { content = tostring(err) }
+end
+"##,
+        );
+        let plugin = LuaPlugin::load(&dir, "ui-nohost", None, None, None).unwrap();
+        let resp = complete_simple(&plugin).await;
+        assert!(
+            resp.content.contains("not available"),
+            "unexpected: {}",
+            resp.content
+        );
+        cleanup("ui-nohost");
     }
 }

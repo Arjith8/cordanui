@@ -10,6 +10,7 @@
 mod app;
 mod config;
 mod db;
+mod plugin_ui;
 mod plugins;
 mod style;
 mod theme;
@@ -91,6 +92,7 @@ fn run(
             Mode::PluginHelp => handle_plugin_help_key(app, key),
             Mode::PluginConfigure { plugin } => handle_configure_key(app, key, &plugin)?,
             Mode::AgentPicker { .. } => handle_agent_picker_key(app, key)?,
+            Mode::PluginModal => handle_plugin_modal_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
@@ -99,6 +101,7 @@ fn run(
         // any pending style changes (cord.g / cord["local"] restyling).
         app.poll_plugin_search()?;
         app.apply_style_updates()?;
+        app.poll_plugin_ui_requests();
 
         // Clear transient message after any key in normal mode
         if app.mode == Mode::Normal && !app.leader_pending && app.message.is_some() {
@@ -391,6 +394,48 @@ fn handle_confirm_delete_key(app: &mut app::App, key: KeyEvent) -> anyhow::Resul
         _ => {}
     }
     Ok(())
+}
+
+/// Keys in a plugin-requested modal (`cord.ui.input/confirm/pick`).
+/// All real logic lives on `App` methods so tests can drive dialogs
+/// without synthesizing key events.
+fn handle_plugin_modal_key(app: &mut app::App, key: KeyEvent) {
+    use app::PluginModalKind;
+    use cordanui_plugin_runtime::UiRequest;
+
+    let kind = app.plugin_modal.as_ref().map(|m| match &m.kind {
+        PluginModalKind::Input { .. } => "input",
+        PluginModalKind::Confirm => "confirm",
+        PluginModalKind::Pick { .. } => "pick",
+    });
+
+    match (key.code, kind) {
+        // Input: typing.
+        (KeyCode::Char(c), Some("input")) if !c.is_control() => app.plugin_modal_push_char(c),
+        (KeyCode::Backspace, Some("input")) => app.plugin_modal_backspace(),
+        (KeyCode::Enter, _) => app.submit_plugin_modal(),
+        (KeyCode::Esc, _) => {
+            // First Esc clears typed text; an empty box cancels.
+            if kind == Some("input") && app.plugin_modal_text().is_some_and(|t| !t.is_empty()) {
+                if let Some(app::ActivePluginModal {
+                    kind: PluginModalKind::Input { buffer, .. },
+                    ..
+                }) = &mut app.plugin_modal
+                {
+                    buffer.clear();
+                }
+            } else {
+                app.cancel_plugin_modal();
+            }
+        }
+        // Confirm: y/n aliases.
+        (KeyCode::Char('y') | KeyCode::Char('Y'), Some("confirm")) => app.submit_plugin_modal(),
+        (KeyCode::Char('n') | KeyCode::Char('N'), Some("confirm")) => app.cancel_plugin_modal(),
+        // Pick: selection movement.
+        (KeyCode::Up | KeyCode::Char('k'), Some("pick")) => app.plugin_modal_move_selection(-1),
+        (KeyCode::Down | KeyCode::Char('j'), Some("pick")) => app.plugin_modal_move_selection(1),
+        _ => {}
+    }
 }
 
 /// Keys in the provider/model picker.

@@ -44,10 +44,11 @@ Living document. Updated as we build.
       `settings.style.<var>` (syncs via Turso), `cord["local"].style.*`
       is session-only. Palette re-resolves within a frame of any change.
       Mobile-side aliasing of new-keyed themes is pending.
-- [ ] **9. Style variables in the UI surface** — expose the same
-      variables to non-plugin users (e.g. a TUI command mode:
-      `:style primary #ff8800`) and a `cordanui.ui` declarative widget API
-      for plugins to render panels.
+- [~] **9. Style variables in the UI surface** — plugin-side done:
+      `cord.ui.input/confirm/pick` render host-owned modals with answers
+      awaited from Lua (full round-trip tested through the App). Remaining:
+      a TUI command mode for non-plugin users (`:style primary #ff8800`)
+      and the tier-2 `cordanui.ui` declarative widget trees.
 
 ## phase 1 — TUI base
 
