@@ -52,12 +52,11 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use anyhow::{bail, Context, Result};
-use mlua::{Function, Lua, LuaSerdeExt, Table, Value as LuaValue};
-
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
-use crate::ui::{SharedUiHost, UiRequest, UiResponse};
+use crate::ui::{SharedUiHost, UiLevel, UiRequest, UiResponse};
+use anyhow::{bail, Context, Result};
+use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
 
 /// An in-process Lua plugin: a loaded and initialized `main.lua`.
 pub struct LuaPlugin {
@@ -485,28 +484,153 @@ fn register_cord_ui(lua: &Lua, cord: &Table, ui: Option<SharedUiHost>) -> mlua::
     // cord.ui.pick{title?, items = {...}} -> index (1-based) | nil
     api.set(
         "pick",
-        lua.create_async_function(move |_, params: Table| {
+        lua.create_async_function({
             let ui = ui.clone();
-            async move {
-                let title: Option<String> = params.get("title").ok();
-                let items: Vec<String> = params.get("items").unwrap_or_default();
-                if items.is_empty() {
+            move |_, params: Table| {
+                let ui = ui.clone();
+                async move {
+                    let title: Option<String> = params.get("title").ok();
+                    let items: Vec<String> = params.get("items").unwrap_or_default();
+                    if items.is_empty() {
+                        return Err(mlua::Error::runtime(
+                            "cord.ui.pick needs a non-empty items list",
+                        ));
+                    }
+                    match ui_answer(
+                        ui.as_ref(),
+                        UiRequest::Pick {
+                            title: title.unwrap_or_default(),
+                            items,
+                        },
+                    )
+                    .await?
+                    {
+                        UiResponse::Choice(idx) => Ok(idx.map(|i| i as mlua::Integer + 1)),
+                        _ => Err(mlua::Error::runtime("unexpected response to pick")),
+                    }
+                }
+            }
+        })?,
+    )?;
+
+    // cord.ui.multiselect{title?, items = {...}, selected? = {1-based}} ->
+    // array of 1-based indices (possibly empty) | nil on cancel
+    api.set(
+        "multiselect",
+        lua.create_async_function({
+            let ui = ui.clone();
+            let lua = lua.clone();
+            move |_, params: Table| {
+                let ui = ui.clone();
+                let lua = lua.clone();
+                async move {
+                    let title: Option<String> = params.get("title").ok();
+                    let items: Vec<String> = params.get("items").unwrap_or_default();
+                    if items.is_empty() {
+                        return Err(mlua::Error::runtime(
+                            "cord.ui.multiselect needs a non-empty items list",
+                        ));
+                    }
+                    let preselected: Vec<mlua::Integer> =
+                        params.get("selected").unwrap_or_default();
+                    let preselected: Vec<usize> = preselected
+                        .into_iter()
+                        .map(|i| (i - 1).max(0) as usize)
+                        .filter(|i| *i < items.len())
+                        .collect();
+                    match ui_answer(
+                        ui.as_ref(),
+                        UiRequest::MultiSelect {
+                            title: title.unwrap_or_default(),
+                            items,
+                            preselected,
+                        },
+                    )
+                    .await?
+                    {
+                        UiResponse::Choices(idx) => match idx {
+                            // Cancelled -> nil.
+                            None => Ok(Value::Nil),
+                            Some(indices) => {
+                                let t = lua.create_table()?;
+                                for i in indices {
+                                    t.push(i as mlua::Integer + 1)?;
+                                }
+                                // Empty table = submitted with nothing selected
+                                // (distinct from nil = cancelled).
+                                Ok(Value::Table(t))
+                            }
+                        },
+                        _ => Err(mlua::Error::runtime("unexpected response to multiselect")),
+                    }
+                }
+            }
+        })?,
+    )?;
+
+    // cord.ui.text{title?, placeholder?, prefill?} -> string | nil
+    // Multi-line: Enter inserts a newline; the host's submit chord commits.
+    api.set(
+        "text",
+        lua.create_async_function({
+            let ui = ui.clone();
+            move |_, params: Table| {
+                let ui = ui.clone();
+                async move {
+                    let title: Option<String> = params.get("title").ok();
+                    let placeholder: Option<String> = params.get("placeholder").ok();
+                    let prefill: Option<String> = params.get("prefill").ok();
+                    match ui_answer(
+                        ui.as_ref(),
+                        UiRequest::Text {
+                            title: title.unwrap_or_default(),
+                            placeholder,
+                            prefill,
+                        },
+                    )
+                    .await?
+                    {
+                        UiResponse::Text(v) => Ok(v),
+                        _ => Err(mlua::Error::runtime("unexpected response to text")),
+                    }
+                }
+            }
+        })?,
+    )?;
+
+    // cord.ui.notify(message | { message, level? }) -> true
+    // Fire-and-forget: the host shows a transient status message; there is
+    // nothing to await. level: "info" (default) | "warn" | "error".
+    api.set(
+        "notify",
+        lua.create_function({
+            let ui = ui.clone();
+            move |_, params: Value| {
+                let Some(host) = ui.as_ref() else {
                     return Err(mlua::Error::runtime(
-                        "cord.ui.pick needs a non-empty items list",
+                        "cord.ui is not available in this host",
                     ));
-                }
-                match ui_answer(
-                    ui.as_ref(),
-                    UiRequest::Pick {
-                        title: title.unwrap_or_default(),
-                        items,
-                    },
-                )
-                .await?
-                {
-                    UiResponse::Choice(idx) => Ok(idx.map(|i| i as mlua::Integer + 1)),
-                    _ => Err(mlua::Error::runtime("unexpected response to pick")),
-                }
+                };
+                let (message, level) = match &params {
+                    Value::String(s) => (s.to_str()?.to_string(), UiLevel::Info),
+                    Value::Table(t) => {
+                        let message: String = t.get("message")?;
+                        let level: Option<String> = t.get("level").ok();
+                        let level = match level.as_deref() {
+                            Some("warn") => UiLevel::Warn,
+                            Some("error") => UiLevel::Error,
+                            _ => UiLevel::Info,
+                        };
+                        (message, level)
+                    }
+                    _ => {
+                        return Err(mlua::Error::runtime(
+                            "cord.ui.notify takes a string or a table {message, level}",
+                        ))
+                    }
+                };
+                host.notify(level, message);
+                Ok(true)
             }
         })?,
     )?;
@@ -982,9 +1106,10 @@ end
             // No canned answer left: respond with each dialog kind's
             // documented cancel value.
             let response = canned.unwrap_or_else(|| match &pending.request {
-                UiRequest::Input { .. } => UiResponse::Text(None),
+                UiRequest::Input { .. } | UiRequest::Text { .. } => UiResponse::Text(None),
                 UiRequest::Confirm { .. } => UiResponse::Confirmed(false),
                 UiRequest::Pick { .. } => UiResponse::Choice(None),
+                UiRequest::MultiSelect { .. } => UiResponse::Choices(None),
             });
             let _ = pending.respond.send(response);
         }
@@ -1071,6 +1196,89 @@ end
         let resp = complete_simple(&plugin).await;
         assert_eq!(resp.content, "claude-sonnet-4-5");
         cleanup("ui-pick");
+    }
+
+    #[tokio::test]
+    async fn ui_multiselect_text_and_notify() {
+        use std::sync::Mutex as SM;
+
+        #[derive(Default)]
+        struct NotifyCapture {
+            notifications: SM<Vec<(String, String)>>,
+        }
+        impl crate::ui::UiHost for NotifyCapture {
+            fn submit(&self, _pending: crate::ui::PendingUi) {
+                unreachable!("notify test never opens a dialog");
+            }
+            fn notify(&self, level: crate::ui::UiLevel, message: String) {
+                self.notifications
+                    .lock()
+                    .unwrap()
+                    .push((level.as_str().to_string(), message));
+            }
+        }
+
+        // A queue-based host: answers dialogs in order, then falls back to
+        // each kind's cancel default. Also captures notify() calls.
+        #[derive(Default)]
+        struct QueueUi {
+            queue: SM<Vec<UiResponse>>,
+            notifications: SM<Vec<(String, String)>>,
+        }
+        impl crate::ui::UiHost for QueueUi {
+            fn submit(&self, pending: crate::ui::PendingUi) {
+                let canned = self.queue.lock().unwrap().pop();
+                let response = canned.unwrap_or_else(|| match &pending.request {
+                    UiRequest::Input { .. } | UiRequest::Text { .. } => UiResponse::Text(None),
+                    UiRequest::Confirm { .. } => UiResponse::Confirmed(false),
+                    UiRequest::Pick { .. } => UiResponse::Choice(None),
+                    UiRequest::MultiSelect { .. } => UiResponse::Choices(None),
+                });
+                let _ = pending.respond.send(response);
+            }
+            fn notify(&self, level: crate::ui::UiLevel, message: String) {
+                self.notifications
+                    .lock()
+                    .unwrap()
+                    .push((level.as_str().to_string(), message));
+            }
+        }
+
+        let dir = fixture(
+            "ui-more",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  -- multiselect: two of three preselected (1-based), answered {2,3} 1-based
+  local picked = cord.ui.multiselect{ title = "Tags", items = { "a", "b", "c" }, selected = { 1 } }
+  local sum = 0
+  for _, i in ipairs(picked or {}) do sum = sum + i end
+
+  -- multiline text round trip
+  local body = cord.ui.text{ title = "Body", prefill = "line1\nline2" }
+
+  -- fire-and-forget notifications
+  cord.ui.notify("plain string")
+  cord.ui.notify{ message = "careful", level = "warn" }
+
+  return { content = sum .. "|" .. tostring(body) }
+end
+"##,
+        );
+        let host = Arc::new(QueueUi::default());
+        // Popped LIFO — push in reverse answer order.
+        (*host.queue.lock().unwrap()).push(UiResponse::Text(Some("line1\nline2".into())));
+        (*host.queue.lock().unwrap()).push(UiResponse::Choices(Some(vec![1, 2])));
+        let plugin = LuaPlugin::load(&dir, "ui-more", None, None, Some(host.clone() as _)).unwrap();
+
+        let resp = complete_simple(&plugin).await;
+
+        assert_eq!(resp.content, "5|line1\nline2");
+        let notes = host.notifications.lock().unwrap();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0], ("info".to_string(), "plain string".to_string()));
+        assert_eq!(notes[1], ("warn".to_string(), "careful".to_string()));
+        cleanup("ui-more");
     }
 
     #[tokio::test]

@@ -93,7 +93,8 @@ fn render_plugin_modal(app: &App, frame: &mut Frame) {
 
     // Size the box to its content.
     let (pct_w, pct_h) = match kind {
-        PluginModalKind::Pick { .. } => (45, 40),
+        PluginModalKind::Pick { .. } | PluginModalKind::MultiSelect { .. } => (45, 40),
+        PluginModalKind::TextEditor { .. } => (60, 50),
         _ => (50, 22),
     };
     let area = centered_rect(pct_w, pct_h, frame.area());
@@ -150,6 +151,46 @@ fn render_plugin_modal(app: &App, frame: &mut Frame) {
                 Line::from(Span::styled(format!("  {marker}{item}"), style))
             })
             .collect(),
+        (
+            PluginModalKind::MultiSelect { selected, cursor },
+            UiRequest::MultiSelect { items, .. },
+        ) => items
+            .iter()
+            .zip(selected)
+            .enumerate()
+            .map(|(i, (item, on))| {
+                let check = if *on { "[x]" } else { "[ ]" };
+                let style = if i == *cursor {
+                    Style::default().fg(c.on_primary).bg(c.primary)
+                } else if *on {
+                    Style::default().fg(c.success)
+                } else {
+                    Style::default().fg(c.on_background)
+                };
+                Line::from(Span::styled(format!("  {check} {item}"), style))
+            })
+            .collect(),
+        (
+            PluginModalKind::TextEditor {
+                buffer,
+                placeholder,
+            },
+            UiRequest::Text { .. },
+        ) => {
+            let body = if buffer.is_empty() {
+                placeholder.clone().unwrap_or_default()
+            } else {
+                buffer.clone()
+            };
+            vec![
+                Line::from(""),
+                Line::from(if buffer.is_empty() {
+                    Span::styled(body, Style::default().fg(c.outline_variant))
+                } else {
+                    Span::styled(body, Style::default().fg(c.on_background))
+                }),
+            ]
+        }
         _ => vec![Line::from("")],
     };
 
@@ -404,6 +445,12 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
             Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
             Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),
             Some(PluginModalKind::Pick { .. }) => "↑↓ select · Enter pick · Esc cancel".into(),
+            Some(PluginModalKind::MultiSelect { .. }) => {
+                "↑↓ move · space toggle · Enter submit · Esc cancel".into()
+            }
+            Some(PluginModalKind::TextEditor { .. }) => {
+                "Enter newline · Ctrl+Enter submit · Esc cancel".into()
+            }
             None => String::new(),
         },
     };

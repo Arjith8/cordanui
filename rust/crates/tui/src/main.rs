@@ -404,19 +404,30 @@ fn handle_plugin_modal_key(app: &mut app::App, key: KeyEvent) {
     use cordanui_plugin_runtime::UiRequest;
 
     let kind = app.plugin_modal.as_ref().map(|m| match &m.kind {
-        PluginModalKind::Input { .. } => "input",
+        PluginModalKind::Input { .. } | PluginModalKind::TextEditor { .. } => "text",
         PluginModalKind::Confirm => "confirm",
         PluginModalKind::Pick { .. } => "pick",
+        PluginModalKind::MultiSelect { .. } => "multi",
     });
 
-    match (key.code, kind) {
-        // Input: typing.
-        (KeyCode::Char(c), Some("input")) if !c.is_control() => app.plugin_modal_push_char(c),
-        (KeyCode::Backspace, Some("input")) => app.plugin_modal_backspace(),
-        (KeyCode::Enter, _) => app.submit_plugin_modal(),
-        (KeyCode::Esc, _) => {
+    match (key.code, key.modifiers, kind) {
+        // Text editor: Ctrl+Enter submits; plain Enter adds a newline.
+        (KeyCode::Enter, m, Some("text")) if m.contains(KeyModifiers::CONTROL) => {
+            app.submit_plugin_modal()
+        }
+        (KeyCode::Char(c), _, Some("input") | Some("text")) if !c.is_control() => {
+            app.plugin_modal_push_char(c)
+        }
+        (KeyCode::Backspace, _, Some("input") | Some("text")) => app.plugin_modal_backspace(),
+        (KeyCode::Enter, m, Some("text")) if !m.contains(KeyModifiers::CONTROL) => {
+            app.plugin_modal_newline()
+        }
+        (KeyCode::Enter, _, _) => app.submit_plugin_modal(),
+        (KeyCode::Esc, _, _) => {
             // First Esc clears typed text; an empty box cancels.
-            if kind == Some("input") && app.plugin_modal_text().is_some_and(|t| !t.is_empty()) {
+            if matches!(kind, Some("input") | Some("text"))
+                && app.plugin_modal_text().is_some_and(|t| !t.is_empty())
+            {
                 if let Some(app::ActivePluginModal {
                     kind: PluginModalKind::Input { buffer, .. },
                     ..
@@ -429,11 +440,17 @@ fn handle_plugin_modal_key(app: &mut app::App, key: KeyEvent) {
             }
         }
         // Confirm: y/n aliases.
-        (KeyCode::Char('y') | KeyCode::Char('Y'), Some("confirm")) => app.submit_plugin_modal(),
-        (KeyCode::Char('n') | KeyCode::Char('N'), Some("confirm")) => app.cancel_plugin_modal(),
-        // Pick: selection movement.
-        (KeyCode::Up | KeyCode::Char('k'), Some("pick")) => app.plugin_modal_move_selection(-1),
-        (KeyCode::Down | KeyCode::Char('j'), Some("pick")) => app.plugin_modal_move_selection(1),
+        (KeyCode::Char('y') | KeyCode::Char('Y'), _, Some("confirm")) => app.submit_plugin_modal(),
+        (KeyCode::Char('n') | KeyCode::Char('N'), _, Some("confirm")) => app.cancel_plugin_modal(),
+        // Pick / multiselect: cursor movement.
+        (KeyCode::Up | KeyCode::Char('k'), _, Some("pick") | Some("multi")) => {
+            app.plugin_modal_move_selection(-1)
+        }
+        (KeyCode::Down | KeyCode::Char('j'), _, Some("pick") | Some("multi")) => {
+            app.plugin_modal_move_selection(1)
+        }
+        // Multiselect: space toggles the highlighted item.
+        (KeyCode::Char(' '), _, Some("multi")) => app.plugin_modal_toggle_current(),
         _ => {}
     }
 }

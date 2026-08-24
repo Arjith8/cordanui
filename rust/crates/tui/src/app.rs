@@ -67,6 +67,17 @@ pub enum PluginModalKind {
     Pick {
         selected: usize,
     },
+    /// Multi-select: per-item toggles plus a highlight cursor.
+    /// Enter submits the set, Esc cancels.
+    MultiSelect {
+        selected: Vec<bool>,
+        cursor: usize,
+    },
+    /// Multi-line text: Enter inserts a newline, Ctrl+Enter submits.
+    TextEditor {
+        buffer: String,
+        placeholder: Option<String>,
+    },
 }
 
 /// One selectable (provider plugin, model) pair in the agent picker.
@@ -998,7 +1009,20 @@ impl App {
     /// is on screen is refused — plugins get a clean error instead of a
     /// surprise dialog.
     pub fn poll_plugin_ui_requests(&mut self) {
-        let Some(pending) = self.plugin_ui.try_take_request() else {
+        let Some(event) = self.plugin_ui.try_take_event() else {
+            return;
+        };
+        // Notifications never block and never get refused.
+        if let crate::plugin_ui::PluginUiEvent::Notify { level, message } = &event {
+            let prefixed = match level {
+                cordanui_plugin_runtime::UiLevel::Info => message.clone(),
+                cordanui_plugin_runtime::UiLevel::Warn => format!("⚠ {message}"),
+                cordanui_plugin_runtime::UiLevel::Error => format!("✖ {message}"),
+            };
+            self.set_message(&prefixed);
+            return;
+        }
+        let crate::plugin_ui::PluginUiEvent::Modal(pending) = event else {
             return;
         };
         if self.mode != Mode::Normal || self.plugin_modal.is_some() {
@@ -1016,6 +1040,24 @@ impl App {
             },
             UiRequest::Confirm { .. } => PluginModalKind::Confirm,
             UiRequest::Pick { items, .. } => PluginModalKind::Pick { selected: 0 },
+            UiRequest::MultiSelect {
+                items, preselected, ..
+            } => PluginModalKind::MultiSelect {
+                selected: items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, _)| preselected.contains(&i))
+                    .collect(),
+                cursor: 0,
+            },
+            UiRequest::Text {
+                placeholder,
+                prefill,
+                ..
+            } => PluginModalKind::TextEditor {
+                buffer: prefill.clone().unwrap_or_default(),
+                placeholder: placeholder.clone(),
+            },
         };
         self.plugin_modal = Some(ActivePluginModal {
             kind,
@@ -1039,7 +1081,8 @@ impl App {
     pub fn plugin_modal_text(&self) -> Option<&str> {
         match &self.plugin_modal {
             Some(ActivePluginModal {
-                kind: PluginModalKind::Input { buffer, .. },
+                kind:
+                    PluginModalKind::Input { buffer, .. } | PluginModalKind::TextEditor { buffer, .. },
                 ..
             }) => Some(buffer),
             _ => None,
@@ -1048,42 +1091,70 @@ impl App {
 
     /// Feed a character into an open input modal.
     pub fn plugin_modal_push_char(&mut self, c: char) {
-        if let Some(ActivePluginModal {
-            kind: PluginModalKind::Input { buffer, .. },
-            ..
-        }) = &mut self.plugin_modal
-        {
-            buffer.push(c);
+        if let Some(ActivePluginModal { kind, .. }) = &mut self.plugin_modal {
+            match kind {
+                PluginModalKind::Input { buffer, .. }
+                | PluginModalKind::TextEditor { buffer, .. } => buffer.push(c),
+                _ => {}
+            }
         }
     }
 
     /// Remove the last character from an open input modal.
     pub fn plugin_modal_backspace(&mut self) {
-        if let Some(ActivePluginModal {
-            kind: PluginModalKind::Input { buffer, .. },
-            ..
-        }) = &mut self.plugin_modal
-        {
-            buffer.pop();
+        if let Some(ActivePluginModal { kind, .. }) = &mut self.plugin_modal {
+            match kind {
+                PluginModalKind::Input { buffer, .. }
+                | PluginModalKind::TextEditor { buffer, .. } => {
+                    buffer.pop();
+                }
+                _ => {}
+            }
         }
     }
 
-    /// Move the picker selection in an open pick modal.
+    /// Move the cursor in an open pick/multiselect modal.
     pub fn plugin_modal_move_selection(&mut self, delta: i32) {
-        let max_items = match &self.plugin_modal {
-            Some(ActivePluginModal {
-                request: UiRequest::Pick { items, .. },
-                ..
-            }) => items.len(),
-            _ => return,
+        let len = match &self.plugin_modal {
+            Some(m) => match &m.request {
+                UiRequest::Pick { items, .. } | UiRequest::MultiSelect { items, .. } => items.len(),
+                _ => return,
+            },
+            None => return,
         };
+        let bump = |cursor: &mut usize| {
+            *cursor = ((*cursor as i64) + (delta as i64)).clamp(0, len as i64 - 1) as usize;
+        };
+        if let Some(modal) = &mut self.plugin_modal {
+            match &mut modal.kind {
+                PluginModalKind::Pick { selected } => bump(selected),
+                PluginModalKind::MultiSelect { cursor, .. } => bump(cursor),
+                _ => {}
+            }
+        }
+    }
+
+    /// Toggle the highlighted item in an open multiselect modal (space).
+    pub fn plugin_modal_toggle_current(&mut self) {
         if let Some(ActivePluginModal {
-            kind: PluginModalKind::Pick { selected },
+            kind: PluginModalKind::MultiSelect { selected, cursor },
             ..
         }) = &mut self.plugin_modal
         {
-            *selected =
-                ((*selected as i64) + (delta as i64)).clamp(0, max_items as i64 - 1) as usize;
+            if let Some(flag) = selected.get_mut(*cursor) {
+                *flag = !*flag;
+            }
+        }
+    }
+
+    /// Insert a newline in an open text-editor modal (plain Enter).
+    pub fn plugin_modal_newline(&mut self) {
+        if let Some(ActivePluginModal {
+            kind: PluginModalKind::TextEditor { buffer, .. },
+            ..
+        }) = &mut self.plugin_modal
+        {
+            buffer.push('\n');
         }
     }
 
@@ -1099,6 +1170,17 @@ impl App {
             }
             PluginModalKind::Confirm => UiResponse::Confirmed(true),
             PluginModalKind::Pick { selected } => UiResponse::Choice(Some(*selected)),
+            PluginModalKind::MultiSelect { selected, .. } => UiResponse::Choices(Some(
+                selected
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, on)| **on)
+                    .map(|(i, _)| i)
+                    .collect(),
+            )),
+            PluginModalKind::TextEditor { buffer, .. } => {
+                UiResponse::Text(Some(buffer.trim_end().to_string()))
+            }
         };
         self.answer_plugin_modal(response);
     }
@@ -1109,10 +1191,10 @@ impl App {
             self.plugin_modal.as_ref().map(|m| &m.kind),
             Some(PluginModalKind::Confirm)
         );
-        let response = if is_confirm {
-            UiResponse::Confirmed(false)
-        } else {
-            UiResponse::Text(None)
+        let response = match self.plugin_modal.as_ref().map(|m| &m.kind) {
+            Some(PluginModalKind::Confirm) => UiResponse::Confirmed(false),
+            Some(PluginModalKind::MultiSelect { .. }) => UiResponse::Choices(None),
+            _ => UiResponse::Text(None),
         };
         self.answer_plugin_modal(response);
     }

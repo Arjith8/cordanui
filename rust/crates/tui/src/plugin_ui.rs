@@ -13,12 +13,20 @@
 
 use std::sync::{mpsc, Mutex};
 
-use cordanui_plugin_runtime::{PendingUi, UiHost};
+use cordanui_plugin_runtime::{PendingUi, UiHost, UiLevel, UiResponse};
+
+/// Everything a plugin can put in front of the user.
+pub enum PluginUiEvent {
+    /// A blocking dialog awaiting an answer.
+    Modal(PendingUi),
+    /// A transient, non-blocking status message.
+    Notify { level: UiLevel, message: String },
+}
 
 /// Bridge shared with plugin Lua states via `Arc`.
 pub struct PluginUiBridge {
-    tx: mpsc::Sender<PendingUi>,
-    rx: Mutex<mpsc::Receiver<PendingUi>>,
+    tx: mpsc::Sender<PluginUiEvent>,
+    rx: Mutex<mpsc::Receiver<PluginUiEvent>>,
 }
 
 impl PluginUiBridge {
@@ -30,9 +38,9 @@ impl PluginUiBridge {
         }
     }
 
-    /// Take the next queued request, if any. Non-blocking: called every
+    /// Take the next queued event, if any. Non-blocking: called every
     /// event-loop iteration.
-    pub fn try_take_request(&self) -> Option<PendingUi> {
+    pub fn try_take_event(&self) -> Option<PluginUiEvent> {
         self.rx.lock().unwrap().try_recv().ok()
     }
 }
@@ -41,7 +49,11 @@ impl UiHost for PluginUiBridge {
     fn submit(&self, pending: PendingUi) {
         // The App always drains the queue; a send only fails if it has
         // been dropped, in which case cancelling the dialog is correct.
-        let _ = self.tx.send(pending);
+        let _ = self.tx.send(PluginUiEvent::Modal(pending));
+    }
+
+    fn notify(&self, level: UiLevel, message: String) {
+        let _ = self.tx.send(PluginUiEvent::Notify { level, message });
     }
 }
 
@@ -54,7 +66,7 @@ mod tests {
     #[test]
     fn requests_round_trip_through_the_bridge() {
         let bridge = PluginUiBridge::new();
-        assert!(bridge.try_take_request().is_none());
+        assert!(bridge.try_take_event().is_none());
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         bridge.submit(PendingUi {
@@ -65,7 +77,11 @@ mod tests {
             respond: tx,
         });
 
-        let pending = bridge.try_take_request().expect("request queued");
+        let crate::plugin_ui::PluginUiEvent::Modal(pending) =
+            bridge.try_take_event().expect("request queued")
+        else {
+            panic!("expected a modal event");
+        };
         assert_eq!(pending.request.title(), "Sure?");
         let _ = pending.respond.send(UiResponse::Confirmed(true));
         assert!(matches!(
@@ -164,6 +180,110 @@ end
 
             let resp = answer.join().unwrap();
             assert_eq!(resp.content, "typed:hello");
+        });
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&plug_dir);
+    }
+
+    /// Multiselect: space toggles items, Enter submits the 0-based index
+    /// set; notify lands in the status message without blocking.
+    #[test]
+    fn lua_multiselect_and_notify_flow() {
+        use crate::app::{App, Mode};
+        use cordanui_plugin_runtime::{CompleteRequest, LuaPlugin};
+
+        let plug_dir = std::env::temp_dir()
+            .join("cordanui-plugin-ui-test")
+            .join(cordanui_schema::new_id());
+        std::fs::create_dir_all(&plug_dir).unwrap();
+        std::fs::write(
+            plug_dir.join("main.lua"),
+            r##"
+plugin = {}
+function plugin.complete(req)
+  cord.ui.notify("scanning goals...")
+  local picked = cord.ui.multiselect{
+    title = "Tags",
+    items = { "urgent", "work", "someday" },
+  }
+  if picked == nil then return { content = "cancelled" } end
+  local sum = 0
+  for _, i in ipairs(picked) do sum = sum + i end
+  return { content = "picked-sum:" .. sum }
+end
+"##,
+        )
+        .unwrap();
+
+        let db_dir = std::env::temp_dir().join(format!(
+            "cordanui-plugin-ui-app-{}",
+            cordanui_schema::new_id()
+        ));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(db).unwrap();
+
+        std::thread::scope(|scope| {
+            let styles = app.styles.clone();
+            let ui = app.plugin_ui.clone();
+            let plugin = LuaPlugin::load(&plug_dir, "asker", None, Some(styles), Some(ui)).unwrap();
+
+            let answer = scope.spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    plugin
+                        .complete(&CompleteRequest {
+                            model: "m".into(),
+                            prompt: "p".into(),
+                            system: None,
+                            max_tokens: None,
+                            temperature: None,
+                            config: None,
+                        })
+                        .await
+                        .unwrap()
+                })
+            });
+
+            // First drain cycles: the notify arrives (status line, no
+            // modal), then nothing until the dialog request lands.
+            for _ in 0..200 {
+                app.poll_plugin_ui_requests();
+                if app.message.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(app.message.as_deref(), Some("scanning goals..."));
+
+            // Then the modal.
+            for _ in 0..200 {
+                app.poll_plugin_ui_requests();
+                if app.mode == Mode::PluginModal {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(matches!(app.mode, Mode::PluginModal));
+
+            // Cursor starts on item 0 ("urgent"); select it, move to item 2
+            // ("someday"), select it too — 1-based indices 1+3 = 4.
+            app.plugin_modal_toggle_current();
+            app.plugin_modal_move_selection(2);
+            app.plugin_modal_toggle_current();
+            app.submit_plugin_modal();
+            assert_eq!(app.mode, Mode::Normal);
+
+            let resp = answer.join().unwrap();
+            assert_eq!(resp.content, "picked-sum:4");
         });
 
         let _ = std::fs::remove_dir_all(&db_dir);

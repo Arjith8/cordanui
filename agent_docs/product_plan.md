@@ -48,8 +48,10 @@ Living document. Updated as we build.
       `settings.style.*` overrides (TUI `cord.g.style.*`) now restyle
       mobile on next reload.
 - [~] **9. Style variables in the UI surface** — plugin-side done:
-      `cord.ui.input/confirm/pick` render host-owned modals with answers
-      awaited from Lua (full round-trip tested through the App). Remaining:
+      `cord.ui.input/confirm/pick/multiselect/text` render host-owned
+      modals with answers awaited from Lua (full round-trip tested
+      through the App), plus non-blocking `cord.ui.notify` status
+      messages. Remaining:
       a TUI command mode for non-plugin users (`:style primary #ff8800`)
       and the tier-2 `cordanui.ui` declarative widget trees.
 

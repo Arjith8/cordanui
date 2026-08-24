@@ -586,16 +586,31 @@ local ok = cord.ui.confirm{ title = "Delete", message = "remove this goal?" }
 local items = { "grok-code", "claude-sonnet-4-5" }
 local idx = cord.ui.pick{ title = "Model", items = items }
 if idx then use_model(items[idx]) end
+
+-- Toggle any of N. Returns an array of 1-based indices (possibly empty),
+-- or nil if cancelled.
+local picked = cord.ui.multiselect{ title = "Tags", items = tags, selected = { 2 } }
+
+-- Multi-line text. Enter inserts a newline; Ctrl+Enter submits.
+-- Returns the string, or nil if cancelled.
+local body = cord.ui.text{ title = "Description", prefill = goal.description }
+
+-- Non-blocking status message. level: "info" (default) | "warn" | "error".
+cord.ui.notify("sync complete")
+cord.ui.notify{ message = "quota low", level = "warn" }
 ```
 
 Contract:
 
 - **Keys**: `title` is always optional. `input` takes `placeholder` and
   `prefill`; `confirm` takes `message`; `pick` requires a non-empty
-  `items` array of strings.
-- **Cancel semantics**: Esc always resolves to `nil` for input/pick and
-  `false` for confirm — never an error. An empty input submitted with
-  Enter also resolves to `nil`.
+  `items` array of strings; `multiselect` additionally takes an optional
+  `selected` array of 1-based indices; `text` is like `input` but
+  multi-line.
+- **Cancel semantics**: Esc resolves to `nil` for input/pick/multiselect/
+  text and `false` for confirm — never an error. An empty input submitted
+  with Enter also resolves to `nil`; a multiselect submitted with nothing
+  selected returns an empty table (distinct from nil).
 - **Refusals are errors**: if the host cannot show the dialog right now
   (another dialog is open), the call raises a Lua error carrying the
   reason. Wrap in `pcall` when a refusal is acceptable:
