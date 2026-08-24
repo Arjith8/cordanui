@@ -12,13 +12,21 @@ Living document. Updated as we build.
       Local-only when no config; embedded replica with background sync when
       `~/.config/cordanui/config.toml` has a `[turso]` section. 3 tests passing.
 - [ ] **3. Plugin runtime** — manifest parsing, subprocess spawning, JSON
-      stdio protocol. **Done** — `rust/crates/plugin-runtime`, 9 tests passing.
+      stdio protocol. **Done** — `rust/crates/plugin-runtime`. Plus a second
+      runtime: **embedded Lua plugins** (`runtime = "lua"` in the manifest,
+      `main.lua` executed in-process via mlua; no build step). Lua plugins
+      get a host API (`cordanui.*`: config injection, log, json, http) and
+      the live-styling `cord` global. Reference: `rust/plugins/provider-zen/`
+      is now written in Lua.
 - [ ] **4. Plugin manager** — GitHub search, clone, build, lockfile.
-- [~] **5. Reference provider plugin** — **Done.** `rust/plugins/provider-zen/`
+      Lua-runtime plugins skip the build step (clone + activate).
+- [~] **5. Reference provider plugin** — `rust/plugins/provider-zen/`
       uses OpenCode Zen gateway (OpenAI-compatible `/chat/completions`).
-      Compiles clean. Not yet tested against live API (needs OPENCODE_API_KEY).
-      Replaces the original `provider-claude` plan — Zen gives access to
-      Claude, GPT, Gemini, Qwen, and more via a single key.
+      Rewritten as a **Lua plugin** (manifest + `main.lua`, runs on the
+      embedded runtime; round-trip tested). Not yet tested against live API
+      (needs OPENCODE_API_KEY). Replaces the original `provider-claude`
+      plan — Zen gives access to Claude, GPT, Gemini, Qwen, and more via a
+      single key.
 - [~] **6. Agent backend** — HTTP server, reads task from DB, runs
       provider plugin, streams results. **Scaffold done, `cargo check`
       passes.** Now lives at `rust/plugins/cordanui-agents/` — it's an optional
@@ -26,7 +34,20 @@ Living document. Updated as we build.
 - [~] **7. Mobile app** — thin Turso client, goal CRUD, agent trigger,
       pre-warm. **Local-first scaffold done** (goal tree CRUD, local
       SQLite). Turso sync, agent trigger, chat pending.
-- [ ] **8. Theme system** — plugin-based theming.
+- [~] **8. Theme system** — plugin-based theming works (theme packs,
+      `themes` table, plugin manager integration). **Token vocabulary
+      overhauled** to Compose/Material 3 roles (`background`, `primary`,
+      `success`, ...; no more widget-specific tokens like `statusWip` —
+      statuses use standard roles). Legacy mobile token names are aliased
+      on read; builtin seeds carry both vocabularies. Plus a live styling
+      API for Lua plugins: `cord.g.style.<var>("color")` persists to
+      `settings.style.<var>` (syncs via Turso), `cord["local"].style.*`
+      is session-only. Palette re-resolves within a frame of any change.
+      Mobile-side aliasing of new-keyed themes is pending.
+- [ ] **9. Style variables in the UI surface** — expose the same
+      variables to non-plugin users (e.g. a TUI command mode:
+      `:style primary #ff8800`) and a `cordanui.ui` declarative widget API
+      for plugins to render panels.
 
 ## phase 1 — TUI base
 

@@ -58,10 +58,13 @@ you flip it to "agent mode" and an agent picks it up and gets it done.
 - **Turso is the only shared state.** The HTTP call to the backend is a
   wake-and-point (just a task ID), not a data transfer. The backend reads
   the task from Turso and writes results back to Turso.
-- **Plugins are Rust, built locally, act as CLIs.** The TUI spawns them as
-  subprocesses, passes JSON via stdin, reads JSON from stdout. One-shot
-  invocations for simple things, long-running processes with streaming
-  output for the agent layer. No in-process loading, no ABI headaches.
+- **Plugins come in two runtimes.** *Lua plugins* (`runtime = "lua"`) are
+  `main.lua` scripts executed in-process by an embedded Lua runtime —
+  no build step; install = clone + activate; they call the host through a
+  `cordanui.*` API (config, log, json, http). *Binary plugins* are Rust
+  CLIs built locally and spawned as subprocesses with JSON over stdio.
+  One-shot invocations for simple things, long-running processes with
+  streaming output for the agent layer. See `rust/plugins/AGENTS.md`.
 - **Base has zero providers.** No Claude, no OpenAI, nothing. A provider
   is just another plugin. We ship a reference Claude provider plugin but
   it is not in the core.
@@ -80,10 +83,10 @@ cordanui/
 │   │   ├── tui/               # ratatui app (binary) — goal list + plugin mgr + sync
 │   │   ├── schema/            # shared types + SQLite migrations (tui + backend)
 │   │   ├── sync/              # libSQL embedded replica wrapper (tui + backend) — Turso sync
-│   │   └── plugin-runtime/    # manifest parsing, subprocess spawning, JSON stdio protocol
+│   │   ├── plugin-runtime/    # manifest parsing, subprocess spawning, JSON stdio protocol, embedded Lua runtime
 │   └── plugins/
 │       ├── cordanui-agents/   # optional agent backend (HTTP server, reads task from DB, runs provider)
-│       └── provider-zen/      # OpenCode Zen provider plugin (GPT, Claude, Gemini, Qwen, etc.)
+│       └── provider-zen/      # OpenCode Zen provider plugin (Lua runtime; GPT, Claude, Gemini, Qwen, etc.)
 ├── mobile/                    # mobile app (separate codebase)
 └── agent_docs/                # product plan + status
 ```
