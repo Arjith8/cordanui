@@ -34,14 +34,14 @@ export default function InlineAddInput({
           styles.input,
           {
             backgroundColor: colors.surface,
-            color: colors.text,
-            borderColor: colors.border,
+            color: colors.onBackground,
+            borderColor: colors.outline,
           },
         ]}
         value={value}
         onChangeText={onChangeText}
         placeholder={placeholder}
-        placeholderTextColor={colors.textFaint}
+        placeholderTextColor={colors.outlineVariant}
         onSubmitEditing={() => canAdd && onSubmit()}
         returnKeyType="done"
         autoFocus={autoFocus}
@@ -51,14 +51,14 @@ export default function InlineAddInput({
         <Pressable
           onPress={onSubmit}
           hitSlop={8}
-          style={[styles.addBtn, { backgroundColor: colors.accent }]}
+          style={[styles.addBtn, { backgroundColor: colors.primary }]}
         >
-          <Text style={[styles.addBtnText, { color: colors.onAccent }]}>Add</Text>
+          <Text style={[styles.addBtnText, { color: colors.onPrimary }]}>Add</Text>
         </Pressable>
       ) : null}
       {onCancel ? (
         <Pressable onPress={onCancel} hitSlop={8}>
-          <Text style={[styles.cancelBtn, { color: colors.textDim }]}>✕</Text>
+          <Text style={[styles.cancelBtn, { color: colors.onSurfaceVariant }]}>✕</Text>
         </Pressable>
       ) : null}
     </View>

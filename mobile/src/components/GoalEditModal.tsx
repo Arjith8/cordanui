@@ -38,50 +38,50 @@ export default function GoalEditModal({
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <View style={[styles.overlay, { backgroundColor: `${colors.treeLine}80` }]}>
-        <View style={[styles.sheet, { backgroundColor: colors.bg }]}>
-          <Text style={[styles.header, { color: colors.text }]}>Edit goal</Text>
+      <View style={[styles.overlay, { backgroundColor: `${colors.outlineVariant}80` }]}>
+        <View style={[styles.sheet, { backgroundColor: colors.background }]}>
+          <Text style={[styles.header, { color: colors.onBackground }]}>Edit goal</Text>
 
-          <Text style={[styles.label, { color: colors.textFaint }]}>Title</Text>
+          <Text style={[styles.label, { color: colors.outlineVariant }]}>Title</Text>
           <TextInput
-            style={[styles.input, { backgroundColor: colors.surface, color: colors.text }]}
+            style={[styles.input, { backgroundColor: colors.surface, color: colors.onBackground }]}
             value={title}
             onChangeText={setTitle}
             placeholder="Goal title"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={colors.outlineVariant}
             autoFocus
           />
 
-          <Text style={[styles.label, { color: colors.textFaint }]}>Description</Text>
+          <Text style={[styles.label, { color: colors.outlineVariant }]}>Description</Text>
           <TextInput
             style={[
               styles.input,
               styles.multiline,
-              { backgroundColor: colors.surface, color: colors.text },
+              { backgroundColor: colors.surface, color: colors.onBackground },
             ]}
             value={description}
             onChangeText={setDescription}
             placeholder="Optional description"
-            placeholderTextColor={colors.textFaint}
+            placeholderTextColor={colors.outlineVariant}
             multiline
             numberOfLines={4}
           />
 
           <View style={styles.actions}>
             <Pressable style={styles.deleteBtn} onPress={() => onDelete(goal.id)}>
-              <Text style={[styles.deleteText, { color: colors.danger }]}>Delete</Text>
+              <Text style={[styles.deleteText, { color: colors.error }]}>Delete</Text>
             </Pressable>
             <View style={{ flex: 1 }} />
             <Pressable style={styles.cancelBtn} onPress={onClose}>
-              <Text style={[styles.cancelText, { color: colors.textDim }]}>Cancel</Text>
+              <Text style={[styles.cancelText, { color: colors.onSurfaceVariant }]}>Cancel</Text>
             </Pressable>
             <Pressable
-              style={[styles.saveBtn, { backgroundColor: colors.accent }]}
+              style={[styles.saveBtn, { backgroundColor: colors.primary }]}
               onPress={() => {
                 if (title.trim()) onSave(goal.id, title.trim(), description.trim());
               }}
             >
-              <Text style={[styles.saveText, { color: colors.onAccent }]}>Save</Text>
+              <Text style={[styles.saveText, { color: colors.onPrimary }]}>Save</Text>
             </Pressable>
           </View>
         </View>

@@ -39,45 +39,57 @@ migration v2:
 Defined once in `src/theme/types.ts` as `ThemeColors`. Components must never
 hardcode hex values; they consume tokens via `useTheme().colors`.
 
-> **Vocabulary change (TUI-side, 2026-08):** the TUI now addresses colors by
-> **Compose / Material 3 role names** — `background`, `onBackground`,
-> `surface`, `onSurface`, `surfaceVariant`, `onSurfaceVariant`, `primary`,
-> `onPrimary`, `secondary`, `onSecondary`, `tertiary`, `onTertiary`,
-> `success`, `onSuccess`, `error`, `onError`, `outline`, `outlineVariant`.
-> Widget-specific tokens (`statusWip` etc.) are gone there; statuses use
-> standard roles (pending → `onSurfaceVariant`, wip → `primary`,
-> done → `success`, agent → `tertiary`).
+> **Both hosts now speak the role vocabulary (2026-08):** colors are
+> addressed by **Compose / Material 3 role names** — `background`,
+> `onBackground`, `surface`, `onSurface`, `surfaceVariant`,
+> `onSurfaceVariant`, `primary`, `onPrimary`, `secondary`, `onSecondary`,
+> `tertiary`, `onTertiary`, `success`, `onSuccess`, `error`, `onError`,
+> `outline`, `outlineVariant`. Widget-specific tokens (`statusWip` etc.)
+> are gone everywhere; statuses use standard roles (pending →
+> `onSurfaceVariant`, wip → `primary`, done → `success`, agent →
+> `tertiary`) via `statusColor()`.
 >
-> The shared `themes.colors_json` rows may therefore contain **either**
-> vocabulary. The TUI aliases legacy names on read (`bg` → `background`,
-> `accent` → `primary`, `statusDone` → `success`, ...). Mobile should do
-> the same when it starts encountering new-keyed themes; until then,
-> builtin seeds carry both key sets so existing code keeps rendering.
+> **Legacy rows still render:** `themeColorsOf()` aliases old token names
+> (`bg` → `background`, `accent` → `primary`, `statusDone` → `success`,
+> ...) before applying canonical keys, so plugin themes written against
+> the old vocabulary keep working. New themes should use canonical roles;
+> dual-keying is no longer necessary but remains harmless.
 >
-> There is also a new user override layer: the TUI persists per-variable
-> overrides as `settings` rows keyed `style.<var>` (written by the plugin
-> API `cord.g.style.<var>("color")`; session-only variants never touch
-> storage). They sit **above** the active theme in precedence and sync
-> through Turso like any settings row.
+> **Synced user overrides:** the TUI's `cord.g.style.*` persists
+> per-variable overrides as `settings` rows keyed `style.<var>`. Mobile
+> reads them in `getThemeState()` and applies them **above** the active
+> theme (`themeColorsOf(active, styleOverrides)`). They sync via Turso,
+> so restyling the TUI restyles this app on next reload.
 
-Legacy token map (mobile-side `ThemeColors`, still canonical for mobile):
+Token table (`ThemeColors` in `src/theme/types.ts`):
 
-| token          | semantic                                    | TUI role equivalent          |
-|----------------|---------------------------------------------|------------------------------|
-| `bg`           | screen background                           | `background`                 |
-| `surface`      | cards, inputs, inactive tabs                | `surface`                    |
-| `border`       | hairline borders/dividers                   | `outline` / `surfaceVariant` |
-| `treeLine`     | tree guide/elbow lines                      | `outlineVariant`             |
-| `text`         | primary text                                | `onBackground`               |
-| `textDim`      | secondary text                              | `onSurfaceVariant`           |
-| `textFaint`    | placeholders, hints, de-emphasized text     | `outlineVariant`             |
-| `accent`       | primary action color                        | `primary`                    |
-| `onAccent`     | text/icon color on top of accent            | `onPrimary`                  |
-| `danger`       | destructive actions / error text            | `error`                      |
-| `statusPending`| ○ pending status                            | `onSurfaceVariant`           |
-| `statusWip`    | ◐ wip status                                | `primary`                    |
-| `statusDone`   | ● done status                               | `success`                    |
-| `statusAgent`  | agent-mode status + profile icon            | `tertiary`                   |
+| role               | semantic                                    |
+|--------------------|---------------------------------------------|
+| `background`       | screen background                           |
+| `onBackground`     | primary text                                |
+| `surface`          | cards, inputs, inactive tabs                |
+| `onSurface`        | text/icons on surfaces                      |
+| `surfaceVariant`   | muted surface variant                       |
+| `onSurfaceVariant` | secondary text                              |
+| `primary`          | primary action color; ◐ wip status          |
+| `onPrimary`        | text/icons on top of primary                |
+| `secondary`        | secondary accent                            |
+| `onSecondary`      | text/icons on top of secondary              |
+| `tertiary`         | third accent; ⤴ agent status                |
+| `onTertiary`       | text/icons on top of tertiary               |
+| `success`          | ● done status / success states              |
+| `onSuccess`        | text/icons on top of success                |
+| `error`            | destructive actions / error text            |
+| `onError`          | text/icons on top of error                  |
+| `outline`          | hairline borders and dividers               |
+| `outlineVariant`   │ tree guides, placeholders, faint text      |
+
+Legacy alias map (read-only compatibility, see `LEGACY_ALIASES`):
+`bg`→`background`, `border`→`outline`, `treeLine`→`outlineVariant`,
+`text`→`onBackground`, `textDim`→`onSurfaceVariant`,
+`textFaint`→`outlineVariant`, `accent`→`primary`, `onAccent`→`onPrimary`,
+`danger`→`error`, `statusPending`→`onSurfaceVariant`,
+`statusWip`→`primary`, `statusDone`→`success`, `statusAgent`→`tertiary`.
 
 `colors_json` may specify **any subset** of tokens. Missing keys are filled
 from `DARK_THEME_COLORS` by `themeColorsOf()` (`{ ...DARK_THEME_COLORS,
@@ -159,6 +171,7 @@ still renders sanely.
 ## Migration discipline
 
 The tables ship in migration **v2** of the versioned runner in
-`goalsDb.ts` (`LATEST_SCHEMA_VERSION`, `schema_migrations` table). Any new
+`goalsDb.ts` (`LATEST_SCHEMA_VERSION`, `schema_migrations` table); the
+token-role re-seed of the builtins is **v3** (`theme-token-roles`). Any new
 theming columns/tables must be a **new numbered migration step**, never an
 edit to existing steps. See `agent-docs/development_practices.md`.

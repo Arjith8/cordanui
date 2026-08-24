@@ -108,7 +108,7 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
  * compare the version recorded in the local `schema_migrations` table against
  * this variable and apply everything missing.
  */
-export const LATEST_SCHEMA_VERSION = 2;
+export const LATEST_SCHEMA_VERSION = 3;
 
 interface Migration {
   version: number;
@@ -151,6 +151,26 @@ const MIGRATIONS: Migration[] = [
         `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
          VALUES (?, ?, 'builtin', 0, ?)`,
         ['builtin-light', 'Cordanui Light', JSON.stringify(LIGHT_THEME_COLORS)],
+      );
+    },
+  },
+  {
+    version: 3,
+    name: 'theme-token-roles',
+    // Token vocabulary switched to Compose/Material 3 roles
+    // (`background`, `primary`, ... — see src/theme/types.ts). Re-seed the
+    // two builtin rows so fresh and migrated installs agree; plugin themes
+    // keep their stored JSON and are aliased on read by themeColorsOf().
+    up: async (database) => {
+      await database.runAsync(
+        `UPDATE themes SET colors_json = ?
+         WHERE id = 'builtin-dark' AND source = 'builtin'`,
+        [JSON.stringify(DARK_THEME_COLORS)],
+      );
+      await database.runAsync(
+        `UPDATE themes SET colors_json = ?
+         WHERE id = 'builtin-light' AND source = 'builtin'`,
+        [JSON.stringify(LIGHT_THEME_COLORS)],
       );
     },
   },

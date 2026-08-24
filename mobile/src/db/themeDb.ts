@@ -43,11 +43,23 @@ export async function getThemeState(scheme: 'light' | 'dark'): Promise<{
   mode: ThemeMode;
   active: ThemeRecord;
   themes: ThemeRecord[];
+  /** Global per-variable style overrides (`settings.style.<var>`), written
+   * by the TUI's `cord.g.style.*` and synced via Turso. Applied above the
+   * active theme by themeColorsOf(). */
+  styleOverrides: Record<string, string>;
 }> {
   const db = await getDb();
   const mode = ((await getSetting('theme_mode')) as ThemeMode | null) ?? 'system';
   const selectedId = await getSetting('selected_theme_id');
   const themes = await listThemes();
+
+  const overrideRows = await db.getAllAsync<{ key: string; value: string }>(
+    "SELECT key, value FROM settings WHERE key LIKE 'style.%'",
+  );
+  const styleOverrides: Record<string, string> = {};
+  for (const row of overrideRows) {
+    styleOverrides[row.key.slice('style.'.length)] = row.value;
+  }
 
   let active: ThemeRecord | undefined;
   if (mode === 'explicit' && selectedId) {
@@ -62,7 +74,7 @@ export async function getThemeState(scheme: 'light' | 'dark'): Promise<{
     if (!row) throw new Error('theme-system: builtin themes missing — migration did not run');
     active = row;
   }
-  return { mode, active, themes };
+  return { mode, active, themes, styleOverrides };
 }
 
 /**

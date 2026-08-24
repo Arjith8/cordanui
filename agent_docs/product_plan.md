@@ -43,7 +43,10 @@ Living document. Updated as we build.
       API for Lua plugins: `cord.g.style.<var>("color")` persists to
       `settings.style.<var>` (syncs via Turso), `cord["local"].style.*`
       is session-only. Palette re-resolves within a frame of any change.
-      Mobile-side aliasing of new-keyed themes is pending.
+      **Mobile migrated too**: `ThemeColors` uses the same roles, migration
+      v3 re-seeds builtins, legacy rows alias on read, and the synced
+      `settings.style.*` overrides (TUI `cord.g.style.*`) now restyle
+      mobile on next reload.
 - [~] **9. Style variables in the UI surface** — plugin-side done:
       `cord.ui.input/confirm/pick` render host-owned modals with answers
       awaited from Lua (full round-trip tested through the App). Remaining:

@@ -276,8 +276,8 @@ export default function HomeScreen() {
 
   if (loading) {
     return (
-      <View style={[styles.container, styles.center, { backgroundColor: colors.bg }]}>
-        <Text style={[styles.muted, { color: colors.textFaint }]}>Loading…</Text>
+      <View style={[styles.container, styles.center, { backgroundColor: colors.background }]}>
+        <Text style={[styles.muted, { color: colors.outlineVariant }]}>Loading…</Text>
       </View>
     );
   }
@@ -287,11 +287,13 @@ export default function HomeScreen() {
   }
 
   return (
-    <View style={[styles.container, { backgroundColor: colors.bg, paddingTop: insets.top }]}>
-      <View style={[styles.headerRow, { borderBottomColor: colors.border }]}>
+    <View
+      style={[styles.container, { backgroundColor: colors.background, paddingTop: insets.top }]}
+    >
+      <View style={[styles.headerRow, { borderBottomColor: colors.outline }]}>
         <View style={styles.header}>
-          <Text style={[styles.title, { color: colors.text }]}>cordanui</Text>
-          <Text style={[styles.subtitle, { color: colors.textFaint }]}>
+          <Text style={[styles.title, { color: colors.onBackground }]}>cordanui</Text>
+          <Text style={[styles.subtitle, { color: colors.outlineVariant }]}>
             {totals.completed}/{totals.total} done · {totals.pending} pending
           </Text>
         </View>
@@ -300,13 +302,13 @@ export default function HomeScreen() {
           hitSlop={8}
           style={[styles.profileBtn, { backgroundColor: colors.surface }]}
         >
-          <Text style={[styles.profileIcon, { color: colors.statusAgent }]}>◉</Text>
+          <Text style={[styles.profileIcon, { color: colors.tertiary }]}>◉</Text>
         </Pressable>
       </View>
 
       {error ? (
-        <View style={[styles.errorBar, { backgroundColor: colors.danger }]}>
-          <Text style={[styles.errorText, { color: colors.onAccent }]}>{error}</Text>
+        <View style={[styles.errorBar, { backgroundColor: colors.error }]}>
+          <Text style={[styles.errorText, { color: colors.onPrimary }]}>{error}</Text>
         </View>
       ) : null}
 
@@ -315,7 +317,7 @@ export default function HomeScreen() {
         horizontal
         showsHorizontalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
-        style={[styles.tabs, { borderBottomColor: colors.border }]}
+        style={[styles.tabs, { borderBottomColor: colors.outline }]}
         contentContainerStyle={styles.tabsContent}
       >
         {sheets.map((sheet) => (
@@ -325,15 +327,15 @@ export default function HomeScreen() {
             style={[
               styles.tab,
               { backgroundColor: colors.surface },
-              sheet.id === activeSheetId && { backgroundColor: colors.accent },
+              sheet.id === activeSheetId && { backgroundColor: colors.primary },
             ]}
           >
             <Text
               style={[
                 styles.tabText,
-                { color: colors.textDim },
+                { color: colors.onSurfaceVariant },
                 sheet.id === activeSheetId && {
-                  color: colors.onAccent,
+                  color: colors.onPrimary,
                   fontWeight: '600' as const,
                 },
               ]}
@@ -347,9 +349,9 @@ export default function HomeScreen() {
           <Pressable
             onPress={() => setAddingSheet(true)}
             hitSlop={8}
-            style={[styles.addTab, { borderColor: colors.treeLine }]}
+            style={[styles.addTab, { borderColor: colors.outlineVariant }]}
           >
-            <Text style={[styles.addTabText, { color: colors.textDim }]}>+</Text>
+            <Text style={[styles.addTabText, { color: colors.onSurfaceVariant }]}>+</Text>
           </Pressable>
         ) : null}
       </ScrollView>
@@ -407,8 +409,10 @@ export default function HomeScreen() {
         )}
         ListEmptyComponent={
           <View style={styles.empty}>
-            <Text style={[styles.muted, { color: colors.textFaint }]}>This sheet is empty.</Text>
-            <Text style={[styles.muted, { color: colors.textFaint }]}>
+            <Text style={[styles.muted, { color: colors.outlineVariant }]}>
+              This sheet is empty.
+            </Text>
+            <Text style={[styles.muted, { color: colors.outlineVariant }]}>
               Type above to add your first goal.
             </Text>
           </View>

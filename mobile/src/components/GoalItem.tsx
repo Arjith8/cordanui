@@ -125,8 +125,8 @@ export default function GoalItem({
     <View style={[dragging && styles.dragging]}>
       {/* Header row */}
       <View style={[styles.header, completed && styles.dimmed]}>
-        <BodyGuides prefix={prefix} color={colors.treeLine} />
-        <Elbow isLast={isLast} color={colors.treeLine} />
+        <BodyGuides prefix={prefix} color={colors.outlineVariant} />
+        <Elbow isLast={isLast} color={colors.outlineVariant} />
         <StatusCircle status={goal.status} onPress={() => onCycleStatus(goal.id)} />
         <View style={styles.titleArea}>
           <EditableText
@@ -134,8 +134,8 @@ export default function GoalItem({
             onTap={() => setOpen((v) => !v)}
             onEditStart={() => setOpen(true)}
             onCommit={(t) => onRename(goal.id, t)}
-            style={[styles.title, { color: colors.text }, completed && styles.titleDone]}
-            placeholderColor={colors.textFaint}
+            style={[styles.title, { color: colors.onBackground }, completed && styles.titleDone]}
+            placeholderColor={colors.outlineVariant}
           />
         </View>
         {drag ? (
@@ -145,10 +145,10 @@ export default function GoalItem({
             hitSlop={6}
             style={styles.grip}
           >
-            <Text style={{ color: colors.treeLine, fontSize: 16 }}>≡</Text>
+            <Text style={{ color: colors.outlineVariant, fontSize: 16 }}>≡</Text>
           </TouchableOpacity>
         ) : null}
-        <Text style={[styles.chevron, { color: colors.treeLine }]}>
+        <Text style={[styles.chevron, { color: colors.outlineVariant }]}>
           {children.length > 0 || open ? (open ? '▾' : '▸') : ''}
         </Text>
       </View>
@@ -158,18 +158,18 @@ export default function GoalItem({
         <View>
           {/* Goal's own content, guided by its ancestors' lines */}
           <View style={[styles.bodyRow, completed && styles.dimmed]}>
-            <BodyGuides prefix={prefix} color={colors.treeLine} />
+            <BodyGuides prefix={prefix} color={colors.outlineVariant} />
             <View style={styles.bodySpacer} />
             <View style={styles.bodyContent}>
               <EditableText
                 value={goal.description ?? ''}
                 multiline
                 emptyLabel="No description — double-tap to add one"
-                placeholderColor={colors.textFaint}
+                placeholderColor={colors.outlineVariant}
                 onCommit={(text) => onSaveDescription(goal.id, text)}
                 style={[
                   goal.description ? styles.description : styles.descriptionEmpty,
-                  { color: goal.description ? colors.textDim : colors.textFaint },
+                  { color: goal.description ? colors.onSurfaceVariant : colors.outlineVariant },
                 ]}
               />
 
@@ -185,7 +185,7 @@ export default function GoalItem({
                         hitSlop={6}
                         style={[
                           styles.statusOption,
-                          { borderColor: colors.border },
+                          { borderColor: colors.outline },
                           activeOpt && { borderColor: statusColor(colors, opt.status) },
                         ]}
                       >
@@ -196,7 +196,9 @@ export default function GoalItem({
                           style={[
                             styles.statusOptionLabel,
                             {
-                              color: activeOpt ? statusColor(colors, opt.status) : colors.textDim,
+                              color: activeOpt
+                                ? statusColor(colors, opt.status)
+                                : colors.onSurfaceVariant,
                               fontWeight: activeOpt ? ('600' as const) : ('400' as const),
                             },
                           ]}
@@ -208,7 +210,7 @@ export default function GoalItem({
                   })}
                 </View>
                 <Pressable onPress={() => onDeleteDirect(goal.id)} hitSlop={8}>
-                  <Text style={{ color: colors.danger, fontSize: 15 }}>🗑</Text>
+                  <Text style={{ color: colors.error, fontSize: 15 }}>🗑</Text>
                 </Pressable>
               </View>
             </View>
@@ -248,7 +250,7 @@ export default function GoalItem({
 
           {/* Add-subgoal input, aligned under the children column */}
           <View style={[styles.bodyRow, completed && styles.dimmed]}>
-            <BodyGuides prefix={prefix} color={colors.treeLine} />
+            <BodyGuides prefix={prefix} color={colors.outlineVariant} />
             <View style={styles.bodySpacer} />
             <InlineAddInput
               nested

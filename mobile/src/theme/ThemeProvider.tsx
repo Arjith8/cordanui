@@ -40,7 +40,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const reload = useCallback(async () => {
     try {
       const state = await getThemeState(scheme);
-      setColors(themeColorsOf(state.active));
+      setColors(themeColorsOf(state.active, state.styleOverrides));
       setActiveThemeId(state.active.id);
       setMode(state.mode);
       setThemes(state.themes);

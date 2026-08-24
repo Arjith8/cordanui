@@ -32,45 +32,47 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
   }, [refresh]);
 
   return (
-    <View style={[styles.container, { backgroundColor: colors.bg, paddingTop: insets.top }]}>
-      <View style={[styles.header, { borderBottomColor: colors.border }]}>
+    <View
+      style={[styles.container, { backgroundColor: colors.background, paddingTop: insets.top }]}
+    >
+      <View style={[styles.header, { borderBottomColor: colors.outline }]}>
         <Pressable onPress={onBack} hitSlop={8}>
-          <Text style={[styles.back, { color: colors.accent }]}>← Back</Text>
+          <Text style={[styles.back, { color: colors.primary }]}>← Back</Text>
         </Pressable>
-        <Text style={[styles.title, { color: colors.text }]}>Profile</Text>
+        <Text style={[styles.title, { color: colors.onBackground }]}>Profile</Text>
         <Pressable onPress={handleClear} hitSlop={8}>
-          <Text style={[styles.clear, { color: colors.danger }]}>Clear</Text>
+          <Text style={[styles.clear, { color: colors.error }]}>Clear</Text>
         </Pressable>
       </View>
 
       {/* Themes section */}
       <Pressable
         onPress={() => setShowThemes((v) => !v)}
-        style={[styles.sectionRow, { borderBottomColor: colors.border }]}
+        style={[styles.sectionRow, { borderBottomColor: colors.outline }]}
       >
-        <Text style={[styles.sectionTitle, { color: colors.text }]}>🎨 Themes</Text>
-        <Text style={[styles.sectionMeta, { color: colors.textFaint }]}>
+        <Text style={[styles.sectionTitle, { color: colors.onBackground }]}>🎨 Themes</Text>
+        <Text style={[styles.sectionMeta, { color: colors.outlineVariant }]}>
           {mode === 'system' ? 'System' : (themes.find((t) => t.id === activeThemeId)?.name ?? '')}{' '}
           {showThemes ? '▾' : '▸'}
         </Text>
       </Pressable>
 
       {showThemes ? (
-        <View style={[styles.themeList, { borderBottomColor: colors.border }]}>
+        <View style={[styles.themeList, { borderBottomColor: colors.outline }]}>
           <Pressable
             onPress={() => selectTheme(null)}
             hitSlop={4}
             style={[
               styles.themeOption,
-              mode === 'system' && { borderColor: colors.accent },
-              { borderColor: colors.border },
+              mode === 'system' && { borderColor: colors.primary },
+              { borderColor: colors.outline },
             ]}
           >
-            <Text style={{ color: colors.textDim, fontSize: 13 }}>◐</Text>
+            <Text style={{ color: colors.onSurfaceVariant, fontSize: 13 }}>◐</Text>
             <Text
               style={[
                 styles.themeName,
-                { color: mode === 'system' ? colors.accent : colors.textDim },
+                { color: mode === 'system' ? colors.primary : colors.onSurfaceVariant },
                 mode === 'system' && styles.themeNameActive,
               ]}
             >
@@ -87,19 +89,19 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
                 hitSlop={4}
                 style={[
                   styles.themeOption,
-                  { borderColor: active ? colors.accent : colors.border },
+                  { borderColor: active ? colors.primary : colors.outline },
                 ]}
               >
                 <View style={styles.swatchRow}>
-                  <View style={[styles.swatch, { backgroundColor: preview.bg }]} />
+                  <View style={[styles.swatch, { backgroundColor: preview.background }]} />
                   <View style={[styles.swatch, { backgroundColor: preview.surface }]} />
-                  <View style={[styles.swatch, { backgroundColor: preview.accent }]} />
-                  <View style={[styles.swatch, { backgroundColor: preview.statusDone }]} />
+                  <View style={[styles.swatch, { backgroundColor: preview.primary }]} />
+                  <View style={[styles.swatch, { backgroundColor: preview.success }]} />
                 </View>
                 <Text
                   style={[
                     styles.themeName,
-                    { color: active ? colors.accent : colors.textDim },
+                    { color: active ? colors.primary : colors.onSurfaceVariant },
                     active && styles.themeNameActive,
                   ]}
                 >
@@ -112,13 +114,13 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
         </View>
       ) : null}
 
-      <View style={[styles.errorsHeader, { borderBottomColor: colors.border }]}>
-        <Text style={[styles.sectionTitle, { color: colors.text }]}>🐞 Logged errors</Text>
+      <View style={[styles.errorsHeader, { borderBottomColor: colors.outline }]}>
+        <Text style={[styles.sectionTitle, { color: colors.onBackground }]}>🐞 Logged errors</Text>
       </View>
 
       {loading ? (
         <View style={styles.center}>
-          <Text style={[styles.muted, { color: colors.textFaint }]}>Loading…</Text>
+          <Text style={[styles.muted, { color: colors.outlineVariant }]}>Loading…</Text>
         </View>
       ) : (
         <FlatList
@@ -126,20 +128,22 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
           keyExtractor={(item) => item.id}
           ListEmptyComponent={
             <View style={[styles.center, styles.empty]}>
-              <Text style={[styles.muted, { color: colors.textFaint }]}>No errors logged. 🎉</Text>
+              <Text style={[styles.muted, { color: colors.outlineVariant }]}>
+                No errors logged. 🎉
+              </Text>
             </View>
           }
           renderItem={({ item }) => (
             <View style={[styles.card, { backgroundColor: colors.surface }]}>
               <View style={styles.cardHeader}>
-                <Text style={[styles.context, { color: colors.statusAgent }]}>{item.context}</Text>
-                <Text style={[styles.time, { color: colors.textFaint }]}>
+                <Text style={[styles.context, { color: colors.tertiary }]}>{item.context}</Text>
+                <Text style={[styles.time, { color: colors.outlineVariant }]}>
                   {formatTime(item.created_at)}
                 </Text>
               </View>
-              <Text style={[styles.message, { color: colors.danger }]}>{item.message}</Text>
+              <Text style={[styles.message, { color: colors.error }]}>{item.message}</Text>
               {item.detail ? (
-                <Text numberOfLines={6} style={[styles.detail, { color: colors.textDim }]}>
+                <Text numberOfLines={6} style={[styles.detail, { color: colors.onSurfaceVariant }]}>
                   {item.detail}
                 </Text>
               ) : null}

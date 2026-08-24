@@ -291,8 +291,9 @@ Contract:
 - **Legacy keys still load**: themes authored against the old mobile token
   names (`bg`, `accent`, `statusDone`, ...) are aliased to their roles on
   read (`bg` → `background`, `accent` → `primary`, `statusDone` →
-  `success`, ...). Prefer the canonical names in new work; the aliases
-  exist so existing themes and the mobile client keep working.
+  `success`, ...) by both hosts. New themes should use canonical role
+  names only — the mobile client has migrated too; duplicate legacy keys
+  are harmless but unnecessary.
 - Any subset of keys is valid; missing or unknown tokens fall back to the
   builtin dark palette.
 - On install the host inserts a row into the `themes` table:
