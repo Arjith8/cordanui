@@ -24,6 +24,11 @@ pub struct PluginManifest {
     pub provider: Option<ProviderConfig>,
     #[serde(default)]
     pub build: Option<BuildConfig>,
+    /// A long-running process the plugin ships (any language). Declared
+    /// under `[service]`. The host can spawn/stop it (plugin manager,
+    /// `cord.services.*`, `cordanui service` CLI).
+    #[serde(default)]
+    pub service: Option<ServiceConfig>,
     /// Declarative settings form. Authored as `[[field]]` entries at the
     /// manifest root (flattened into [`UiSpec`] here). The host renders
     /// these fields (plugin manager → Configure), stores values namespaced
@@ -157,6 +162,44 @@ pub struct ProviderConfig {
     pub api_key_env: Option<String>,
 }
 
+/// A long-running process the plugin ships. The binary can be written in
+/// any language; the host only knows how to spawn/stop it and where it
+/// listens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceConfig {
+    /// Command to spawn, relative to the plugin directory.
+    pub cmd: String,
+    /// Default arguments; callers may append more.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Base URL for `cord.services.request` (e.g. "http://127.0.0.1:8081").
+    #[serde(default)]
+    pub addr: Option<String>,
+    /// Optional readiness probe URL.
+    #[serde(default)]
+    pub health: Option<String>,
+    /// Hint for TUI hosts: start the service when the plugin activates.
+    #[serde(default)]
+    pub autostart: bool,
+}
+
+impl ServiceConfig {
+    /// The URL `cord.services.request` should address: `addr` if set,
+    /// otherwise the health probe's origin.
+    pub fn base_url(&self) -> Option<String> {
+        if let Some(addr) = &self.addr {
+            return Some(addr.trim_end_matches('/').to_string());
+        }
+        self.health.as_deref().and_then(|h| {
+            let without = h
+                .strip_prefix("http://")
+                .or_else(|| h.strip_prefix("https://"))?;
+            let origin = without.split('/').next()?;
+            Some(format!("http://{origin}"))
+        })
+    }
+}
+
 /// How to build the plugin binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuildConfig {
@@ -222,6 +265,20 @@ impl PluginManifest {
                 "`runtime` must be at the manifest root (before any [section]), not under [plugin]"
                     .into(),
             );
+        }
+        if let Some(service) = &self.service {
+            if service.cmd.trim().is_empty() {
+                problems.push("[service] cmd must not be empty".into());
+            }
+            for url_field in [&service.addr, &service.health] {
+                if let Some(url) = url_field {
+                    if !url.starts_with("http://") && !url.starts_with("https://") {
+                        problems.push(format!(
+                            "[service] url '{url}' must start with http:// or https://"
+                        ));
+                    }
+                }
+            }
         }
         if let Some(ui) = &self.ui {
             // An absent/empty form is valid — plugins don't need settings.
@@ -359,6 +416,46 @@ version = "0.1"
             bad.validate(),
             vec!["unknown runtime 'wasm' (expected \"binary\" or \"lua\")"]
         );
+    }
+
+    #[test]
+    fn service_manifest_parses_and_validates() {
+        let toml = r#"
+[plugin]
+name = "cordanui-agents"
+version = "0.1.0"
+
+[service]
+cmd = "./target/release/cordanui-agents"
+args = ["--port", "8081"]
+addr = "http://127.0.0.1:8081"
+health = "http://127.0.0.1:8081/health"
+autostart = true
+"#;
+        let m = PluginManifest::from_str(toml).unwrap();
+        let service = m.service.clone().expect("service present");
+        assert_eq!(service.cmd, "./target/release/cordanui-agents");
+        assert_eq!(service.args, vec!["--port", "8081"]);
+        assert!(service.autostart);
+        assert_eq!(service.base_url().as_deref(), Some("http://127.0.0.1:8081"));
+        assert!(m.validate().is_empty());
+
+        // health-only: base_url derives the origin
+        let m2 = PluginManifest::from_str(
+            "[plugin]\nname = \"x\"\nversion = \"0.1\"\n\n[service]\ncmd = \"./srv\"\nhealth = \"http://1.2.3.4:9/api/health\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            m2.service.unwrap().base_url().as_deref(),
+            Some("http://1.2.3.4:9")
+        );
+
+        // bad url is caught
+        let bad: PluginManifest = toml::from_str(
+            "[plugin]\nname = \"x\"\nversion = \"0.1\"\n\n[service]\ncmd = \"./srv\"\naddr = \"ftp://nope\"\n",
+        )
+        .unwrap();
+        assert_eq!(bad.validate().len(), 1);
     }
 
     #[test]

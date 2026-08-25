@@ -723,6 +723,55 @@ page from panels/dialogs (sections 12–13) and persist with
 
 ---
 
+## 13b. Services (`[service]`) — shipping long-running processes
+
+A plugin can ship a long-running backend process in **any language**.
+Declare it in the manifest; the host (and the CLI) spawn, supervise, and
+stop it. The process is a black box — the host only knows how to start
+it, where it listens, and how to kill it.
+
+```toml
+[service]
+cmd = "./target/release/cordanui-agents"     # relative to the plugin dir
+args = ["--port", "8081"]                    # default args
+addr = "http://127.0.0.1:8081"               # base url for cord.services.request
+health = "http://127.0.0.1:8081/health"      # optional readiness probe
+autostart = true                             # tui: start when plugin activates
+```
+
+**Lua interface** (`cord.services`) — lifecycle + transport:
+
+```lua
+if not cord.services.is_running("cordanui-agents") then
+  cord.services.start("cordanui-agents")     -- extra args: start(name, {...})
+end
+local res = cord.services.request("cordanui-agents", {
+  method = "POST",
+  path = "/wake",
+  body = { task_id = goal.id },              -- json-encoded automatically
+})
+if res.status == 200 then ... end
+```
+
+- `request` requires the service to be running — start it first; it
+  addresses the manifest's `addr` (or the `health` origin).
+- Deactivating the plugin stops its service. Pidfiles live in
+  `~/.local/share/cordanui/services/`, shared with the CLI.
+
+**Headless (no TUI needed):**
+
+```
+cordanui service list
+cordanui service start cordanui-agents -- --port 9090   # -- args override
+cordanui service status cordanui-agents
+cordanui service stop cordanui-agents
+```
+
+Logs append to `~/.local/share/cordanui/services/<plugin>.log` — a
+systemd unit wrapping `service start` is the intended server deployment.
+
+---
+
 ## 14. Commands (`plugin.commands`) — user-invocable functions
 
 Register functions users can run from the TUI's command line

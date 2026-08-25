@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
 use crate::ui::{
-    ConfigHost, PanelSpec, SharedConfigHost, SharedPanelHost, SharedUiHost, UiLevel, UiRequest,
-    UiResponse, Widget,
+    ConfigHost, PanelSpec, SharedConfigHost, SharedPanelHost, SharedServiceHost, SharedUiHost,
+    UiLevel, UiRequest, UiResponse, Widget,
 };
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
@@ -77,6 +77,7 @@ pub struct HostHooks {
     pub ui: Option<SharedUiHost>,
     pub panels: Option<SharedPanelHost>,
     pub config: Option<SharedConfigHost>,
+    pub services: Option<SharedServiceHost>,
 }
 
 impl HostHooks {
@@ -102,6 +103,11 @@ impl HostHooks {
 
     pub fn with_config(mut self, config: SharedConfigHost) -> Self {
         self.config = Some(config);
+        self
+    }
+
+    pub fn with_services(mut self, services: SharedServiceHost) -> Self {
+        self.services = Some(services);
         self
     }
 }
@@ -143,6 +149,7 @@ impl LuaPlugin {
             hooks.ui,
             hooks.panels,
             hooks.config,
+            hooks.services,
             name,
         )
         .context("registering cord styling API")?;
@@ -466,10 +473,12 @@ fn register_cord(
     ui: Option<SharedUiHost>,
     panels: Option<SharedPanelHost>,
     config: Option<SharedConfigHost>,
+    services: Option<SharedServiceHost>,
     plugin_name: &str,
 ) -> mlua::Result<()> {
     let cord = lua.create_table()?;
     register_cord_config(lua, &cord, config, plugin_name)?;
+    register_cord_services(lua, &cord, services)?;
     register_cord_ui(lua, &cord, ui, panels)?;
 
     for scope in ["g", "local"] {
@@ -554,6 +563,134 @@ fn register_cord(
     cord.set("style", lookup)?;
 
     lua.globals().set("cord", cord)?;
+    Ok(())
+}
+
+/// The `cord.services` table — lifecycle control + HTTP transport for
+/// plugin-declared `[service]` processes (any language).
+///
+/// ```lua
+/// if not cord.services.is_running("cordanui-agents") then
+///   cord.services.start("cordanui-agents")
+/// end
+/// local res = cord.services.request("cordanui-agents", {
+///   method = "POST",
+///   path = "/wake",
+///   body = { task_id = "abc" },
+/// })
+/// ```
+fn register_cord_services(
+    lua: &Lua,
+    cord: &Table,
+    services: Option<SharedServiceHost>,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    api.set(
+        "start",
+        lua.create_function({
+            let services = services.clone();
+            move |_, (name, extra): (String, Option<Vec<String>>)| {
+                let Some(host) = services.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.services is not available in this host",
+                    ));
+                };
+                host.start(&name, &extra.unwrap_or_default())
+                    .map_err(mlua::Error::external)?;
+                Ok(true)
+            }
+        })?,
+    )?;
+
+    api.set(
+        "stop",
+        lua.create_function({
+            let services = services.clone();
+            move |_, name: String| {
+                let Some(host) = services.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.services is not available in this host",
+                    ));
+                };
+                host.stop(&name).map_err(mlua::Error::external)?;
+                Ok(true)
+            }
+        })?,
+    )?;
+
+    api.set(
+        "is_running",
+        lua.create_function({
+            let services = services.clone();
+            move |_, name: String| {
+                let Some(host) = services.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.services is not available in this host",
+                    ));
+                };
+                Ok(host.is_running(&name))
+            }
+        })?,
+    )?;
+
+    // cord.services.request(name, {method?, path, headers?, body?})
+    // Addressed to the service's manifest addr/health base URL. Requires
+    // the service to be running — start it first.
+    api.set(
+        "request",
+        lua.create_async_function({
+            let services = services.clone();
+            let lua = lua.clone();
+            move |_, (name, params): (String, Table)| {
+                let services = services.clone();
+                let lua = lua.clone();
+                async move {
+                    let Some(host) = services.as_ref() else {
+                        return Err(mlua::Error::runtime(
+                            "cord.services is not available in this host",
+                        ));
+                    };
+                    if !host.is_running(&name) {
+                        return Err(mlua::Error::runtime(format!(
+                            "service '{name}' is not running — call cord.services.start first"
+                        )));
+                    }
+                    let Some(base) = host.base_url(&name) else {
+                        return Err(mlua::Error::runtime(format!(
+                            "service '{name}' declares no addr/health url"
+                        )));
+                    };
+                    let path: String = params.get("path").unwrap_or_else(|_| "/".into());
+                    let url = format!("{}{}", base.trim_end_matches('/'), path);
+                    let method: Option<String> = params.get("method").ok();
+                    let headers: Option<Table> = params.get("headers").ok();
+                    let json_body: Option<LuaValue> = params.get("body").ok();
+
+                    let mut req = http_client().request(method_from(&method), &url);
+                    if let Some(hs) = headers {
+                        for pair in hs.pairs::<String, String>() {
+                            let (k, v) = pair?;
+                            req = req.header(k, v);
+                        }
+                    }
+                    if let Some(body) = json_body {
+                        let json = serde_json::to_string(&body).map_err(mlua::Error::external)?;
+                        req = req.header("content-type", "application/json").body(json);
+                    }
+                    let resp = req.send().await.map_err(mlua::Error::external)?;
+                    let status = resp.status().as_u16();
+                    let text = resp.text().await.map_err(mlua::Error::external)?;
+                    let out = lua.create_table()?;
+                    out.set("status", status)?;
+                    out.set("body", text)?;
+                    Ok(out)
+                }
+            }
+        })?,
+    )?;
+
+    cord.set("services", api)?;
     Ok(())
 }
 
@@ -1926,5 +2063,91 @@ end
             Some(&"dawn".to_string())
         );
         cleanup("configure");
+    }
+
+    // ---------- cord.services ----------
+
+    #[test]
+    fn services_lifecycle_and_request() {
+        use crate::ui::ServiceHost;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        #[derive(Default)]
+        struct MockServices {
+            running: AtomicBool,
+        }
+        impl crate::ui::ServiceHost for MockServices {
+            fn start(&self, _plugin: &str, _extra: &[String]) -> anyhow::Result<()> {
+                self.running.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            fn stop(&self, _plugin: &str) -> anyhow::Result<()> {
+                self.running.store(false, Ordering::Relaxed);
+                Ok(())
+            }
+            fn is_running(&self, _plugin: &str) -> bool {
+                self.running.load(Ordering::Relaxed)
+            }
+            fn base_url(&self, _plugin: &str) -> Option<String> {
+                Some("http://127.0.0.1:18099".into())
+            }
+        }
+
+        let dir = fixture(
+            "services",
+            r##"
+plugin = {}
+function plugin.complete(req)
+  assert(not cord.services.is_running("cordanui-agents"))
+  cord.services.start("cordanui-agents")
+  assert(cord.services.is_running("cordanui-agents"))
+
+  -- request while running: hits the (mock) base url — connection to a
+  -- dead port errors, which proves the transport was addressed.
+  local ok, err = pcall(function()
+    return cord.services.request("cordanui-agents", { path = "/wake", body = { task_id = "t" } })
+  end)
+
+  cord.services.stop("cordanui-agents")
+  assert(not cord.services.is_running("cordanui-agents"))
+
+  -- request while stopped: clean lua error, not a crash
+  local ok2, err2 = pcall(function()
+    return cord.services.request("cordanui-agents", { path = "/" })
+  end)
+  local matched = tostring(err2):find("not running") ~= nil
+  return { content = tostring(matched) }
+end
+"##,
+        );
+        let host = Arc::new(MockServices::default());
+        let plugin = LuaPlugin::load(
+            &dir,
+            "services",
+            None,
+            HostHooks::new().with_services(host.clone()),
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let resp = rt.block_on(async {
+            plugin
+                .complete(&CompleteRequest {
+                    model: "m".into(),
+                    prompt: "p".into(),
+                    system: None,
+                    max_tokens: None,
+                    temperature: None,
+                    config: None,
+                })
+                .await
+                .unwrap()
+        });
+        // The stopped-service request produced the "not running" error.
+        assert_eq!(resp.content, "true");
+        cleanup("services");
     }
 }

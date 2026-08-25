@@ -234,6 +234,21 @@ pub trait ConfigHost: Send + Sync {
 /// Convenience alias for hosts sharing one bridge across runtimes.
 pub type SharedConfigHost = std::sync::Arc<dyn ConfigHost>;
 
+/// Host side of `cord.services` — lifecycle control for plugin-declared
+/// `[service]` processes. The service itself is any-language binary; this
+/// interface is how Lua plugins drive it.
+pub trait ServiceHost: Send + Sync {
+    fn start(&self, plugin: &str, extra_args: &[String]) -> anyhow::Result<()>;
+    fn stop(&self, plugin: &str) -> anyhow::Result<()>;
+    fn is_running(&self, plugin: &str) -> bool;
+    /// Base URL for `cord.services.request` (from the manifest's
+    /// `addr`, or derived from `health`).
+    fn base_url(&self, plugin: &str) -> Option<String>;
+}
+
+/// Convenience alias for hosts sharing one bridge across runtimes.
+pub type SharedServiceHost = std::sync::Arc<dyn ServiceHost>;
+
 /// A request plus the channel the host answers on.
 ///
 /// Hosts that drop a `PendingUi` without responding cause the waiting

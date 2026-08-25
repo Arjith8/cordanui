@@ -578,7 +578,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         } => "GitHub link / owner/repo / terms · Enter install · Esc back".into(),
         Mode::PluginManager {
             pane: PluginPane::List,
-        } => "i install · ↑↓ select · Enter activate · u update all · d uninstall · ? help · Esc close".into(),
+        } => "i install · ↑↓ select · Enter activate · u update · s service · d uninstall · ? help · Esc close".into(),
         Mode::PluginHelp => "Esc/q to close".into(),
         Mode::PluginConfigure { .. } => "↑↓ field · Enter edit · Enter save · Esc back".into(),
         Mode::AgentPicker { .. } => "↑↓ model · Enter run · Esc close".into(),

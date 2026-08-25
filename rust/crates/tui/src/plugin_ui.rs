@@ -142,12 +142,15 @@ impl PanelHost for PluginUiBridge {
 pub fn plugin_runtime_hooks(
     styles: &std::sync::Arc<crate::style::StyleBridge>,
     ui: &std::sync::Arc<PluginUiBridge>,
+    services: &std::sync::Arc<crate::services::ServiceManager>,
 ) -> cordanui_plugin_runtime::HostHooks {
+    let services: std::sync::Arc<dyn cordanui_plugin_runtime::ServiceHost> = services.clone();
     cordanui_plugin_runtime::HostHooks::new()
         .with_styles(styles.clone())
         .with_ui(ui.clone())
         .with_panels(ui.clone())
         .with_config(ui.clone())
+        .with_services(services)
 }
 
 #[cfg(test)]

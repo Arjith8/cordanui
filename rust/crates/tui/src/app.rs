@@ -254,6 +254,8 @@ pub struct App {
     pub theme: crate::theme::Theme,
     /// Live style overrides — the host side of `cord.g` / `cord["local"]`.
     pub styles: std::sync::Arc<crate::style::StyleBridge>,
+    /// Supervises plugin `[service]` processes.
+    pub services: std::sync::Arc<crate::services::ServiceManager>,
     /// Host side of the `cord.ui.*` dialog API. Plugins submit requests
     /// here; the loop drains them into [`Self::plugin_modal`].
     pub plugin_ui: std::sync::Arc<crate::plugin_ui::PluginUiBridge>,
@@ -337,6 +339,7 @@ impl App {
     pub fn new(db: Database) -> anyhow::Result<Self> {
         let goals = db::get_all(&db)?;
         let styles = std::sync::Arc::new(crate::style::StyleBridge::new());
+        let services = std::sync::Arc::new(crate::services::ServiceManager::new());
         let theme = crate::theme::Theme::resolve(&db, &styles.session_snapshot());
         let plugin_ui = std::sync::Arc::new(crate::plugin_ui::PluginUiBridge::new());
         let mut list_state = ListState::default();
@@ -348,6 +351,7 @@ impl App {
             keybinds: crate::config::Keybinds::default(),
             theme,
             styles,
+            services,
             plugin_ui,
             plugin_modal: None,
             plugin_panel: None,
@@ -1202,6 +1206,28 @@ impl App {
         Ok(())
     }
 
+    /// Start/stop the selected plugin's `[service]` (`s` in the manager).
+    pub fn toggle_selected_service(&mut self) -> anyhow::Result<()> {
+        let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
+            return Ok(());
+        };
+        let dir = std::path::PathBuf::from(&p.dir);
+        let manifest = cordanui_plugin_runtime::PluginManifest::from_dir(&dir)?;
+        let Some(spec) = manifest.service else {
+            self.set_message("this plugin declares no [service]");
+            return Ok(());
+        };
+        self.services.register(&p.id, &dir, spec);
+        if self.services.is_running(&p.id) {
+            self.services.stop_service(&p.id)?;
+            self.set_message(&format!("{} service stopped", p.id));
+        } else {
+            self.services.start_registered(&p.id, &[])?;
+            self.set_message(&format!("{} service started", p.id));
+        }
+        Ok(())
+    }
+
     /// Pull + rebuild every installed plugin on a worker thread
     /// (`u` in the plugin manager). Lua plugins are pull-only — no build.
     pub fn update_all_plugins(&mut self) {
@@ -1246,6 +1272,11 @@ impl App {
         let activating = !p.active;
 
         db::set_plugin_active(&self.db, &id, activating)?;
+        if !activating {
+            // Deactivation stops any service the plugin declared — a
+            // plugin shouldn't keep running after it's turned off.
+            let _ = self.services.stop_service(&p.id);
+        }
 
         // Theme-capable plugins get special handling.
         let is_theme_plugin = std::fs::read_to_string(dir.join("cordanui.toml"))
@@ -1558,7 +1589,11 @@ impl App {
                 &dir,
                 &name,
                 config,
-                crate::plugin_ui::plugin_runtime_hooks(&self.styles, &self.plugin_ui),
+                crate::plugin_ui::plugin_runtime_hooks(
+                    &self.styles,
+                    &self.plugin_ui,
+                    &self.services,
+                ),
             ) {
                 Ok(state) => {
                     for cmd in state.list_commands() {

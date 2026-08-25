@@ -24,7 +24,7 @@ pub mod ui;
 
 pub use lua::{CommandInfo, HostHooks, LuaPlugin};
 pub use manifest::{
-    BuildConfig, PluginCapability, PluginManifest, ProviderConfig, UiField, UiSpec,
+    BuildConfig, PluginCapability, PluginManifest, ProviderConfig, ServiceConfig, UiField, UiSpec,
 };
 pub use protocol::{
     AgentEvent, AgentEventType, AgentResult, AgentRunConfig, CompleteRequest, CompleteResponse,
@@ -32,6 +32,7 @@ pub use protocol::{
 pub use spawn::{run_one_shot, run_streaming};
 pub use style::{parse_color, NullStyleHost, StyleHost, CORE_VARS, LEGACY_ALIASES};
 pub use ui::{
-    ConfigHost, NoUiHost, PanelHost, PanelSpec, PendingUi, SharedConfigHost, SharedPanelHost,
-    SharedUiHost, UiHost, UiLevel, UiRequest, UiResponse, Widget,
+    ConfigHost, NoUiHost, PanelHost, PanelSpec, PendingUi, ServiceHost, SharedConfigHost,
+    SharedPanelHost, SharedServiceHost, SharedUiHost, UiHost, UiLevel, UiRequest, UiResponse,
+    Widget,
 };

@@ -12,6 +12,7 @@ mod config;
 mod db;
 pub mod plugin_ui;
 mod plugins;
+mod services;
 mod style;
 mod theme;
 mod ui;
@@ -30,6 +31,13 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use crate::app::Mode;
 
 fn main() -> anyhow::Result<()> {
+    // Headless service management: `cordanui service list|start|stop|status`
+    // runs without the TUI (servers, systemd units).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("service") {
+        return services::cli_run(&argv[1..]);
+    }
+
     // Keybinds from the [keybinds] section of config.toml.
     let keybinds = config::Keybinds::load();
 
@@ -311,8 +319,11 @@ fn handle_plugin_manager_key(
             // Uninstall (files + registry row).
             KeyCode::Char('d') | KeyCode::Delete => app.uninstall_selected_plugin()?,
             KeyCode::Char('u') => app.update_all_plugins(),
-            // Configure (declarative [ui] settings form).
+            // Configure (declarative [ui] settings form, or the plugin's
+            // own page when it defines plugin.configure).
             KeyCode::Char('c') => app.open_configure()?,
+            // Start/stop the selected plugin's [service] process.
+            KeyCode::Char('s') => app.toggle_selected_service()?,
             _ => {}
         },
     }
