@@ -725,6 +725,50 @@ impl App {
     }
 
     /// Commit the in-progress edit for the selected field.
+    /// Cycle a `select` field through its options (Tab / Shift+Tab).
+    /// Saves immediately — selects have no free-text edit step.
+    pub fn cycle_config_field(&mut self, plugin: &str, delta: i32) -> anyhow::Result<()> {
+        let Some(spec) = &self.config_spec else {
+            return Ok(());
+        };
+        let Some(field) = spec.fields.get(self.config_selected) else {
+            return Ok(());
+        };
+        if field.r#type != "select" || field.options.is_empty() {
+            return Ok(());
+        }
+
+        let current = self
+            .config_values
+            .get(&field.key)
+            .cloned()
+            .or_else(|| field.default.clone())
+            .unwrap_or_default();
+        let len = field.options.len() as i64;
+        let cur_idx = field
+            .options
+            .iter()
+            .position(|o| *o == current)
+            .map(|i| i as i64)
+            .unwrap_or(0);
+        let next = ((cur_idx + delta as i64).rem_euclid(len)) as usize;
+        let value = field.options[next].clone();
+
+        db::set_plugin_setting(&self.db, plugin, &field.key, &value)?;
+        self.config_values.insert(field.key.clone(), value.clone());
+        self.set_message(&format!("{} = {}", field.key, value));
+        Ok(())
+    }
+
+    /// True if the field under the cursor is a cycleable select.
+    pub fn config_selected_is_select(&self) -> bool {
+        self.config_spec
+            .as_ref()
+            .and_then(|s| s.fields.get(self.config_selected))
+            .map(|f| f.r#type == "select" && !f.options.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn commit_config_field(&mut self, plugin: &str) -> anyhow::Result<()> {
         let (Some(spec), Some(buf)) = (&self.config_spec, &self.config_editing) else {
             return Ok(());

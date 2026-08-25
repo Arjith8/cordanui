@@ -881,9 +881,17 @@ fn render_plugin_configure(app: &App, plugin: &str, frame: &mut Frame) {
 
     let Some(spec) = &app.config_spec else { return };
 
+    let any_select = spec
+        .fields
+        .iter()
+        .any(|f| f.r#type == "select" && !f.options.is_empty());
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "  ↑↓ select · Enter edit · Enter save · Esc back",
+        if any_select {
+            "  ↑↓ field · Tab cycle select · Enter edit · Esc back"
+        } else {
+            "  ↑↓ select · Enter edit · Enter save · Esc back"
+        },
         Style::default().fg(c.outline_variant),
     )));
     lines.push(Line::from(""));
@@ -894,8 +902,19 @@ fn render_plugin_configure(app: &App, plugin: &str, frame: &mut Frame) {
         let value = app.config_values.get(&f.key).cloned().unwrap_or_default();
 
         // While editing THIS field, show the live buffer.
+        let is_select = f.r#type == "select" && !f.options.is_empty();
         let shown = if selected && app.config_editing.is_some() {
             format!("{}│", app.config_editing.as_deref().unwrap_or(""))
+        } else if is_select {
+            // Cycle affordance: ◂ value ▸
+            format!(
+                "◂ {} ▸",
+                if value.is_empty() {
+                    "(not set)"
+                } else {
+                    &value
+                }
+            )
         } else if f.r#type == "secret" && !value.is_empty() {
             "•".repeat(value.chars().count().min(24))
         } else if value.is_empty() {
@@ -905,6 +924,10 @@ fn render_plugin_configure(app: &App, plugin: &str, frame: &mut Frame) {
         };
         let value_style = if selected && app.config_editing.is_some() {
             Style::default().fg(c.primary).add_modifier(Modifier::BOLD)
+        } else if is_select && selected {
+            Style::default()
+                .fg(c.secondary)
+                .add_modifier(Modifier::BOLD)
         } else if value.is_empty() {
             Style::default().fg(c.outline_variant)
         } else {

@@ -346,6 +346,7 @@ fn handle_configure_key(app: &mut app::App, key: KeyEvent, plugin: &str) -> anyh
     let Some(spec) = app.config_spec.clone() else {
         return Ok(());
     };
+    let on_select = app.config_selected_is_select();
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -363,6 +364,11 @@ fn handle_configure_key(app: &mut app::App, key: KeyEvent, plugin: &str) -> anyh
                 app.config_selected += 1;
             }
         }
+        // Select fields cycle through their options instead of free-text
+        // editing. Tab / Shift+Tab in either direction; Enter = forward.
+        KeyCode::Tab => app.cycle_config_field(plugin, 1)?,
+        KeyCode::BackTab => app.cycle_config_field(plugin, -1)?,
+        KeyCode::Enter | KeyCode::Char(' ') if on_select => app.cycle_config_field(plugin, 1)?,
         // Start editing: seed the buffer with the current value (secrets
         // too — the user is already past any shoulder-surfers here).
         KeyCode::Enter | KeyCode::Char(' ') => {
@@ -374,7 +380,7 @@ fn handle_configure_key(app: &mut app::App, key: KeyEvent, plugin: &str) -> anyh
                     .unwrap_or_default(),
             );
         }
-        KeyCode::Char(c) if !c.is_control() => {
+        KeyCode::Char(c) if !c.is_control() && !on_select => {
             app.config_editing = Some(c.to_string());
         }
         _ => {}

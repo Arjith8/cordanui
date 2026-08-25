@@ -636,4 +636,57 @@ plugin.commands = {
         let _ = std::fs::remove_dir_all(&db_dir);
         let _ = std::fs::remove_dir_all(&plug_dir);
     }
+
+    /// Configure-form select fields cycle with Tab and persist immediately.
+    #[test]
+    fn config_select_field_cycles_and_persists() {
+        use crate::app::App;
+        use cordanui_plugin_runtime::UiSpec;
+
+        let db_dir = std::env::temp_dir().join(format!(
+            "cordanui-config-cycle-{}",
+            cordanui_schema::new_id()
+        ));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(db).unwrap();
+
+        let spec: UiSpec = toml::from_str(
+            r#"
+[[field]]
+key = "variant"
+type = "select"
+options = ["rosepine", "rosepine-moon", "rosepine-dawn"]
+default = "rosepine-moon"
+"#,
+        )
+        .unwrap();
+        app.config_spec = Some(spec);
+        app.config_selected = 0;
+
+        // No stored value yet: cycling starts from the default.
+        app.cycle_config_field("p", 1).unwrap();
+        assert_eq!(app.config_values.get("variant").unwrap(), "rosepine-dawn");
+
+        // Wraps forward past the end.
+        app.cycle_config_field("p", 1).unwrap();
+        assert_eq!(app.config_values.get("variant").unwrap(), "rosepine");
+
+        // And backward past the start.
+        app.cycle_config_field("p", -1).unwrap();
+        assert_eq!(app.config_values.get("variant").unwrap(), "rosepine-dawn");
+
+        // Every cycle was persisted to the settings table.
+        let stored = crate::db::get_plugin_settings(&app.db, "p").unwrap();
+        assert_eq!(
+            stored.get("variant").map(String::as_str),
+            Some("rosepine-dawn")
+        );
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+    }
 }
