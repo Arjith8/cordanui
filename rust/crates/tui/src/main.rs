@@ -70,6 +70,16 @@ fn run(
     app: &mut app::App,
 ) -> anyhow::Result<()> {
     loop {
+        // Drain all plugin queues BEFORE drawing so worker results,
+        // style commits, dialogs, panels, and notifications are visible
+        // this frame — not on the next keypress. (event::poll below can
+        // idle up to 250ms; drains must not wait on input.)
+        app.poll_plugin_search()?;
+        app.apply_style_updates()?;
+        app.poll_plugin_ui_requests();
+        app.poll_plugin_panel();
+        app.poll_command_results();
+
         terminal.draw(|f| ui::render(app, f))?;
 
         if !event::poll(std::time::Duration::from_millis(250))? {
@@ -103,14 +113,6 @@ fn run(
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
-
-        // Non-blocking drain of any in-flight plugin task, then commit
-        // any pending style changes (cord.g / cord["local"] restyling).
-        app.poll_plugin_search()?;
-        app.apply_style_updates()?;
-        app.poll_plugin_ui_requests();
-        app.poll_plugin_panel();
-        app.poll_command_results();
 
         // Clear transient message after any key in normal mode
         if app.mode == Mode::Normal && !app.leader_pending && app.message.is_some() {
