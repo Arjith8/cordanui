@@ -101,6 +101,44 @@ impl SyncConfig {
     }
 }
 
+
+// ---------- plain-local -> replica migration ----------
+
+/// Detects libSQL's "can not sync a database without a wal_index" error,
+/// which happens when a plain local database (created before credentials
+/// existed) is opened as an embedded replica.
+fn is_wal_index_error(err: &libsql::Error) -> bool {
+    err.to_string().contains("wal_index")
+}
+
+/// Move a plain-local database (plus `-wal` / `-shm` sidecars) aside so a
+/// fresh replica can be created. Returns the (source, backup) pairs for
+/// restoration if replica creation fails.
+fn set_aside_plain_local(db_path: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
+    let mut moved = Vec::new();
+    for suffix in ["", "-wal", "-shm"] {
+        let src = PathBuf::from(format!("{}{}", db_path.display(), suffix));
+        if src.exists() {
+            let dst = PathBuf::from(format!(
+                "{}.pre-replica{}",
+                db_path.display(),
+                suffix
+            ));
+            std::fs::rename(&src, &dst).with_context(|| {
+                format!("moving {} aside for replica migration", src.display())
+            })?;
+            moved.push((src, dst));
+        }
+    }
+    Ok(moved)
+}
+
+fn restore_plain_local(moved: &[(PathBuf, PathBuf)]) {
+    for (src, dst) in moved {
+        let _ = std::fs::rename(dst, src);
+    }
+}
+
 impl Database {
     /// Open a database with the given config. If sync is enabled, creates an
     /// embedded replica; otherwise opens a local-only database.
@@ -118,11 +156,42 @@ impl Database {
             let token = config.turso_token.as_ref().unwrap();
             tracing::info!(url = %url, "opening embedded replica with Turso sync");
 
-            let db = runtime.block_on(async {
-                libsql::Builder::new_remote_replica(&config.db_path, url.clone(), token.clone())
+            let build_replica = || {
+                runtime.block_on(async {
+                    libsql::Builder::new_remote_replica(
+                        &config.db_path,
+                        url.clone(),
+                        token.clone(),
+                    )
                     .build()
                     .await
-            })?;
+                })
+            };
+
+            let db = match build_replica() {
+                Ok(db) => db,
+                Err(err) if is_wal_index_error(&err) => {
+                    // The local file predates sync (plain local SQLite) and
+                    // cannot be opened as a replica in place. Start fresh:
+                    // set the old file aside as a backup and initialize the
+                    // replica from the remote.
+                    tracing::info!(
+                        "existing local-only database detected —                          starting fresh replica (old file kept as *.pre-replica)"
+                    );
+                    let moved = set_aside_plain_local(&config.db_path)?;
+                    let db = match build_replica() {
+                        Ok(db) => db,
+                        Err(e) => {
+                            restore_plain_local(&moved);
+                            return Err(anyhow::anyhow!(
+                                "replica creation failed after migration;                                  local database restored: {e}"
+                            ));
+                        }
+                    };
+                    db
+                }
+                Err(err) => return Err(err.into()),
+            };
             (db, true)
         } else {
             tracing::info!(path = %config.db_path.display(), "opening local-only database");
@@ -133,6 +202,19 @@ impl Database {
 
         let db = Arc::new(db);
         let conn = runtime.block_on(async { db.connect() })?;
+
+        // Local-only databases get WAL mode: the host opens the same file
+        // from several handles (main + cord.config + sync worker), and
+        // WAL is what makes that concurrent access safe instead of a
+        // SQLITE_BUSY minefield. Replica databases manage their own WAL
+        // internally.
+        if !sync_enabled {
+            runtime.block_on(async {
+                let mut rows = conn.query("PRAGMA journal_mode = WAL;", ()).await?;
+                while rows.next().await?.is_some() {}
+                Ok::<(), libsql::Error>(())
+            })?;
+        }
 
         // Apply schema + migrations. This runs on every startup; the
         // `_migrations` table records what has been applied so each
@@ -388,6 +470,34 @@ pub fn write_turso_credentials(url: &str, token: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_databases_open_in_wal_mode() {
+        let dir = std::env::temp_dir().join(format!(
+            "cordanui-sync-wal-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = SyncConfig {
+            db_path: dir.join("test.db"),
+            ..Default::default()
+        };
+        let db = Database::open(&config).unwrap();
+        let result = db
+            .query_simple("PRAGMA journal_mode;")
+            .unwrap();
+        let mode = result
+            .rows()
+            .first()
+            .and_then(|r| r.first())
+            .map(|v| match v {
+                Value::Text(s) => s.clone(),
+                _ => String::new(),
+            })
+            .unwrap_or_default();
+        assert_eq!(mode, "wal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn turso_credentials_round_trip_preserves_other_sections() {
