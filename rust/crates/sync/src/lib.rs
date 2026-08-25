@@ -27,7 +27,7 @@
 //! If the file doesn't exist or the `[turso]` section is missing, the
 //! database opens in local-only mode.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -126,9 +126,8 @@ impl Database {
             (db, true)
         } else {
             tracing::info!(path = %config.db_path.display(), "opening local-only database");
-            let db = runtime.block_on(async {
-                libsql::Builder::new_local(&config.db_path).build().await
-            })?;
+            let db = runtime
+                .block_on(async { libsql::Builder::new_local(&config.db_path).build().await })?;
             (db, false)
         };
 
@@ -190,9 +189,7 @@ impl Database {
         })?;
 
         // Enable foreign keys
-        runtime.block_on(async {
-            conn.execute("PRAGMA foreign_keys = ON;", ()).await
-        })?;
+        runtime.block_on(async { conn.execute("PRAGMA foreign_keys = ON;", ()).await })?;
 
         Ok(Self {
             conn,
@@ -221,32 +218,28 @@ impl Database {
         if !self.sync_enabled {
             return Ok(());
         }
-        self.runtime
-            .block_on(async { self.db.sync().await })?;
+        self.runtime.block_on(async { self.db.sync().await })?;
         Ok(())
     }
 
     /// Execute a statement that returns no rows (INSERT, UPDATE, DELETE).
     pub fn execute(&self, sql: &str, params: Vec<Value>) -> Result<()> {
-        self.runtime.block_on(async {
-            self.conn.execute(sql, params).await
-        })?;
+        self.runtime
+            .block_on(async { self.conn.execute(sql, params).await })?;
         Ok(())
     }
 
     /// Execute a statement with no parameters.
     pub fn execute_simple(&self, sql: &str) -> Result<()> {
-        self.runtime.block_on(async {
-            self.conn.execute(sql, ()).await
-        })?;
+        self.runtime
+            .block_on(async { self.conn.execute(sql, ()).await })?;
         Ok(())
     }
 
     /// Execute a batch of statements (e.g. schema migration).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.runtime.block_on(async {
-            self.conn.execute_batch(sql).await
-        })?;
+        self.runtime
+            .block_on(async { self.conn.execute_batch(sql).await })?;
         Ok(())
     }
 
@@ -256,9 +249,7 @@ impl Database {
             .runtime
             .block_on(async { self.conn.prepare(sql).await })?;
 
-        let mut rows = self
-            .runtime
-            .block_on(async { stmt.query(params).await })?;
+        let mut rows = self.runtime.block_on(async { stmt.query(params).await })?;
 
         let mut result_rows = Vec::new();
         loop {
@@ -328,16 +319,105 @@ fn default_db_path() -> PathBuf {
     base.join("cordanui").join("cordanui.db")
 }
 
-fn config_file_path() -> PathBuf {
+/// The config file location, public so hosts can offer in-app editing
+/// (global settings page writes Turso credentials here).
+pub fn config_file_path() -> PathBuf {
     let base = dirs::config_dir()
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
         .expect("cannot determine config directory");
     base.join("cordanui").join("config.toml")
 }
 
+// ---------- global settings: turso credentials ----------
+
+/// Read the Turso credentials from `path`. `(None, None)` when absent.
+pub fn read_turso_credentials_at(path: &Path) -> (Option<String>, Option<String>) {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&contents) else {
+        return (None, None);
+    };
+    match parsed.get("turso") {
+        Some(t) => (
+            t.get("url").and_then(|v| v.as_str()).map(String::from),
+            t.get("token").and_then(|v| v.as_str()).map(String::from),
+        ),
+        None => (None, None),
+    }
+}
+
+/// Read Turso credentials from the default config file.
+pub fn read_turso_credentials() -> (Option<String>, Option<String>) {
+    read_turso_credentials_at(&config_file_path())
+}
+
+/// Write Turso credentials to `path`, preserving every other section in
+/// the file (keybinds, ...). Creates the file if missing.
+pub fn write_turso_credentials_at(path: &Path, url: &str, token: &str) -> Result<()> {
+    let mut root = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+
+    let table = root
+        .as_table_mut()
+        .context("config.toml root is not a table")?;
+    let mut turso = toml::map::Map::new();
+    turso.insert("url".into(), toml::Value::String(url.to_string()));
+    turso.insert("token".into(), toml::Value::String(token.to_string()));
+    table.insert("turso".into(), toml::Value::Table(turso));
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(
+        path,
+        toml::to_string_pretty(&root).context("serializing config.toml")?,
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Write Turso credentials to the default config file.
+pub fn write_turso_credentials(url: &str, token: &str) -> Result<()> {
+    write_turso_credentials_at(&config_file_path(), url, token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turso_credentials_round_trip_preserves_other_sections() {
+        let dir = std::env::temp_dir().join(format!("cordanui-sync-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[keybinds]\nleader = \"ctrl+a\"\n\n[turso]\nurl = \"old\"\ntoken = \"oldtok\"\n",
+        )
+        .unwrap();
+
+        write_turso_credentials_at(&path, "libsql://new.turso.io", "tok2").unwrap();
+        let (url, token) = read_turso_credentials_at(&path);
+        assert_eq!(url.as_deref(), Some("libsql://new.turso.io"));
+        assert_eq!(token.as_deref(), Some("tok2"));
+
+        // [keybinds] survived the rewrite.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.contains("ctrl+a"),
+            "other sections must survive: {contents}"
+        );
+
+        // Fresh file creation works too.
+        let fresh = dir.join("fresh.toml");
+        write_turso_credentials_at(&fresh, "u", "t").unwrap();
+        assert_eq!(read_turso_credentials_at(&fresh).0.as_deref(), Some("u"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn open_local_database() {
@@ -432,11 +512,16 @@ mod tests {
                 v => panic!("expected integer version, got {v:?}"),
             })
             .collect();
-        let expected: Vec<i64> = cordanui_schema::MIGRATIONS.iter().map(|m| m.version).collect();
+        let expected: Vec<i64> = cordanui_schema::MIGRATIONS
+            .iter()
+            .map(|m| m.version)
+            .collect();
         assert_eq!(versions, expected);
 
         // …and the final schema already reflects them (no `is_dark`).
-        assert!(db.query_simple("SELECT is_dark FROM themes LIMIT 1").is_err());
+        assert!(db
+            .query_simple("SELECT is_dark FROM themes LIMIT 1")
+            .is_err());
     }
 
     #[test]
@@ -449,7 +534,9 @@ mod tests {
         // themes shape (with `is_dark`) and no `_migrations` table.
         {
             let rt = Builder::new_current_thread().enable_all().build().unwrap();
-            let raw = rt.block_on(async { libsql::Builder::new_local(&path).build().await }).unwrap();
+            let raw = rt
+                .block_on(async { libsql::Builder::new_local(&path).build().await })
+                .unwrap();
             let conn = rt.block_on(async { raw.connect() }).unwrap();
             rt.block_on(async {
                 conn.execute_batch(
@@ -496,7 +583,9 @@ mod tests {
         .unwrap();
 
         // Migration ran: the column is gone but the data survives.
-        assert!(db.query_simple("SELECT is_dark FROM themes LIMIT 1").is_err());
+        assert!(db
+            .query_simple("SELECT is_dark FROM themes LIMIT 1")
+            .is_err());
         db.execute(
             "INSERT INTO themes (id, name, source, colors_json) VALUES ('t1', 'T', 'https://github.com/x/y', '{}')",
             vec![],
@@ -505,9 +594,7 @@ mod tests {
 
         // …and it was recorded exactly once.
         let result = db
-            .query_simple(
-                "SELECT COUNT(*) FROM _migrations WHERE name LIKE 'themes_drop_is_dark%'",
-            )
+            .query_simple("SELECT COUNT(*) FROM _migrations WHERE name LIKE 'themes_drop_is_dark%'")
             .unwrap();
         match &result.rows()[0][0] {
             Value::Integer(n) => assert_eq!(*n, 1),

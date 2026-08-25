@@ -110,6 +110,7 @@ fn run(
             Mode::PluginModal => handle_plugin_modal_key(app, key),
             Mode::PluginPanel => handle_plugin_panel_key(app, key),
             Mode::Command => handle_command_key(app, key),
+            Mode::GlobalConfig => handle_global_config_key(app, key)?,
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
@@ -175,6 +176,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
                 }
             }
             _ if binds.commands.matches(key) => app.open_command_mode(),
+            _ if binds.global_config.matches(key) => app.open_global_config(),
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -434,6 +436,77 @@ fn handle_command_key(app: &mut app::App, key: KeyEvent) {
         KeyCode::Char(c) if !c.is_control() => app.input.push_char(c),
         _ => {}
     }
+}
+
+/// Keys in the global settings page. Rows are the host Sync fields
+/// followed by plugin-owned configurator entries; Enter on a field edits
+/// it, Enter on a plugin entry runs that plugin's configurator.
+fn handle_global_config_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    // Editing a field value (same buffer pattern as the plugin form).
+    if app.config_editing.is_some() {
+        match key.code {
+            KeyCode::Enter => app.commit_global_field()?,
+            KeyCode::Esc => app.config_editing = None,
+            KeyCode::Backspace => {
+                if let Some(buf) = &mut app.config_editing {
+                    buf.pop();
+                }
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                if let Some(buf) = &mut app.config_editing {
+                    buf.push(c);
+                }
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    let field_count = app
+        .global_spec
+        .as_ref()
+        .map(|s| s.fields.len())
+        .unwrap_or(0);
+    let total = app.global_row_count();
+    let on_field = app.config_selected < field_count;
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.cancel(),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.config_selected > 0 {
+                app.config_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.config_selected + 1 < total {
+                app.config_selected += 1;
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') if on_field => {
+            let key_name = app
+                .global_spec
+                .as_ref()
+                .and_then(|s| s.fields.get(app.config_selected))
+                .map(|f| f.key.clone())
+                .unwrap_or_default();
+            app.config_editing = Some(
+                app.global_values
+                    .get(&key_name)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            // Plugin entry: run its configurator (worker thread; the
+            // panel/dialog it opens is answered via the normal loop).
+            let idx = app.config_selected.saturating_sub(field_count);
+            if let Some((name, _)) = app.global_plugin_entries.get(idx).cloned() {
+                app.spawn_plugin_call(&name, app::PluginCall::Configure);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Keys in a plugin-owned panel (`cord.ui.show_panel`). Keys are forwarded

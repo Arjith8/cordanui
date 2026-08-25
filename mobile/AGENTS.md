@@ -710,6 +710,19 @@ Contract:
 
 ---
 
+## 13a. Global settings page — how plugins extend it
+
+The host has a global settings page (`<leader>,`) with a Sync section
+(Turso URL + token, written to `~/.config/cordanui/config.toml`; restart
+applies the connection). You extend it **without any extra API**: every
+active Lua plugin that defines `plugin.configure` (section 10.1a) is
+listed automatically under *Plugins*, and Enter runs your configurator —
+the same facilitate-don't-render model as the configure key. Build your
+page from panels/dialogs (sections 12–13) and persist with
+`cord.config`. Nothing to declare; installing your plugin adds the row.
+
+---
+
 ## 14. Commands (`plugin.commands`) — user-invocable functions
 
 Register functions users can run from the TUI's command line

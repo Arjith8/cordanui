@@ -53,6 +53,9 @@ pub enum Mode {
     /// The user-facing command line (`<leader>;`) listing every command
     /// registered by active Lua plugins via `plugin.commands`.
     Command,
+    /// Host-level settings (Turso credentials) plus one entry per plugin
+    /// that owns a configurator.
+    GlobalConfig,
 }
 
 /// A plugin-requested modal currently on screen.
@@ -260,6 +263,11 @@ pub struct App {
     pub plugin_selected: usize,
     /// Configure form: the [ui] spec of the plugin being configured.
     pub config_spec: Option<cordanui_plugin_runtime::UiSpec>,
+    /// Global settings page: synthetic spec (turso url/token) + values.
+    pub global_spec: Option<cordanui_plugin_runtime::UiSpec>,
+    pub global_values: std::collections::BTreeMap<String, String>,
+    /// Active Lua plugins that own a configurator: (name, description).
+    pub global_plugin_entries: Vec<(String, String)>,
     /// Configure form: current editable values (bare field key → value).
     pub config_values: std::collections::BTreeMap<String, String>,
     /// Configure form: selected field index.
@@ -314,6 +322,9 @@ impl App {
             plugin_selected: 0,
             config_spec: None,
             config_values: Default::default(),
+            global_spec: None,
+            global_values: Default::default(),
+            global_plugin_entries: Vec::new(),
             config_selected: 0,
             config_editing: None,
             agent_choices: Vec::new(),
@@ -756,6 +767,106 @@ impl App {
     }
 
     /// Commit the in-progress edit for the selected field.
+    /// Open the global settings page: host Sync section (Turso) plus one
+    /// entry per active plugin that owns a configurator.
+    pub fn open_global_config(&mut self) {
+        use cordanui_plugin_runtime::{UiField, UiSpec};
+        let (url, token) = cordanui_sync::read_turso_credentials();
+        let spec = UiSpec {
+            fields: vec![
+                UiField {
+                    key: "turso_url".into(),
+                    label: "Turso URL".into(),
+                    r#type: "text".into(),
+                    required: false,
+                    default: None,
+                    options: vec![],
+                },
+                UiField {
+                    key: "turso_token".into(),
+                    label: "Turso token".into(),
+                    r#type: "secret".into(),
+                    required: false,
+                    default: None,
+                    options: vec![],
+                },
+            ],
+        };
+        let mut values = std::collections::BTreeMap::new();
+        values.insert("turso_url".into(), url.unwrap_or_default());
+        values.insert("turso_token".into(), token.unwrap_or_default());
+
+        // Plugins that own a configurator are listed automatically — the
+        // extension point for this page.
+        self.global_plugin_entries.clear();
+        let states = self.plugin_states.lock().unwrap();
+        for row in &self.installed_plugins {
+            if !row.active {
+                continue;
+            }
+            if states.contains_key(&row.id) {
+                let desc = cordanui_plugin_runtime::PluginManifest::from_dir(std::path::Path::new(
+                    &row.dir,
+                ))
+                .map(|m| m.plugin.description)
+                .unwrap_or_else(|_| "configure".into());
+                self.global_plugin_entries.push((row.id.clone(), desc));
+            }
+        }
+        drop(states);
+
+        self.global_spec = Some(spec);
+        self.global_values = values;
+        self.config_selected = 0;
+        self.config_editing = None;
+        self.mode = Mode::GlobalConfig;
+    }
+
+    /// Total selectable rows on the global page: fields + plugin entries.
+    pub fn global_row_count(&self) -> usize {
+        self.global_spec
+            .as_ref()
+            .map(|s| s.fields.len())
+            .unwrap_or(0)
+            + self.global_plugin_entries.len()
+    }
+
+    /// Persist the Sync section back to config.toml. Other sections
+    /// (keybinds, ...) survive. Sync itself reconnects on next start.
+    pub fn commit_global_field(&mut self) -> anyhow::Result<()> {
+        let (Some(spec), Some(buf)) = (&self.global_spec, &self.config_editing) else {
+            return Ok(());
+        };
+        let Some(field) = spec.fields.get(self.config_selected) else {
+            return Ok(());
+        };
+        let value = buf.trim().to_string();
+        self.global_values.insert(field.key.clone(), value.clone());
+
+        let url = self
+            .global_values
+            .get("turso_url")
+            .cloned()
+            .unwrap_or_default();
+        let token = self
+            .global_values
+            .get("turso_token")
+            .cloned()
+            .unwrap_or_default();
+        if url.is_empty() != token.is_empty() {
+            self.set_message("turso url and token must both be set (or both empty for local-only)");
+            return Ok(());
+        }
+        if !url.is_empty() {
+            cordanui_sync::write_turso_credentials(&url, &token)?;
+            self.set_message("saved — restart to apply sync");
+        } else {
+            self.set_message("saved (local-only mode)");
+        }
+        self.config_editing = None;
+        Ok(())
+    }
+
     /// Cycle a `select` field through its options (Tab / Shift+Tab).
     /// Saves immediately — selects have no free-text edit step.
     pub fn cycle_config_field(&mut self, plugin: &str, delta: i32) -> anyhow::Result<()> {
@@ -1453,7 +1564,7 @@ impl App {
     }
 
     /// Shared worker spawn for commands and custom configure pages.
-    fn spawn_plugin_call(&mut self, plugin_name: &str, call: PluginCall) {
+    pub fn spawn_plugin_call(&mut self, plugin_name: &str, call: PluginCall) {
         if self.command_running {
             self.set_message("a command is already running");
             return;

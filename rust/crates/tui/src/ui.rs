@@ -85,6 +85,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Mode::Command = &app.mode {
         render_command_matches(app, frame);
     }
+    if let Mode::GlobalConfig = &app.mode {
+        render_global_config(app, frame);
+    }
 }
 
 /// The command-line match list: up to 8 commands filtered by the input.
@@ -472,6 +475,14 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
         Mode::PluginPanel => (" PLUGIN PANEL ".to_string(), String::new()),
         Mode::Command => (" COMMAND ".to_string(), app.input.text.clone()),
+        Mode::GlobalConfig => {
+            let text = if app.config_editing.is_some() {
+                app.config_editing.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
+            (" GLOBAL SETTINGS ".to_string(), text)
+        }
     };
 
     let label_style = match &app.mode {
@@ -486,7 +497,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::AgentRunning { .. }
         | Mode::PluginModal
         | Mode::PluginPanel => Style::default().fg(c.primary),
-        Mode::Command => Style::default().fg(c.secondary),
+        Mode::Command | Mode::GlobalConfig => Style::default().fg(c.secondary),
         Mode::ConfirmDelete { .. } => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
     };
@@ -548,6 +559,16 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
         Mode::PluginPanel => "plugin panel — keys go to the plugin".into(),
         Mode::Command => "type to filter · Enter run · Esc close".into(),
+        Mode::GlobalConfig => {
+            let field_count = app.global_spec.as_ref().map(|s| s.fields.len()).unwrap_or(0);
+            if app.config_editing.is_some() {
+                "Enter save · Esc cancel edit".into()
+            } else if app.config_selected < field_count {
+                "Enter edit · ↑↓ row · Esc close".into()
+            } else {
+                "Enter open plugin settings · ↑↓ row · Esc close".into()
+            }
+        }
         Mode::PluginModal => match app.plugin_modal.as_ref().map(|m| &m.kind) {
             Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
             Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),
@@ -961,6 +982,99 @@ fn render_plugin_configure(app: &App, plugin: &str, frame: &mut Frame) {
     }
 
     let _ = plugin;
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Global settings: host-owned Sync section (Turso credentials) plus one
+/// entry per plugin that owns a configurator — the plugin extension point
+/// for this page.
+fn render_global_config(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(64, 60, frame.area());
+    frame.render_widget(Clear, area);
+    let outer = Block::default()
+        .title(" Global Settings ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+    let inner = outer.inner(area);
+    frame.render_widget(&outer, area);
+
+    let Some(spec) = &app.global_spec else { return };
+    let mut lines: Vec<Line> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "  Sync",
+        Style::default()
+            .fg(c.secondary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    for (i, f) in spec.fields.iter().enumerate() {
+        let selected = app.config_selected == i;
+        let cursor = if selected { "▶ " } else { "  " };
+        let raw = app.global_values.get(&f.key).cloned().unwrap_or_default();
+        let shown = if app.config_selected == i && app.config_editing.is_some() {
+            format!("{}│", app.config_editing.as_deref().unwrap_or(""))
+        } else if f.r#type == "secret" && !raw.is_empty() {
+            "•".repeat(raw.chars().count().min(24))
+        } else if raw.is_empty() {
+            "(not set — local-only)".to_string()
+        } else {
+            raw.clone()
+        };
+        let style = if app.config_selected == i && app.config_editing.is_some() {
+            Style::default().fg(c.primary).add_modifier(Modifier::BOLD)
+        } else if raw.is_empty() {
+            Style::default().fg(c.outline_variant)
+        } else {
+            Style::default().fg(c.on_background)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {cursor}"), Style::default().fg(c.primary)),
+            Span::styled(
+                format!("{:<14}", truncate_str(&f.label, 13)),
+                if selected {
+                    Style::default()
+                        .fg(c.on_background)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(c.on_background)
+                },
+            ),
+            Span::styled(shown, style),
+        ]));
+    }
+
+    if !app.global_plugin_entries.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Plugins",
+            Style::default()
+                .fg(c.secondary)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for (i, (name, desc)) in app.global_plugin_entries.iter().enumerate() {
+            let selected = app.config_selected == spec.fields.len() + i;
+            let cursor = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default().fg(c.on_primary).bg(c.primary)
+            } else {
+                Style::default().fg(c.on_background)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {cursor}"), Style::default().fg(c.primary)),
+                Span::styled(format!("{:<14}", truncate_str(name, 13)), style),
+                Span::styled(
+                    desc.clone(),
+                    if selected {
+                        Style::default().fg(c.on_primary).bg(c.primary)
+                    } else {
+                        Style::default().fg(c.outline_variant)
+                    },
+                ),
+            ]));
+        }
+    }
+
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
