@@ -297,6 +297,7 @@ fn handle_plugin_manager_key(
             }
             // Uninstall (files + registry row).
             KeyCode::Char('d') | KeyCode::Delete => app.uninstall_selected_plugin()?,
+            KeyCode::Char('u') => app.update_all_plugins(),
             // Configure (declarative [ui] settings form).
             KeyCode::Char('c') => app.open_configure()?,
             _ => {}

@@ -46,6 +46,85 @@ pub struct ThemeFile {
     pub colors_json: String,
 }
 
+/// Build a plugin's binary if its capability set ships one. Lua-runtime
+/// and theme plugins are data-only and skip this entirely — a Lua plugin
+/// is just `main.lua` + manifest, run in-process by the host.
+fn build_if_needed(
+    tx: &Sender<TaskEvent>,
+    manifest: &cordanui_plugin_runtime::PluginManifest,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    let needs_binary = !manifest.is_lua()
+        && (manifest.capabilities.provider
+            || manifest.capabilities.tool
+            || manifest.capabilities.agent
+            || manifest.capabilities.command);
+    if !needs_binary {
+        let _ = tx.send(TaskEvent::Log("Data-only plugin — skipping build.".into()));
+        return Ok(());
+    }
+    let build_cmd = manifest
+        .build
+        .as_ref()
+        .map(|b| b.cmd.clone())
+        .unwrap_or_else(|| "cargo build --release".to_string());
+    let _ = tx.send(TaskEvent::Log(format!("Building — `{build_cmd}`…")));
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(&build_cmd).current_dir(dest);
+    stream_process(tx, &mut cmd).map_err(|e| anyhow::anyhow!(e))?;
+
+    let bin = manifest.binary_path(dest);
+    if !bin.exists() {
+        anyhow::bail!("build succeeded but binary missing at {}", bin.display());
+    }
+    let _ = tx.send(TaskEvent::Log("Build complete.".into()));
+    Ok(())
+}
+
+/// Pull (`git pull --ff-only`) every installed plugin, rebuild binaries,
+/// re-validate manifests, and report theme packs. Lua plugins need no
+/// build — updates are clone-fast. Terminal event:
+/// [`TaskEvent::UpdateFinished`].
+pub fn spawn_update_all_task(installed: Vec<(String, String)>) -> Receiver<TaskEvent> {
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut updated = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for (name, dir) in installed {
+            let path = std::path::PathBuf::from(&dir);
+            let _ = tx.send(TaskEvent::Log(format!("pulling {name}…")));
+            if let Err(e) = stream_process(
+                &tx,
+                Command::new("git").args(["-C"]).arg(&path).args([
+                    "pull",
+                    "--ff-only",
+                    "--progress",
+                ]),
+            ) {
+                failed.push(format!("{name} (pull: {e})"));
+                continue;
+            }
+            let manifest = match cordanui_plugin_runtime::PluginManifest::from_dir(&path) {
+                Ok(m) => m,
+                Err(e) => {
+                    failed.push(format!("{name} (manifest: {e})"));
+                    continue;
+                }
+            };
+            if let Err(e) = build_if_needed(&tx, &manifest, &path) {
+                failed.push(format!("{name} (build: {e})"));
+                continue;
+            }
+            let themes = scan_theme_files(&path);
+            updated += 1;
+            let _ = tx.send(TaskEvent::Updated { name, themes });
+        }
+        let _ = tx.send(TaskEvent::UpdateFinished { updated, failed });
+    });
+    rx
+}
+
 /// What the background thread reports back.
 pub enum TaskEvent {
     /// Progress line for the activity log.
@@ -63,6 +142,14 @@ pub enum TaskEvent {
         dir: String,
         themes: Vec<ThemeFile>,
     },
+    /// One plugin pulled + rebuilt during a bulk update; theme packs to
+    /// re-import ride along.
+    Updated {
+        name: String,
+        themes: Vec<ThemeFile>,
+    },
+    /// Bulk update finished.
+    UpdateFinished { updated: usize, failed: Vec<String> },
 }
 
 /// Lifecycle of one task started from the plugin manager popup.
@@ -188,41 +275,9 @@ fn install_flow(tx: &Sender<TaskEvent>, slug: &str) {
         caps_label(&manifest)
     )));
 
-    // Build if the plugin type ships an executable. Theme packs and
-    // Lua-runtime plugins are data-only and skip this entirely — a Lua
-    // plugin is just `main.lua` + manifest, run in-process by the host.
-    let needs_binary = !manifest.is_lua()
-        && (manifest.capabilities.provider
-            || manifest.capabilities.tool
-            || manifest.capabilities.agent
-            || manifest.capabilities.command);
-
-    if needs_binary {
-        let build_cmd = manifest
-            .build
-            .as_ref()
-            .map(|b| b.cmd.clone())
-            .unwrap_or_else(|| "cargo build --release".to_string());
-        let _ = tx.send(TaskEvent::Log(format!("Building — `{build_cmd}`…")));
-
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c").arg(&build_cmd).current_dir(&dest);
-        if let Err(e) = stream_process(tx, &mut cmd) {
-            let _ = tx.send(TaskEvent::Error(format!("build failed: {e}")));
-            return;
-        }
-
-        let bin = manifest.binary_path(&dest);
-        if !bin.exists() {
-            let _ = tx.send(TaskEvent::Error(format!(
-                "build succeeded but binary missing at {}",
-                bin.display()
-            )));
-            return;
-        }
-        let _ = tx.send(TaskEvent::Log("Build complete.".into()));
-    } else {
-        let _ = tx.send(TaskEvent::Log("Data-only plugin — skipping build.".into()));
+    if let Err(e) = build_if_needed(tx, &manifest, &dest) {
+        let _ = tx.send(TaskEvent::Error(format!("build failed: {e}")));
+        return;
     }
 
     // Collect theme packs (if any) for the host to import.

@@ -627,6 +627,12 @@ plugin.commands = {
                 .with_panels(app.plugin_ui.clone()),
         )
         .unwrap();
+        // `plugin` is moved into the cache after open_command_mode below.
+
+        // Open the command line (this reloads states from the registry),
+        // then inject the plugin as if installed + active.
+        app.open_command_mode();
+        assert!(matches!(app.mode, Mode::Command));
         app.plugin_states
             .lock()
             .unwrap()
@@ -636,10 +642,6 @@ plugin.commands = {
             name: "rose-pine.select".into(),
             desc: "Pick a flavor".into(),
         });
-
-        // Open the command line and filter.
-        app.open_command_mode();
-        assert!(matches!(app.mode, Mode::Command));
         for c in "select".chars() {
             app.input.push_char(c);
         }

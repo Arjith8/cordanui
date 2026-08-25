@@ -1039,6 +1039,30 @@ impl App {
         Ok(())
     }
 
+    /// Pull + rebuild every installed plugin on a worker thread
+    /// (`u` in the plugin manager). Lua plugins are pull-only — no build.
+    pub fn update_all_plugins(&mut self) {
+        if self.plugin_rx.is_some() {
+            self.set_message("a plugin task is already running");
+            return;
+        }
+        let installed: Vec<(String, String)> = self
+            .installed_plugins
+            .iter()
+            .map(|p| (p.id.clone(), p.dir.clone()))
+            .collect();
+        if installed.is_empty() {
+            self.set_message("nothing installed to update");
+            return;
+        }
+        self.plugin_state = crate::plugins::TaskState::Working(vec![format!(
+            "updating {} plugin{}…",
+            installed.len(),
+            if installed.len() == 1 { "" } else { "s" }
+        )]);
+        self.plugin_rx = Some(crate::plugins::spawn_update_all_task(installed));
+    }
+
     /// Re-read the plugins registry from the DB.
     pub fn reload_installed_plugins(&mut self) -> anyhow::Result<()> {
         self.installed_plugins = db::list_plugins(&self.db)?;
@@ -1342,9 +1366,10 @@ impl App {
     /// Load (or reload) every active Lua-runtime plugin's state and
     /// rebuild the command registry. Called at startup; install/activate
     /// flows can call it again to pick up new commands.
-    pub fn load_plugin_states(&mut self) {
+    pub fn load_plugin_states(&mut self) -> Vec<String> {
+        let mut problems = Vec::new();
         let Ok(plugins) = db::list_plugins(&self.db) else {
-            return;
+            return problems;
         };
         let mut states = self.plugin_states.lock().unwrap();
         states.clear();
@@ -1382,15 +1407,27 @@ impl App {
                     }
                     states.insert(name, state);
                 }
-                Err(e) => eprintln!("cordanui: loading plugin '{name}' failed: {e}"),
+                Err(e) => problems.push(format!("{name}: {e:#}")),
             }
         }
         self.plugin_commands.sort_by(|a, b| a.name.cmp(&b.name));
+        problems
     }
 
-    /// Open the command line over loaded plugin commands.
+    /// Open the command line over loaded plugin commands. Refreshes
+    /// plugin states first so freshly installed/activated plugins work
+    /// without a restart; load problems surface on the status line
+    /// (stderr is invisible inside a TUI session).
     pub fn open_command_mode(&mut self) {
+        let problems = self.load_plugin_states();
         self.input.clear();
+        if let Some(first) = problems.first() {
+            self.set_message(&format!("✖ {first}"));
+        } else if self.plugin_commands.is_empty() {
+            self.set_message(
+                "no plugin commands (need an active runtime=\"lua\" plugin defining plugin.commands)",
+            );
+        }
         self.mode = Mode::Command;
     }
 
@@ -1540,6 +1577,50 @@ impl App {
                 Ok(crate::plugins::TaskEvent::Error(e)) => {
                     self.plugin_state = crate::plugins::TaskState::Error(e);
                     break;
+                }
+                Ok(crate::plugins::TaskEvent::Updated { name, themes }) => {
+                    // Re-import theme packs under the plugin's existing
+                    // source (no re-registration — it's already installed).
+                    let source = self
+                        .installed_plugins
+                        .iter()
+                        .find(|p| p.id == name)
+                        .map(|p| p.source.clone())
+                        .unwrap_or_else(|| "plugin".into());
+                    for t in &themes {
+                        let _ = db::upsert_theme(&self.db, &t.id, &t.name, &source, &t.colors_json);
+                    }
+                    if let crate::plugins::TaskState::Working(log) = &mut self.plugin_state {
+                        log.push(format!(
+                            "{name} updated{}",
+                            if themes.is_empty() {
+                                String::new()
+                            } else {
+                                format!(
+                                    " (+{} theme{})",
+                                    themes.len(),
+                                    if themes.len() == 1 { "" } else { "s" }
+                                )
+                            }
+                        ));
+                    }
+                }
+                Ok(crate::plugins::TaskEvent::UpdateFinished { updated, failed }) => {
+                    let problems = self.load_plugin_states();
+                    let mut msg = if failed.is_empty() {
+                        format!(
+                            "updated {updated} plugin{}",
+                            if updated == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        format!("updated {updated}, failed: {}", failed.join("; "))
+                    };
+                    if !problems.is_empty() {
+                        msg.push_str(&format!(" — ⚠ {}", problems.join("; ")));
+                    }
+                    self.set_message(&msg);
+                    self.plugin_state = crate::plugins::TaskState::Idle;
+                    self.reload_installed_plugins()?;
                 }
                 Ok(crate::plugins::TaskEvent::Installed { name, dir, themes }) => {
                     // Register it (most-recent-first) and refresh the list
