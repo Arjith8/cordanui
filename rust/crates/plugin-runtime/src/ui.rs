@@ -221,6 +221,19 @@ pub trait PanelHost: Send + Sync {
 /// Convenience alias for hosts sharing one bridge across runtimes.
 pub type SharedPanelHost = std::sync::Arc<dyn PanelHost>;
 
+/// Host side of `cord.config` — namespaced key/value persistence for a
+/// plugin's own settings. The host scopes every key under the plugin's
+/// name; plugins cannot read or write outside their namespace. Backed by
+/// the shared `settings` table, so values written here are exactly what
+/// the declarative fallback form and subprocess `config` injection see.
+pub trait ConfigHost: Send + Sync {
+    fn get(&self, plugin: &str, key: &str) -> Option<String>;
+    fn set(&self, plugin: &str, key: &str, value: &str);
+}
+
+/// Convenience alias for hosts sharing one bridge across runtimes.
+pub type SharedConfigHost = std::sync::Arc<dyn ConfigHost>;
+
 /// A request plus the channel the host answers on.
 ///
 /// Hosts that drop a `PendingUi` without responding cause the waiting

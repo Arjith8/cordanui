@@ -95,6 +95,13 @@ pub struct PluginCommand {
     pub desc: String,
 }
 
+/// What a worker thread should invoke on a plugin state.
+#[derive(Debug, Clone)]
+pub enum PluginCall {
+    Command(String),
+    Configure,
+}
+
 /// Sent back from the worker thread when a plugin command finishes.
 pub struct PluginCommandOutcome {
     pub plugin_name: String,
@@ -315,7 +322,6 @@ impl App {
             agent_log: Vec::new(),
             agent_goal: None,
         };
-        app.load_plugin_states();
         Ok(app)
     }
 
@@ -684,6 +690,17 @@ impl App {
     /// `c` on a selected plugin: load its [ui] spec + stored settings and
     /// open the configure form. Plugins without a [ui] section just report
     /// that there's nothing to configure.
+    /// Give `cord.config` its database handle. Call once after
+    /// construction (the App's own handle is moved, not shareable).
+    pub fn attach_plugin_config_db(&mut self, db: Database) {
+        self.plugin_ui
+            .attach_config_db(std::sync::Arc::new(std::sync::Mutex::new(db)));
+    }
+
+    /// Configure the selected plugin. A Lua plugin that defines
+    /// `plugin.configure` owns the whole page — we only invoke it (it may
+    /// open panels/dialogs and persists via `cord.config`). Everything
+    /// else falls back to the declarative `[[field]]` form.
     pub fn open_configure(&mut self) -> anyhow::Result<()> {
         let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
             return Ok(());
@@ -696,6 +713,20 @@ impl App {
                 return Ok(());
             }
         };
+
+        // Custom configurator takes precedence.
+        let has_custom = self
+            .plugin_states
+            .lock()
+            .unwrap()
+            .get(&manifest.plugin.name)
+            .map(|s| s.has_configure())
+            .unwrap_or(false);
+        if has_custom {
+            self.spawn_plugin_call(&manifest.plugin.name, PluginCall::Configure);
+            return Ok(());
+        }
+
         let Some(spec) = manifest.ui else {
             self.set_message("this plugin has nothing to configure");
             return Ok(());
@@ -1381,19 +1412,23 @@ impl App {
     /// out of the cache until it finishes — dialogs/panels it opens are
     /// answered through the normal event loop while we keep drawing.
     pub fn execute_plugin_command(&mut self, cmd: &PluginCommand) {
+        self.spawn_plugin_call(&cmd.plugin_name, PluginCall::Command(cmd.name.clone()));
+    }
+
+    /// Shared worker spawn for commands and custom configure pages.
+    fn spawn_plugin_call(&mut self, plugin_name: &str, call: PluginCall) {
         if self.command_running {
             self.set_message("a command is already running");
             return;
         }
-        let Some(mut state) = self.plugin_states.lock().unwrap().remove(&cmd.plugin_name) else {
+        let Some(mut state) = self.plugin_states.lock().unwrap().remove(plugin_name) else {
             self.set_message("plugin not loaded");
             return;
         };
         self.command_running = true;
-        // Leave the command line so dialogs can open (they require Normal).
+        // Leave any input mode so dialogs can open (they require Normal).
         self.cancel();
-        let plugin_name = cmd.plugin_name.clone();
-        let name = cmd.name.clone();
+        let plugin_name = plugin_name.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         self.command_rx = Some(rx);
         std::thread::spawn(move || {
@@ -1403,7 +1438,12 @@ impl App {
                 .enable_all()
                 .build()
                 .unwrap();
-            let result = rt.block_on(state.call_command(&name));
+            let result = rt.block_on(async {
+                match &call {
+                    PluginCall::Command(name) => state.call_command(name).await,
+                    PluginCall::Configure => state.call_configure().await,
+                }
+            });
             let _ = tx.send(PluginCommandOutcome {
                 plugin_name,
                 state,

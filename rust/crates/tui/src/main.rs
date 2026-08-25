@@ -35,7 +35,12 @@ fn main() -> anyhow::Result<()> {
 
     // Open DB
     let db = db::open()?;
+    // A second handle on the same database backs `cord.config` reads and
+    // writes from plugin threads.
+    let config_db = db::open()?;
     let mut app = app::App::new(db)?;
+    app.attach_plugin_config_db(config_db);
+    app.load_plugin_states();
     app.keybinds = keybinds;
 
     // Setup terminal

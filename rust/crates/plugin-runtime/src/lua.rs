@@ -54,7 +54,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
-use crate::ui::{PanelSpec, SharedPanelHost, SharedUiHost, UiLevel, UiRequest, UiResponse, Widget};
+use crate::ui::{
+    ConfigHost, PanelSpec, SharedConfigHost, SharedPanelHost, SharedUiHost, UiLevel, UiRequest,
+    UiResponse, Widget,
+};
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
 
@@ -73,6 +76,7 @@ pub struct HostHooks {
     pub styles: Option<SharedStyleHost>,
     pub ui: Option<SharedUiHost>,
     pub panels: Option<SharedPanelHost>,
+    pub config: Option<SharedConfigHost>,
 }
 
 impl HostHooks {
@@ -93,6 +97,11 @@ impl HostHooks {
 
     pub fn with_panels(mut self, panels: SharedPanelHost) -> Self {
         self.panels = Some(panels);
+        self
+    }
+
+    pub fn with_config(mut self, config: SharedConfigHost) -> Self {
+        self.config = Some(config);
         self
     }
 }
@@ -128,8 +137,15 @@ impl LuaPlugin {
 
         let lua = Arc::new(Lua::new());
         register_api(&lua, dir, name, config).context("registering cordanui API")?;
-        register_cord(&lua, hooks.styles, hooks.ui, hooks.panels)
-            .context("registering cord styling API")?;
+        register_cord(
+            &lua,
+            hooks.styles,
+            hooks.ui,
+            hooks.panels,
+            hooks.config,
+            name,
+        )
+        .context("registering cord styling API")?;
 
         // Let scripts require sibling files relative to the plugin root.
         let package: Table = lua.globals().get("package")?;
@@ -156,8 +172,9 @@ impl LuaPlugin {
             .context("main.lua must define a global `plugin` table")?;
         let has_provider = plugin.contains_key("complete")? || plugin.contains_key("agent_run")?;
         let has_commands = plugin.contains_key("commands")?;
-        if !has_provider && !has_commands {
-            bail!("plugin table defines neither complete, agent_run, nor commands");
+        let has_configure = plugin.contains_key("configure")?;
+        if !has_provider && !has_commands && !has_configure {
+            bail!("plugin table defines neither complete, agent_run, commands, nor configure");
         }
 
         Ok(Self {
@@ -214,6 +231,36 @@ impl LuaPlugin {
             .call_async::<LuaValue>(())
             .await
             .map_err(|e| anyhow::anyhow!("command '{name}' failed: {e}"))?
+        {
+            LuaValue::String(s) => Ok(Some(s.to_string_lossy())),
+            _ => Ok(None),
+        }
+    }
+
+    /// True if the plugin defines `plugin.configure` — a self-owned
+    /// settings page the host opens when the user presses the configure
+    /// key. Plugins without one fall back to the declarative `[[field]]`
+    /// form (or nothing).
+    pub fn has_configure(&self) -> bool {
+        self.lua
+            .globals()
+            .get::<Table>("plugin")
+            .and_then(|p: Table| p.get::<Function>("configure"))
+            .is_ok()
+    }
+
+    /// Invoke `plugin.configure`. Like commands, this runs to completion
+    /// and typically opens a panel or dialogs; a returned string becomes
+    /// a host status message.
+    pub async fn call_configure(&self) -> Result<Option<String>> {
+        let plugin: Table = self.lua.globals().get("plugin")?;
+        let configure: Function = plugin
+            .get("configure")
+            .context("plugin does not define configure")?;
+        match configure
+            .call_async::<LuaValue>(())
+            .await
+            .map_err(|e| anyhow::anyhow!("configure failed: {e}"))?
         {
             LuaValue::String(s) => Ok(Some(s.to_string_lossy())),
             _ => Ok(None),
@@ -418,8 +465,11 @@ fn register_cord(
     styles: Option<SharedStyleHost>,
     ui: Option<SharedUiHost>,
     panels: Option<SharedPanelHost>,
+    config: Option<SharedConfigHost>,
+    plugin_name: &str,
 ) -> mlua::Result<()> {
     let cord = lua.create_table()?;
+    register_cord_config(lua, &cord, config, plugin_name)?;
     register_cord_ui(lua, &cord, ui, panels)?;
 
     for scope in ["g", "local"] {
@@ -504,6 +554,64 @@ fn register_cord(
     cord.set("style", lookup)?;
 
     lua.globals().set("cord", cord)?;
+    Ok(())
+}
+
+/// The `cord.config` table — namespaced settings persistence for the
+/// plugin's own configuration pages.
+///
+/// ```lua
+/// local variant = cord.config.get("variant", "moon")
+/// cord.config.set("variant", "dawn")
+/// ```
+///
+/// Keys are scoped under the plugin's name by the host; values are
+/// strings stored in the shared `settings` table (same place the
+/// declarative fallback form reads and writes).
+fn register_cord_config(
+    lua: &Lua,
+    cord: &Table,
+    config: Option<SharedConfigHost>,
+    plugin_name: &str,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    // cord.config.get(key, default?) -> string | nil
+    api.set(
+        "get",
+        lua.create_function({
+            let config = config.clone();
+            let name = plugin_name.to_string();
+            move |_, (key, default): (String, Option<String>)| {
+                let Some(host) = config.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.config is not available in this host",
+                    ));
+                };
+                Ok(host.get(&name, &key).or(default))
+            }
+        })?,
+    )?;
+
+    // cord.config.set(key, value) -> true
+    api.set(
+        "set",
+        lua.create_function({
+            let config = config.clone();
+            let name = plugin_name.to_string();
+            move |_, (key, value): (String, String)| {
+                let Some(host) = config.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.config is not available in this host",
+                    ));
+                };
+                host.set(&name, &key, &value);
+                Ok(true)
+            }
+        })?,
+    )?;
+
+    cord.set("config", api)?;
     Ok(())
 }
 
@@ -1327,6 +1435,17 @@ end
         fn open_panel(&self, _spec: crate::ui::PanelSpec) {}
         fn close_panel(&self) {}
     }
+    impl crate::ui::ConfigHost for QueueHost {
+        fn get(&self, _plugin: &str, key: &str) -> Option<String> {
+            self.persistent.lock().unwrap().get(key).cloned()
+        }
+        fn set(&self, _plugin: &str, key: &str, value: &str) {
+            self.persistent
+                .lock()
+                .unwrap()
+                .insert(key.into(), value.into());
+        }
+    }
 
     /// A host that answers every dialog with a canned response.
     #[derive(Default)]
@@ -1761,5 +1880,51 @@ plugin.commands = {
             .unwrap_err();
         assert!(err.to_string().contains("no command named"), "{err}");
         cleanup("commands");
+    }
+
+    // ---------- plugin.configure + cord.config ----------
+
+    #[test]
+    fn configure_entry_point_with_config_persistence() {
+        let dir = fixture(
+            "configure",
+            r##"
+plugin = {}
+
+function plugin.configure()
+  local current = cord.config.get("variant", "moon")
+  local idx = cord.ui.pick{ title = "Variant", items = { "main", "moon", "dawn" } }
+  if not idx then return "cancelled" end
+  local chosen = ({ "main", "moon", "dawn" })[idx]
+  cord.config.set("variant", chosen)
+  return "variant = " .. chosen .. " (was " .. current .. ")"
+end
+"##,
+        );
+        let host = Arc::new(QueueHost::default());
+        (*host.queue.lock().unwrap()).push(UiResponse::Choice(Some(2))); // dawn
+        let plugin = LuaPlugin::load(
+            &dir,
+            "configure",
+            None,
+            HostHooks::new()
+                .with_ui(host.clone())
+                .with_config(host.clone()),
+        )
+        .unwrap();
+
+        assert!(plugin.has_configure());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let msg = rt.block_on(plugin.call_configure()).unwrap();
+        assert_eq!(msg.as_deref(), Some("variant = dawn (was moon)"));
+        // cord.config.set persisted under the plugin's namespace.
+        assert_eq!(
+            host.persistent.lock().unwrap().get("variant"),
+            Some(&"dawn".to_string())
+        );
+        cleanup("configure");
     }
 }

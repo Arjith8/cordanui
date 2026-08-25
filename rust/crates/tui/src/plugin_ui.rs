@@ -13,7 +13,10 @@
 
 use std::sync::{mpsc, Mutex};
 
-use cordanui_plugin_runtime::{PanelHost, PanelSpec, PendingUi, UiHost, UiLevel, UiResponse};
+use cordanui_plugin_runtime::{
+    ConfigHost, PanelHost, PanelSpec, PendingUi, UiHost, UiLevel, UiResponse,
+};
+use cordanui_sync::Database;
 
 /// Everything a plugin can put in front of the user.
 pub enum PluginUiEvent {
@@ -35,6 +38,10 @@ pub struct PluginUiBridge {
     rx: Mutex<mpsc::Receiver<PluginUiEvent>>,
     panel_tx: mpsc::Sender<PanelCommand>,
     panel_rx: Mutex<mpsc::Receiver<PanelCommand>>,
+    /// Dedicated DB handle for `cord.config` reads/writes. Attached after
+    /// construction (the App's own handle can't be shared). Mutex makes it
+    /// Sync regardless of `Database`'s own thread-safety bounds.
+    config_db: Mutex<Option<std::sync::Arc<Mutex<Database>>>>,
 }
 
 impl PluginUiBridge {
@@ -46,7 +53,32 @@ impl PluginUiBridge {
             rx: Mutex::new(rx),
             panel_tx,
             panel_rx: Mutex::new(panel_rx),
+            config_db: Mutex::new(None),
         }
+    }
+
+    /// Give `cord.config` a database handle. Call once, right after the
+    /// App is constructed and before plugins load.
+    pub fn attach_config_db(&self, db: std::sync::Arc<Mutex<Database>>) {
+        *self.config_db.lock().unwrap() = Some(db);
+    }
+
+    /// Run a db closure on a plain thread. `cordanui_sync` blocks on its
+    /// internal runtime, which panics if called from inside any tokio
+    /// context (worker threads running plugin commands are exactly that).
+    fn with_config_db<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Database) -> T + Send + 'static,
+    ) -> Option<T> {
+        let db = self.config_db.lock().unwrap().clone()?;
+        Some(
+            std::thread::spawn(move || {
+                let guard = db.lock().unwrap();
+                f(&guard)
+            })
+            .join()
+            .expect("config db thread"),
+        )
     }
 
     /// Take the next queued event, if any. Non-blocking: called every
@@ -73,6 +105,28 @@ impl UiHost for PluginUiBridge {
     }
 }
 
+impl ConfigHost for PluginUiBridge {
+    fn get(&self, plugin: &str, key: &str) -> Option<String> {
+        let plugin = plugin.to_string();
+        let key = key.to_string();
+        self.with_config_db(move |db| {
+            crate::db::get_plugin_settings(db, &plugin)
+                .ok()
+                .and_then(|m| m.get(&key).cloned())
+        })
+        .flatten()
+    }
+
+    fn set(&self, plugin: &str, key: &str, value: &str) {
+        let plugin = plugin.to_string();
+        let key = key.to_string();
+        let value = value.to_string();
+        self.with_config_db(move |db| {
+            let _ = crate::db::set_plugin_setting(db, &plugin, &key, &value);
+        });
+    }
+}
+
 impl PanelHost for PluginUiBridge {
     fn open_panel(&self, spec: PanelSpec) {
         let _ = self.panel_tx.send(PanelCommand::Open(spec));
@@ -93,6 +147,7 @@ pub fn plugin_runtime_hooks(
         .with_styles(styles.clone())
         .with_ui(ui.clone())
         .with_panels(ui.clone())
+        .with_config(ui.clone())
 }
 
 #[cfg(test)]
@@ -688,5 +743,133 @@ default = "rosepine-moon"
         );
 
         let _ = std::fs::remove_dir_all(&db_dir);
+    }
+
+    /// `c` on a plugin with `plugin.configure` invokes the plugin's own
+    /// page (here: a pick dialog + cord.config persistence). The host
+    /// only facilitates.
+    #[test]
+    fn configure_key_invokes_plugin_owned_page() {
+        use crate::app::{App, Mode};
+        use cordanui_plugin_runtime::{HostHooks, LuaPlugin};
+
+        let plug_dir = std::env::temp_dir()
+            .join("cordanui-plugin-ui-test")
+            .join(cordanui_schema::new_id());
+        std::fs::create_dir_all(&plug_dir).unwrap();
+        std::fs::write(
+            plug_dir.join("cordanui.toml"),
+            r#"
+runtime = "lua"
+
+[plugin]
+name = "rosepine-moon"
+version = "0.1.0"
+
+[capabilities]
+theme = true
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plug_dir.join("main.lua"),
+            r##"
+plugin = {}
+
+function plugin.configure()
+  local current = cord.config.get("variant", "moon")
+  local idx = cord.ui.pick{ title = "Variant", items = { "main", "moon", "dawn" } }
+  if not idx then return "cancelled" end
+  cord.config.set("variant", ({ "main", "moon", "dawn" })[idx])
+  return "variant saved"
+end
+"##,
+        )
+        .unwrap();
+
+        let db_dir = std::env::temp_dir().join(format!(
+            "cordanui-configure-app-{}",
+            cordanui_schema::new_id()
+        ));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(db).unwrap();
+
+        // Second handle backs cord.config (mirrors main.rs).
+        let config_db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        app.attach_plugin_config_db(config_db);
+
+        let plugin = LuaPlugin::load(
+            &plug_dir,
+            "rosepine-moon",
+            None,
+            HostHooks::new()
+                .with_styles(app.styles.clone())
+                .with_ui(app.plugin_ui.clone())
+                .with_panels(app.plugin_ui.clone())
+                .with_config(app.plugin_ui.clone()),
+        )
+        .unwrap();
+        app.plugin_states
+            .lock()
+            .unwrap()
+            .insert("rosepine-moon".to_string(), plugin);
+
+        // Register as an installed plugin so the `c` dispatcher finds it.
+        app.installed_plugins.push(crate::db::PluginRow {
+            id: "rosepine-moon".into(),
+            source: "test".into(),
+            dir: plug_dir.display().to_string(),
+            active: true,
+            installed_at: String::new(),
+        });
+
+        // The user presses `c`.
+        app.open_configure();
+
+        // The plugin's awaited pick dialog appears.
+        for _ in 0..200 {
+            app.poll_plugin_ui_requests();
+            if matches!(app.mode, Mode::PluginModal) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            matches!(app.mode, Mode::PluginModal),
+            "plugin-owned configure should open its pick dialog"
+        );
+
+        // Choose "dawn" (0-based 2) and submit.
+        if let Some(modal) = &mut app.plugin_modal {
+            if let crate::app::PluginModalKind::Pick { selected } = &mut modal.kind {
+                *selected = 2;
+            }
+        }
+        app.submit_plugin_modal();
+
+        for _ in 0..200 {
+            app.poll_command_results();
+            if !app.command_running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(app.message.as_deref(), Some("variant saved"));
+
+        // Persisted namespaced via cord.config, readable through the db.
+        let stored = crate::db::get_plugin_settings(&app.db, "rosepine-moon").unwrap();
+        assert_eq!(stored.get("variant").map(String::as_str), Some("dawn"));
+
+        let _ = std::fs::remove_dir_all(&db_dir);
+        let _ = std::fs::remove_dir_all(&plug_dir);
     }
 }

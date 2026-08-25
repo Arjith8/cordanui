@@ -354,12 +354,17 @@ Contract:
 
 ---
 
-## 9. Declarative settings (`[[field]]`) — plugins that need user input
+## 9. Declarative settings (`[[field]]`) — the fallback form
 
-Plugins can ask the host for user-configurable values (API keys, base
-URLs, default models) by declaring a form in `cordanui.toml`. The host
-renders it, stores the answers, and hands them back to your subprocess on
-every invocation. Plugins never touch the database and never prompt at
+This is the **fallback** configuration surface, used when the user
+presses `c` and your plugin does NOT define `plugin.configure`
+(section 10.1). It exists for binary providers and simple plugins: the
+host renders a form from your manifest, stores the answers, and hands
+them back on every invocation. You cannot add custom logic here — if you
+need that, define `plugin.configure` and build the page yourself from
+`cord.ui.*` + `cord.config` (sections 12–13, and `cord.config` below).
+
+Plugins using this form never touch the database and never prompt at
 runtime.
 
 ```toml
@@ -508,6 +513,34 @@ like the subprocess protocol) and are strings, same as section 9.
 with settings form, OpenAI-compatible chat completions via
 `cordanui.http.request`, env-var fallback for the API key, and both entry
 points. Read it before writing your own.
+
+### 10.1a Self-owned configuration (`plugin.configure`)
+
+When the user presses the configure key, a Lua plugin that defines
+`plugin.configure` owns the entire page. The host only facilitates the
+call — you render whatever you want with panels and dialogs (sections
+12–13) and persist values yourself with `cord.config`:
+
+```lua
+function plugin.configure()
+  local current = cord.config.get("variant", "moon")
+  local idx = cord.ui.pick{ title = "Variant", items = { "main", "moon", "dawn" } }
+  if not idx then return "cancelled" end
+  cord.config.set("variant", ({ "main", "moon", "dawn" })[idx])
+  -- apply immediately, e.g. cord["local"].style.* for preview
+  return "variant = " .. ({ "main", "moon", "dawn" })[idx]
+end
+```
+
+- The call runs to completion on a worker thread; dialogs/panels it opens
+  are answered through the normal event loop.
+- A returned string becomes the host status message; errors show as
+  `✖ <message>`.
+- `cord.config.get(key, default?)` / `cord.config.set(key, value)` persist
+  under your plugin's namespace in the shared `settings` table — the same
+  place the fallback form reads and writes, and synced via Turso.
+- Plugins without `plugin.configure` get the declarative `[[field]]`
+  fallback form (section 9).
 
 ### 10.5 Current limitations (spike status)
 
