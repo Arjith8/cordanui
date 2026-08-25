@@ -58,8 +58,13 @@ hardcode hex values; they consume tokens via `useTheme().colors`.
 > **Synced user overrides:** the TUI's `cord.g.style.*` persists
 > per-variable overrides as `settings` rows keyed `style.<var>`. Mobile
 > reads them in `getThemeState()` and applies them **above** the active
-> theme (`themeColorsOf(active, styleOverrides)`). They sync via Turso,
-> so restyling the TUI restyles this app on next reload.
+> theme (`themeColorsOf(active, styleOverrides)`). They arrive via the
+> Turso sync (`src/db/turso.ts` — settings are pull-only, remote wins;
+> runs on app start, every 5 minutes, and via "Sync now" on the Profile
+> page), so restyling the TUI restyles this app within a few minutes or
+> on next sync. Credentials live in local-only `settings` keys
+> (`turso_url` / `turso_token`) that are excluded from pulls and never
+> pushed.
 
 Token table (`ThemeColors` in `src/theme/types.ts`):
 

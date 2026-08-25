@@ -1,10 +1,11 @@
 import { StatusBar } from 'expo-status-bar';
-import { Component, type ReactNode } from 'react';
+import { Component, useEffect, type ReactNode } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import { logError } from './src/db/errorsDb';
+import { isSyncConfigured, syncNow } from './src/db/turso';
 import HomeScreen from './src/screens/HomeScreen';
 import { ThemeProvider } from './src/theme/ThemeProvider';
 
@@ -38,12 +39,41 @@ class ErrorBoundary extends Component<{ children: ReactNode }, BoundaryState> {
   }
 }
 
+const SYNC_INTERVAL_MS = 5 * 60 * 1000;
+
+/** Periodic background sync — mirrors the TUI's 5-minute cadence. Errors
+ * are logged, never surfaced as crashes. */
+function SyncRunner() {
+  useEffect(() => {
+    let cancelled = false;
+    const run = async () => {
+      try {
+        if (await isSyncConfigured()) {
+          await syncNow();
+        }
+      } catch (e) {
+        logError('sync', e);
+      }
+    };
+    void run();
+    const timer = setInterval(() => {
+      if (!cancelled) void run();
+    }, SYNC_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, []);
+  return null;
+}
+
 export default function App() {
   return (
     <GestureHandlerRootView style={styles.flex}>
       <SafeAreaProvider>
         <ThemeProvider>
           <ErrorBoundary>
+            <SyncRunner />
             <HomeScreen />
           </ErrorBoundary>
         </ThemeProvider>

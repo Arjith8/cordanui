@@ -1,9 +1,17 @@
 import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { LoggedError } from '@/db/errorsDb';
 import { clearErrors, getErrors } from '@/db/errorsDb';
+import {
+  formatLastSync,
+  getTursoCreds,
+  isSyncConfigured,
+  lastSyncedAt,
+  setTursoCreds,
+  syncNow,
+} from '@/db/turso';
 import { useTheme } from '@/theme/ThemeProvider';
 
 /**
@@ -17,6 +25,43 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
   const [loading, setLoading] = useState(true);
   const [showThemes, setShowThemes] = useState(false);
 
+  // Sync state.
+  const [syncUrl, setSyncUrl] = useState('');
+  const [syncToken, setSyncToken] = useState('');
+  const [configured, setConfigured] = useState(false);
+  const [lastSync, setLastSync] = useState<string | null>(null);
+  const [syncStatus, setSyncStatus] = useState<string>('');
+  const [syncing, setSyncing] = useState(false);
+
+  const refreshSync = useCallback(async () => {
+    setConfigured(await isSyncConfigured());
+    setLastSync(await lastSyncedAt());
+    const creds = await getTursoCreds();
+    if (creds) {
+      setSyncUrl(creds.url);
+      setSyncToken(creds.token);
+    }
+  }, []);
+
+  const handleSaveCreds = useCallback(async () => {
+    if (!syncUrl.trim() || !syncToken.trim()) {
+      setSyncStatus('url and token are both required');
+      return;
+    }
+    await setTursoCreds({ url: syncUrl.trim(), token: syncToken.trim() });
+    await refreshSync();
+    setSyncStatus('saved');
+  }, [syncUrl, syncToken, refreshSync]);
+
+  const handleSyncNow = useCallback(async () => {
+    setSyncing(true);
+    setSyncStatus('syncing…');
+    const outcome = await syncNow();
+    setSyncing(false);
+    setSyncStatus(outcome.message);
+    await refreshSync();
+  }, [refreshSync]);
+
   const refresh = useCallback(async () => {
     setErrors(await getErrors());
     setLoading(false);
@@ -24,7 +69,8 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
 
   useEffect(() => {
     refresh();
-  }, [refresh]);
+    refreshSync();
+  }, [refresh, refreshSync]);
 
   const handleClear = useCallback(async () => {
     await clearErrors();
@@ -46,6 +92,58 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
       </View>
 
       {/* Themes section */}
+      <View style={[styles.sectionRow, { borderBottomColor: colors.outline }]}>
+        <Text style={[styles.sectionTitle, { color: colors.onBackground }]}>🔄 Sync (Turso)</Text>
+        <Text style={[styles.sectionMeta, { color: colors.outlineVariant }]}>
+          {configured ? `last: ${formatLastSync(lastSync)}` : 'not configured'}
+        </Text>
+      </View>
+      <View style={[styles.syncSection, { borderBottomColor: colors.outline }]}>
+        <TextInput
+          value={syncUrl}
+          onChangeText={setSyncUrl}
+          placeholder="libsql://your-db.turso.io"
+          placeholderTextColor={colors.outlineVariant}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          style={[styles.syncInput, { borderColor: colors.outline, color: colors.onBackground }]}
+        />
+        <TextInput
+          value={syncToken}
+          onChangeText={setSyncToken}
+          placeholder="auth token"
+          placeholderTextColor={colors.outlineVariant}
+          secureTextEntry
+          autoCapitalize="none"
+          autoCorrect={false}
+          style={[styles.syncInput, { borderColor: colors.outline, color: colors.onBackground }]}
+        />
+        <View style={styles.syncRow}>
+          <Pressable
+            onPress={handleSaveCreds}
+            hitSlop={4}
+            style={[styles.syncButton, { borderColor: colors.outline }]}
+          >
+            <Text style={{ color: colors.onBackground }}>Save</Text>
+          </Pressable>
+          <Pressable
+            onPress={handleSyncNow}
+            disabled={!configured || syncing}
+            hitSlop={4}
+            style={[
+              styles.syncButton,
+              { borderColor: colors.outline, opacity: !configured || syncing ? 0.4 : 1 },
+            ]}
+          >
+            <Text style={{ color: colors.primary }}>{syncing ? 'Syncing…' : 'Sync now'}</Text>
+          </Pressable>
+          <Text style={[styles.syncStatus, { color: colors.outlineVariant }]} numberOfLines={1}>
+            {syncStatus || (configured ? 'ready' : 'enter url + token')}
+          </Text>
+        </View>
+      </View>
+
       <Pressable
         onPress={() => setShowThemes((v) => !v)}
         style={[styles.sectionRow, { borderBottomColor: colors.outline }]}
@@ -270,5 +368,32 @@ const styles = StyleSheet.create({
   },
   muted: {
     fontSize: 14,
+  },
+  syncSection: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    gap: 8,
+  },
+  syncInput: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    fontSize: 13,
+  },
+  syncRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  syncButton: {
+    borderWidth: 1,
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  syncStatus: {
+    fontSize: 12,
+    flexShrink: 1,
   },
 });

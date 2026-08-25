@@ -33,7 +33,11 @@ Living document. Updated as we build.
       plugin, not a core crate. Uses libSQL via `cordanui-sync` (same as TUI).
 - [~] **7. Mobile app** — thin Turso client, goal CRUD, agent trigger,
       pre-warm. **Local-first scaffold done** (goal tree CRUD, local
-      SQLite). Turso sync, agent trigger, chat pending.
+      SQLite). **Turso sync first cut done** (`src/db/turso.ts`: HTTP
+      pipeline client, no extra deps — goals LWW pull/push, settings +
+      themes pull-only; creds on the Profile page; auto-sync on start +
+      every 5 min). Limitations: deletes don't propagate (no tombstones),
+      agent trigger + chat pending.
 - [~] **8. Theme system** — plugin-based theming works (theme packs,
       `themes` table, plugin manager integration). **Token vocabulary
       overhauled** to Compose/Material 3 roles (`background`, `primary`,
