@@ -98,6 +98,43 @@ pub struct PluginCommand {
     pub desc: String,
 }
 
+/// Live replication state for the status bar.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncStatus {
+    /// No Turso credentials configured.
+    NotConfigured,
+    /// A sync is in flight.
+    Syncing,
+    /// Last sync succeeded; `at` drives the "2m ago" delta.
+    Synced { at: std::time::Instant },
+    /// Last sync failed (offline, bad token, ...).
+    Failed {
+        at: std::time::Instant,
+        error: String,
+    },
+}
+
+impl Default for SyncStatus {
+    fn default() -> Self {
+        Self::NotConfigured
+    }
+}
+
+/// How often the replica syncs (when credentials are configured).
+pub const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Human delta for the status bar ("just now", "4m ago", "2h ago").
+pub fn format_ago(at: std::time::Instant) -> String {
+    let secs = at.elapsed().as_secs();
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else {
+        format!("{}h ago", secs / 3600)
+    }
+}
+
 /// What a worker thread should invoke on a plugin state.
 #[derive(Debug, Clone)]
 pub enum PluginCall {
@@ -236,6 +273,16 @@ pub struct App {
     /// In-flight plugin command result channel + guard.
     pub(crate) command_rx: Option<std::sync::mpsc::Receiver<PluginCommandOutcome>>,
     pub command_running: bool,
+    /// Second database handle (same file) used by the sync worker, so
+    /// network I/O never blocks the UI thread. `None` = sync not
+    /// configured.
+    pub(crate) sync_db: Option<std::sync::Arc<std::sync::Mutex<Database>>>,
+    /// Replication status shown in the title bar.
+    pub sync_status: SyncStatus,
+    /// Set while a sync worker is running.
+    pub(crate) sync_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    pub(crate) sync_in_flight: bool,
+    pub(crate) last_sync_attempt: Option<std::time::Instant>,
     /// All goals loaded from the DB.
     pub goals: Vec<Goal>,
     /// IDs of expanded nodes in the tree.
@@ -308,6 +355,11 @@ impl App {
             plugin_commands: Vec::new(),
             command_rx: None,
             command_running: false,
+            sync_db: None,
+            sync_status: SyncStatus::NotConfigured,
+            sync_rx: None,
+            sync_in_flight: false,
+            last_sync_attempt: None,
             goals,
             expanded: HashSet::new(),
             detailed: None,
@@ -1625,6 +1677,83 @@ impl App {
                 self.command_running = false;
             }
         }
+    }
+
+    /// Give the sync worker its own replica handle (same local file).
+    /// Call at startup when credentials are configured; the first sync
+    /// fires on the next loop iteration (startup pull).
+    pub fn attach_sync_db(&mut self, db: Database) {
+        self.sync_db = Some(std::sync::Arc::new(std::sync::Mutex::new(db)));
+        self.sync_status = SyncStatus::Syncing;
+        self.last_sync_attempt = None;
+    }
+
+    /// Manual sync (`<leader>s`): due immediately on the next frame.
+    pub fn request_sync(&mut self) {
+        if self.sync_db.is_none() {
+            self.set_message("sync not configured (set turso url + token in global settings)");
+            return;
+        }
+        // Due immediately — even if a sync is currently running, the next
+        // poll fires another right after it lands.
+        self.last_sync_attempt = None;
+        if self.sync_in_flight {
+            self.set_message("sync already running");
+            return;
+        }
+        self.set_message("syncing…");
+    }
+
+    /// Fire the periodic replica sync when due and drain finished syncs.
+    /// Called every loop iteration. The worker runs on its own thread —
+    /// sync is network I/O and must never block the UI.
+    pub fn poll_sync(&mut self) {
+        if let Some(rx) = &self.sync_rx {
+            match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.sync_status = SyncStatus::Synced {
+                        at: std::time::Instant::now(),
+                    };
+                    self.sync_in_flight = false;
+                    self.sync_rx = None;
+                }
+                Ok(Err(e)) => {
+                    self.sync_status = SyncStatus::Failed {
+                        at: std::time::Instant::now(),
+                        error: e,
+                    };
+                    self.sync_in_flight = false;
+                    self.sync_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.sync_in_flight = false;
+                    self.sync_rx = None;
+                }
+            }
+        }
+        if self.sync_in_flight {
+            return;
+        }
+        let due = self
+            .last_sync_attempt
+            .map(|t| t.elapsed() >= SYNC_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        let Some(db) = self.sync_db.clone() else {
+            return;
+        };
+        self.last_sync_attempt = Some(std::time::Instant::now());
+        self.sync_in_flight = true;
+        self.sync_status = SyncStatus::Syncing;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.sync_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = db.lock().unwrap().sync().map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
     }
 
     /// Commit any pending style changes and re-resolve the palette if

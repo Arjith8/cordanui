@@ -323,12 +323,38 @@ fn render_header(app: &App, frame: &mut Frame, area: Rect) {
         format!(" {} / {} done · {} pending", completed, total, pending),
         Style::default().fg(c.outline_variant),
     );
+    let sync = {
+        use crate::app::{format_ago, SyncStatus};
+        let (text, style) = match &app.sync_status {
+            SyncStatus::NotConfigured => (
+                "sync off".to_string(),
+                Style::default().fg(c.outline_variant),
+            ),
+            SyncStatus::Syncing => (
+                "syncing…".to_string(),
+                Style::default().fg(c.on_surface_variant),
+            ),
+            SyncStatus::Synced { at } => (
+                format!("synced {}", format_ago(*at)),
+                Style::default().fg(c.success),
+            ),
+            SyncStatus::Failed { at, error } => (
+                format!(
+                    "sync failed {} — {}",
+                    format_ago(*at),
+                    truncate_str(error, 40)
+                ),
+                Style::default().fg(c.error),
+            ),
+        };
+        Span::styled(format!(" · {text}"), style)
+    };
 
     let block = Block::default()
         .borders(Borders::BOTTOM)
         .border_style(Style::default().fg(c.outline));
 
-    let line = Line::from(vec![title, theme, stats]);
+    let line = Line::from(vec![title, theme, stats, sync]);
     let paragraph = Paragraph::new(line).block(block);
     frame.render_widget(&paragraph, area);
 }

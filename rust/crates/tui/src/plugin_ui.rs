@@ -960,7 +960,10 @@ end
         );
         assert_eq!(app.global_row_count(), 3);
 
-        // Mismatched url/token is rejected before any write.
+        // Mismatched url/token is rejected before any write. Force the
+        // token empty so the test doesn't depend on the real config file.
+        app.global_values
+            .insert("turso_token".to_string(), String::new());
         app.config_selected = 0;
         app.config_editing = Some("libsql://only-url.turso.io".into());
         app.commit_global_field().unwrap();
@@ -981,5 +984,70 @@ end
 
         let _ = std::fs::remove_dir_all(&db_dir);
         let _ = std::fs::remove_dir_all(&plug_dir);
+    }
+
+    /// Sync lifecycle: attach fires an immediate sync (startup pull),
+    /// completion flips the status to Synced; unattached stays
+    /// NotConfigured. Uses a local-only db — sync() is a no-op success.
+    #[test]
+    fn sync_status_transitions() {
+        use crate::app::{App, SyncStatus, SYNC_INTERVAL};
+        use std::time::Duration;
+
+        let db_dir =
+            std::env::temp_dir().join(format!("cordanui-sync-test-{}", cordanui_schema::new_id()));
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        let mut app = App::new(db).unwrap();
+        assert_eq!(app.sync_status, SyncStatus::NotConfigured);
+
+        // No handle: polling never leaves NotConfigured.
+        app.poll_sync();
+        assert_eq!(app.sync_status, SyncStatus::NotConfigured);
+
+        // Attach (as main.rs does when creds exist): fires immediately.
+        let sync_db = Database::open(&SyncConfig {
+            db_path: db_dir.join("test.db"),
+            ..Default::default()
+        })
+        .unwrap();
+        app.attach_sync_db(sync_db);
+        assert!(matches!(app.sync_status, SyncStatus::Syncing));
+
+        // Worker finishes (local-only sync is instant — may already be
+        // done before the next poll) → Synced.
+        for _ in 0..100 {
+            app.poll_sync();
+            if matches!(app.sync_status, SyncStatus::Synced { .. }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(app.sync_status, SyncStatus::Synced { .. }));
+        assert!(!app.sync_in_flight);
+
+        // Inside SYNC_INTERVAL: not due again.
+        app.poll_sync();
+        assert!(matches!(app.sync_status, SyncStatus::Synced { .. }));
+
+        // After the interval elapses (simulate by backdating), due again.
+        app.last_sync_attempt =
+            Some(std::time::Instant::now() - SYNC_INTERVAL - Duration::from_secs(1));
+        app.poll_sync();
+        assert_eq!(app.sync_status, SyncStatus::Syncing);
+
+        // Manual request while due is honored; format helper sanity.
+        app.request_sync();
+        assert!(app.last_sync_attempt.is_none());
+        assert_eq!(
+            crate::app::format_ago(std::time::Instant::now()),
+            "just now"
+        );
+
+        let _ = std::fs::remove_dir_all(&db_dir);
     }
 }

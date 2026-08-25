@@ -143,6 +143,8 @@ pub struct Keybinds {
     pub commands: KeyBinding,
     /// `<leader> + this` opens the global settings page.
     pub global_config: KeyBinding,
+    /// `<leader> + this` triggers an immediate replica sync.
+    pub sync: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -157,6 +159,7 @@ impl Default for Keybinds {
             run_agent: KeyBinding::parse("r").unwrap(),
             commands: KeyBinding::parse(";").unwrap(),
             global_config: KeyBinding::parse(",").unwrap(),
+            sync: KeyBinding::parse("s").unwrap(),
         }
     }
 }
@@ -200,6 +203,7 @@ impl Keybinds {
             run_agent: get("run_agent", &defaults.run_agent),
             commands: get("commands", &defaults.commands),
             global_config: get("global_config", &defaults.global_config),
+            sync: get("sync", &defaults.sync),
         }
     }
 

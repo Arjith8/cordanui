@@ -40,6 +40,15 @@ fn main() -> anyhow::Result<()> {
     let config_db = db::open()?;
     let mut app = app::App::new(db)?;
     app.attach_plugin_config_db(config_db);
+    // Sync worker handle: only when credentials are configured. The
+    // first sync fires on the next loop iteration (startup pull).
+    if cordanui_sync::SyncConfig::load()
+        .map(|c| c.is_sync_enabled())
+        .unwrap_or(false)
+    {
+        let sync_db = db::open()?;
+        app.attach_sync_db(sync_db);
+    }
     app.load_plugin_states();
     app.keybinds = keybinds;
 
@@ -79,6 +88,7 @@ fn run(
         app.poll_plugin_ui_requests();
         app.poll_plugin_panel();
         app.poll_command_results();
+        app.poll_sync();
 
         terminal.draw(|f| ui::render(app, f))?;
 
@@ -177,6 +187,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             }
             _ if binds.commands.matches(key) => app.open_command_mode(),
             _ if binds.global_config.matches(key) => app.open_global_config(),
+            _ if binds.sync.matches(key) => app.request_sync(),
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
