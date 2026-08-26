@@ -653,3 +653,16 @@ pub fn get_errors(db: &Database, limit: i64) -> anyhow::Result<Vec<ErrorRow>> {
 pub fn clear_errors(db: &Database) -> anyhow::Result<()> {
     db.execute_simple("DELETE FROM errors")
 }
+
+// ---------- purge (danger zone) ----------
+
+/// Delete ALL data rows: goals, themes, settings, plugins registry, error
+/// log. Bookkeeping (`_migrations`) is deliberately preserved — purging it
+/// would make the next open re-run shipped migrations against an already
+/// final schema and crash. The schema itself stays in place.
+pub fn purge_all(db: &Database) -> anyhow::Result<()> {
+    for table in ["goals", "themes", "settings", "plugins", "errors"] {
+        db.execute_simple(&format!("DELETE FROM {table}"))?;
+    }
+    Ok(())
+}

@@ -982,7 +982,10 @@ end
             vec![("rosepine-moon".to_string(), "Rose Pine themes".to_string())],
             "plugins with configurators are listed automatically"
         );
-        assert_eq!(app.global_row_count(), 3);
+        assert_eq!(
+            app.global_row_count(),
+            4, // 2 sync fields + 1 plugin configurator + 1 danger-zone row
+        );
 
         // Mismatched url/token is rejected before any write. Force the
         // token empty so the test doesn't depend on the real config file.

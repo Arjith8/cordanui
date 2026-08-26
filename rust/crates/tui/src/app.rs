@@ -28,6 +28,9 @@ pub enum Mode {
     EditDescription { goal_id: String },
     /// Confirmation prompt for deleting a goal.
     ConfirmDelete { goal_id: String },
+    /// Confirmation prompt for purging the entire database (danger zone
+    /// row on the global settings page).
+    ConfirmPurge,
     /// Help overlay.
     Help,
     /// Plugin manager popup (installed list + install input).
@@ -758,6 +761,29 @@ impl App {
         self.input.clear();
     }
 
+    /// Danger zone (global settings, last row): arm the purge confirmation.
+    pub fn request_purge(&mut self) {
+        if self.config_editing.is_some() {
+            return;
+        }
+        self.mode = Mode::ConfirmPurge;
+    }
+
+    /// Actually purge: delete all data rows, then re-resolve every piece
+    /// of in-memory state that was derived from them.
+    pub fn confirm_purge(&mut self) -> anyhow::Result<()> {
+        if self.mode != Mode::ConfirmPurge {
+            return Ok(());
+        }
+        db::purge_all(&self.db)?;
+        self.reload()?;
+        self.theme = crate::theme::Theme::resolve(&self.db, &self.styles.session_snapshot());
+        let _ = self.reload_installed_plugins();
+        self.set_message("database purged");
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
     /// Leader + plugins: open the plugin manager popup (list focused).
     pub fn open_plugin_manager(&mut self) -> anyhow::Result<()> {
         self.input.clear();
@@ -901,13 +927,15 @@ impl App {
         self.mode = Mode::GlobalConfig;
     }
 
-    /// Total selectable rows on the global page: fields + plugin entries.
+    /// Total selectable rows on the global page: fields + plugin entries
+    /// + the danger-zone purge row.
     pub fn global_row_count(&self) -> usize {
         self.global_spec
             .as_ref()
             .map(|s| s.fields.len())
             .unwrap_or(0)
             + self.global_plugin_entries.len()
+            + 1
     }
 
     /// Persist the Sync section back to config.toml. Other sections

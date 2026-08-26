@@ -296,6 +296,35 @@ export async function deleteSheet(id: string): Promise<void> {
   await database.runAsync('DELETE FROM goal_sheets WHERE id = ?', [id]);
 }
 
+// ---------- danger zone ----------
+
+/**
+ * Purge ALL user data: goals, sheets, themes, plugin/theme settings, and
+ * the on-device error log. Device-local sync credentials (`turso_url`,
+ * `turso_token`) and sync bookkeeping (`sync.*`) are deliberately kept so
+ * sync stays configured after a purge — mirrors the TUI's purge behavior.
+ *
+ * Note: deletes do NOT propagate through Turso sync (no tombstones), so
+ * rows already pushed to the cloud will not vanish on other devices.
+ */
+export async function purgeAllData(): Promise<void> {
+  const db = await getDb();
+  await db.execAsync('BEGIN');
+  try {
+    await db.runAsync('DELETE FROM goals');
+    await db.runAsync('DELETE FROM goal_sheets');
+    await db.runAsync('DELETE FROM themes');
+    await db.runAsync(
+      "DELETE FROM settings WHERE key NOT IN ('turso_url', 'turso_token') AND key NOT LIKE 'sync.%'",
+    );
+    await db.runAsync('DELETE FROM errors_mobile');
+    await db.execAsync('COMMIT');
+  } catch (e) {
+    await db.execAsync('ROLLBACK');
+    throw e;
+  }
+}
+
 // ---------- goals ----------
 
 export async function getAllGoals(sheetId?: string): Promise<Goal[]> {

@@ -128,6 +128,7 @@ fn run(
             Mode::PluginPanel => handle_plugin_panel_key(app, key),
             Mode::Command => handle_command_key(app, key),
             Mode::GlobalConfig => handle_global_config_key(app, key)?,
+            Mode::ConfirmPurge => handle_purge_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             _ => handle_input_key(app, key)?,
         }
@@ -530,16 +531,35 @@ fn handle_global_config_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result
             );
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            // Plugin entry: run its configurator (worker thread; the
-            // panel/dialog it opens is answered via the normal loop).
+            // Beyond fields + plugin entries sits the danger-zone purge row.
             let idx = app.config_selected.saturating_sub(field_count);
-            if let Some((name, _)) = app.global_plugin_entries.get(idx).cloned() {
-                app.spawn_plugin_call(&name, app::PluginCall::Configure);
+            match app.global_plugin_entries.get(idx).cloned() {
+                Some((name, _)) => {
+                    // Plugin entry: run its configurator (worker thread; the
+                    // panel/dialog it opens is answered via the normal loop).
+                    app.spawn_plugin_call(&name, app::PluginCall::Configure);
+                }
+                None if idx == app.global_plugin_entries.len() => app.request_purge(),
+                None => {}
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Keys in the purge confirmation dialog: `y` destroys, everything else
+/// that looks like a decline cancels.
+fn handle_purge_key(app: &mut app::App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            if let Err(e) = app.confirm_purge() {
+                app.set_message(&format!("✖ purge failed: {e:#}"));
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => app.cancel(),
+        _ => {}
+    }
 }
 
 /// Keys in a plugin-owned panel (`cord.ui.show_panel`). Keys are forwarded

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { FlatList, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { Alert, FlatList, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { LoggedError } from '@/db/errorsDb';
 import { clearErrors, getErrors } from '@/db/errorsDb';
+import { purgeAllData } from '@/db/goalsDb';
 import {
   formatLastSync,
   getTursoCreds,
@@ -76,6 +77,30 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
     await clearErrors();
     await refresh();
   }, [refresh]);
+
+  const handlePurge = useCallback(() => {
+    Alert.alert(
+      'Purge all data',
+      'Delete ALL goals, sheets, themes, settings and the error log? This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Purge',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              await purgeAllData();
+              // Themes/settings are gone — fall back to the system palette.
+              await selectTheme(null);
+              await refresh();
+            } catch (e) {
+              Alert.alert('Purge failed', e instanceof Error ? e.message : String(e));
+            }
+          },
+        },
+      ],
+    );
+  }, [refresh, selectTheme]);
 
   return (
     <View
@@ -212,6 +237,20 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
         </View>
       ) : null}
 
+      {/* Danger zone */}
+      <View style={[styles.errorsHeader, { borderBottomColor: colors.outline }]}>
+        <Text style={[styles.sectionTitle, { color: colors.onBackground }]}>⚠️ Danger zone</Text>
+      </View>
+      <Pressable
+        onPress={handlePurge}
+        style={[styles.purgeRow, { borderColor: colors.outline }]}
+      >
+        <Text style={[styles.purgeTitle, { color: colors.error }]}>Purge all data</Text>
+        <Text style={[styles.purgeDetail, { color: colors.outlineVariant }]}>
+          goals · sheets · themes · settings · error log
+        </Text>
+      </Pressable>
+
       <View style={[styles.errorsHeader, { borderBottomColor: colors.outline }]}>
         <Text style={[styles.sectionTitle, { color: colors.onBackground }]}>🐞 Logged errors</Text>
       </View>
@@ -330,6 +369,23 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     paddingVertical: 12,
     borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  purgeRow: {
+    marginHorizontal: 16,
+    marginTop: 12,
+    marginBottom: 4,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+  },
+  purgeTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  purgeDetail: {
+    fontSize: 11,
+    marginTop: 2,
   },
   card: {
     borderRadius: 10,

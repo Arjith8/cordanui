@@ -61,6 +61,10 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Mode::ConfirmDelete { goal_id } = &app.mode {
         render_delete_confirm(frame, goal_id, &app.theme.colors);
     }
+
+    if app.mode == Mode::ConfirmPurge {
+        render_purge_confirm(app, frame, &app.theme.colors);
+    }
     if let Mode::PluginManager { pane } = &app.mode {
         render_plugin_manager(app, pane.clone(), frame);
     }
@@ -488,6 +492,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::EditTitle { .. } => (" Edit title: ".to_string(), app.input.text.clone()),
         Mode::EditDescription { .. } => (" Edit description: ".to_string(), app.input.text.clone()),
         Mode::ConfirmDelete { .. } => (" DELETE ".to_string(), String::new()),
+        Mode::ConfirmPurge => (" CONFIRM PURGE ".to_string(), String::new()),
         Mode::Help => (" HELP ".to_string(), String::new()),
         Mode::PluginManager { .. } | Mode::PluginHelp | Mode::PluginConfigure { .. } => {
             (" PLUGIN ".to_string(), app.input.text.clone())
@@ -525,6 +530,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::PluginPanel => Style::default().fg(c.primary),
         Mode::Command | Mode::GlobalConfig => Style::default().fg(c.secondary),
         Mode::ConfirmDelete { .. } => Style::default().fg(c.error),
+        Mode::ConfirmPurge => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
     };
 
@@ -572,6 +578,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::EditTitle { .. } => "Enter to save · Esc to cancel".into(),
         Mode::EditDescription { .. } => "Enter to save · Esc to cancel".into(),
         Mode::ConfirmDelete { .. } => "y to confirm · n/Esc to cancel".into(),
+        Mode::ConfirmPurge => "y to purge · n/Esc to cancel".into(),
         Mode::Help => {
             let tabs = if app.help_tabs.len() > 1 {
                 " · ←/→ tab · j/k scroll"
@@ -1171,7 +1178,81 @@ fn render_global_config(app: &App, frame: &mut Frame) {
         }
     }
 
+    // --- danger zone: purge row (last selectable row) ---
+    {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Danger zone",
+            Style::default().fg(c.error).add_modifier(Modifier::BOLD),
+        )));
+        let purge_idx = spec.fields.len() + app.global_plugin_entries.len();
+        let selected = app.config_selected == purge_idx;
+        let cursor = if selected { "▶ " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {cursor}"),
+                if selected {
+                    Style::default().fg(c.error).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(c.outline_variant)
+                },
+            ),
+            Span::styled(
+                "Purge database",
+                if selected {
+                    Style::default().fg(c.error).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(c.on_background)
+                },
+            ),
+            Span::styled(
+                "  wipe ALL data — goals, themes, settings, plugins",
+                Style::default().fg(c.outline_variant),
+            ),
+        ]));
+    }
+
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Purge confirmation dialog (danger zone). Requires an explicit `y`.
+fn render_purge_confirm(app: &App, frame: &mut Frame, c: &Palette) {
+    let area = centered_rect(56, 30, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Confirm Purge ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.error));
+
+    let lines = vec![
+        Line::from(""),
+        Line::from("  Delete ALL data and start fresh?"),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "  goals · themes · settings · plugins · error log",
+            Style::default().fg(c.error),
+        )]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This cannot be undone.",
+            Style::default().fg(c.outline_variant),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "  y",
+                Style::default().fg(c.error).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" to purge · "),
+            Span::styled("n", Style::default().fg(c.outline_variant)),
+            Span::raw(" to cancel"),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().fg(c.on_background));
+    frame.render_widget(&paragraph, area);
 }
 
 /// Agent picker: choose a provider × model for the selected goal.
