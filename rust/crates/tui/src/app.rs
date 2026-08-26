@@ -1080,7 +1080,17 @@ impl App {
             let Some(provider) = &manifest.provider else {
                 continue;
             };
-            let values = db::get_plugin_settings(&self.db, &manifest.plugin.name)?;
+            let mut values = db::get_plugin_settings(&self.db, &manifest.plugin.name)?;
+            // Unsaved fields fall back to their manifest defaults so
+            // plugins see the authored behavior out of the box (e.g.
+            // `open_picker_on_start = "false"`) instead of nil.
+            if let Some(ui) = &manifest.ui {
+                for f in &ui.fields {
+                    if let Some(d) = &f.default {
+                        values.entry(f.key.clone()).or_insert_with(|| d.clone());
+                    }
+                }
+            }
             let config = db::settings_to_config(&values);
 
             for model in &provider.models {
@@ -1633,10 +1643,19 @@ impl App {
             if !manifest.is_lua() {
                 continue;
             }
-            // Settings collected from the plugin's Configure form.
-            let config = db::settings_to_config(
-                &db::get_plugin_settings(&self.db, &manifest.plugin.name).unwrap_or_default(),
-            );
+            // Settings collected from the plugin's Configure form, with
+            // manifest defaults filled in for never-saved fields so
+            // plugins observe their authored behavior at load time.
+            let mut stored =
+                db::get_plugin_settings(&self.db, &manifest.plugin.name).unwrap_or_default();
+            if let Some(ui) = &manifest.ui {
+                for f in &ui.fields {
+                    if let Some(d) = &f.default {
+                        stored.entry(f.key.clone()).or_insert_with(|| d.clone());
+                    }
+                }
+            }
+            let config = db::settings_to_config(&stored);
             let name = manifest.plugin.name.clone();
             match cordanui_plugin_runtime::LuaPlugin::load(
                 &dir,
