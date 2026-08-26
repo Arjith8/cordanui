@@ -1,22 +1,23 @@
-//! cordanui-sync — libSQL wrapper with Turso embedded replica sync.
+//! cordanui-sync — Turso Database engine wrapper with local-first sync.
 //!
 //! Provides a synchronous database API that the TUI and agent backend can
 //! use without an async runtime. Internally uses a tokio runtime to drive
-//! the async libsql client.
+//! the async `turso` client.
 //!
 //! ## modes
 //!
 //! - **Local-only**: when no Turso URL/token is configured, opens a local
-//!   libSQL database file. All reads/writes are local. No sync.
-//! - **Embedded replica**: when `turso_url` + `turso_token` are provided,
-//!   opens a local file as an embedded replica of a remote Turso primary.
-//!   Reads are local (fast, offline-capable). Writes go to the local file
-//!   and are pushed to Turso in the background. `sync()` pulls remote
-//!   changes.
-//! - **Degraded**: if the replica can't be created (Turso unreachable, bad
-//!   credentials, …) the same file opens local-only instead of failing, so
-//!   hosts keep working offline. `is_sync_enabled()` reports false while
-//!   degraded; writes made then are best-effort (see `Database::open`).
+//!   database file. All reads/writes are local. No sync.
+//! - **Synced**: when `turso_url` + `turso_token` are provided, the same
+//!   local file is backed by a Turso Cloud remote. Opening NEVER touches
+//!   the network (local-first): reads/writes always land in the local
+//!   file instantly, and [`Database::sync`] performs an explicit
+//!   push-then-pull over HTTP. Offline edits stay safe locally until the
+//!   next successful push.
+//!
+//! Conflict strategy is the server's "last push wins" (row-level logical
+//! CDC), which matches the mobile app's LWW-by-updated_at contract far
+//! better than page-frame replication ever did.
 //!
 //! ## config
 //!
@@ -35,27 +36,32 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use libsql::{Connection as LibsqlConnection, Database as LibsqlDatabase};
 
 // Re-export Value so consumers (TUI, agent backend) can use it without
-// directly depending on the libsql crate.
-pub use libsql::Value;
+// directly depending on the turso crate.
+pub use turso::Value;
 
 // ---------- public types ----------
 
-/// A synchronous database connection. Wraps an async libsql connection,
+/// A synchronous database connection. Wraps an async turso connection,
 /// blocking on each operation via an internal tokio runtime.
 ///
 /// Cheap to clone: everything inside is an Arc handle. Hosts should open
-/// the database ONCE per process and clone for additional handles — every
-/// fresh `Database::open` repeats schema/migration setup and, when sync is
-/// configured but Turso is down, pays the failed-handshake cost again.
+/// the database ONCE per process and clone for additional handles.
 #[derive(Clone)]
 pub struct Database {
-    conn: LibsqlConnection,
-    db: Arc<LibsqlDatabase>,
+    conn: turso::Connection,
+    inner: Inner,
     runtime: Arc<tokio::runtime::Runtime>,
     sync_enabled: bool,
+}
+
+/// The underlying engine handle. `sync::Builder` requires a remote URL, so
+/// local-only databases go through the plain builder instead.
+#[derive(Clone)]
+enum Inner {
+    Local(turso::Database),
+    Synced(Arc<turso::sync::Database>),
 }
 
 /// A query result — a vec of rows, each row a vec of column values.
@@ -111,176 +117,75 @@ impl SyncConfig {
     }
 }
 
-
-// ---------- plain-local -> replica migration ----------
-
-/// Detects libSQL's "can not sync a database without a wal_index" error,
-/// which happens when a plain local database (created before credentials
-/// existed) is opened as an embedded replica.
-fn is_wal_index_error(err: &libsql::Error) -> bool {
-    err.to_string().contains("wal_index")
-}
-
-/// Move a plain-local database (plus `-wal` / `-shm` sidecars) aside so a
-/// fresh replica can be created. Returns the (source, backup) pairs for
-/// restoration if replica creation fails.
-fn set_aside_plain_local(db_path: &Path) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let mut moved = Vec::new();
-    for suffix in ["", "-wal", "-shm"] {
-        let src = PathBuf::from(format!("{}{}", db_path.display(), suffix));
-        if src.exists() {
-            let dst = PathBuf::from(format!(
-                "{}.pre-replica{}",
-                db_path.display(),
-                suffix
-            ));
-            std::fs::rename(&src, &dst).with_context(|| {
-                format!("moving {} aside for replica migration", src.display())
-            })?;
-            moved.push((src, dst));
-        }
-    }
-    Ok(moved)
-}
-
-fn restore_plain_local(moved: &[(PathBuf, PathBuf)]) {
-    for (src, dst) in moved {
-        let _ = std::fs::rename(dst, src);
-    }
-}
-
 impl Database {
-    /// Open a database with the given config. If sync is enabled, creates an
-    /// embedded replica; otherwise opens a local-only database.
+    /// Open a database with the given config. Never touches the network:
+    /// with sync credentials the local file is bound to a Turso Cloud
+    /// remote, but actual push/pull only happens inside [`Database::sync`]
+    /// (and therefore off the startup path entirely).
     pub fn open(config: &SyncConfig) -> Result<Self> {
-        // libSQL won't create parent directories — make sure they exist.
+        // The engine won't create parent directories — make sure they exist.
         if let Some(dir) = config.db_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let runtime = Arc::new(tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?);
 
-        let database = if config.is_sync_enabled() {
-            let url = config.turso_url.as_ref().unwrap();
-            let token = config.turso_token.as_ref().unwrap();
-            tracing::info!(url = %url, "opening embedded replica with Turso sync");
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
+        );
 
-            let build_replica = || {
-                runtime.block_on(async {
-                    // Pin sync protocol V1 (classic embedded replica). The
-                    // default (Auto) probes the server and upgrades to V2,
-                    // which delegates every write to the remote primary over
-                    // HTTP — that both fails with `Write delegation: NotFound`
-                    // on databases whose edge doesn't serve the V2 proxy
-                    // route, and makes each write block on a network round
-                    // trip. V1 keeps writes local-first: they land in the
-                    // local file immediately and are pushed to Turso as
-                    // replication frames during `Database::sync()`.
-                    libsql::Builder::new_remote_replica(
-                        &config.db_path,
-                        url.clone(),
-                        token.clone(),
-                    )
-                    .sync_protocol(libsql::SyncProtocol::V1)
-                    .build()
-                    .await
-                })
-            };
-
-            // Replica open, with the legacy plain-local → replica migration
-            // folded in. Any failure bubbles up as degraded mode.
-            let try_replica = || -> std::result::Result<LibsqlDatabase, anyhow::Error> {
-                match build_replica() {
-                    Ok(db) => Ok(db),
-                    Err(err) if is_wal_index_error(&err) => {
-                        // The local file predates sync (plain local SQLite)
-                        // and cannot be opened as a replica in place. Start
-                        // fresh: set the old file aside as a backup and
-                        // initialize the replica from the remote.
-                        tracing::info!(
-                            "existing local-only database detected — \
-                             starting fresh replica (old file kept as *.pre-replica)"
-                        );
-                        let moved = set_aside_plain_local(&config.db_path)?;
-                        match build_replica() {
-                            Ok(db) => Ok(db),
-                            Err(e) => {
-                                restore_plain_local(&moved);
-                                tracing::warn!(
-                                    error = %e,
-                                    "replica creation failed after migration"
-                                );
-                                Err(e.into())
-                            }
-                        }
-                    }
-                    Err(err) => Err(err.into()),
-                }
-            };
-
-            // NOTE on divergence: writes made while degraded live only in
-            // the local file and are NOT in the replication stream. When
-            // replica mode resumes, pulled frames can overwrite those pages.
-            // Treat degraded-mode edits as best-effort.
-            //
-            // The replica handshake is lazy — `build_replica` can succeed
-            // against a dead host and the first delegated write (schema
-            // setup below) is where the connection error actually shows up.
-            // So the fallback must cover the FULL attempt, not just the
-            // build.
-            match try_replica().and_then(|db| Self::finish(db, &runtime, true)) {
-                Ok(database) => {
-                    tracing::info!("embedded replica ready");
-                    return Ok(database);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %format!("{err:#}"),
-                        "turso unreachable — continuing in local-only mode"
-                    );
-                }
-            }
-
-            Self::open_local_at(&config.db_path, &runtime)
-                .context("turso replica open failed and local-only fallback failed too")
+        let path = config.db_path.to_string_lossy().into_owned();
+        let (inner, sync_enabled) = if config.is_sync_enabled() {
+            tracing::info!(
+                url = %config.turso_url.as_ref().unwrap(),
+                "opening local database bound to Turso remote (sync deferred)"
+            );
+            // Local-first: never bootstrap from / never require the
+            // remote at open time. Initial population happens by
+            // replaying data through this connection and pushing.
+            let db = runtime.block_on(
+                turso::sync::Builder::new_remote(&path)
+                    .with_remote_url(config.turso_url.as_ref().unwrap().clone())
+                    .with_auth_token(config.turso_token.as_ref().unwrap().clone())
+                    .bootstrap_if_empty(false)
+                    .build(),
+            )?;
+            (Inner::Synced(Arc::new(db)), true)
         } else {
             tracing::info!(path = %config.db_path.display(), "opening local-only database");
-            Self::open_local_at(&config.db_path, &runtime)
+            let db = runtime.block_on(turso::Builder::new_local(&path).build())?;
+            (Inner::Local(db), false)
+        };
+
+        let t = std::time::Instant::now();
+        let conn = match &inner {
+            // sync Database::connect is async; plain Database::connect is sync
+            Inner::Local(db) => db.connect(),
+            Inner::Synced(db) => runtime.block_on(async { db.connect().await }),
         }?;
+        tracing::debug!(elapsed = ?t.elapsed(), "database opened");
 
-        Ok(database)
+        Self::finish(conn, inner, runtime, sync_enabled)
     }
 
-    /// Open `<path>` as a plain local database and run schema setup.
-    fn open_local_at(path: &Path, runtime: &Arc<tokio::runtime::Runtime>) -> Result<Self> {
-        let db = runtime.block_on(async { libsql::Builder::new_local(path).build().await })?;
-        Self::finish(db, runtime, false)
+    /// Open a local-only database at the default path.
+    pub fn open_local() -> Result<Self> {
+        let config = SyncConfig {
+            db_path: default_db_path(),
+            ..Default::default()
+        };
+        Self::open(&config)
     }
 
-    /// Connect to an opened libSQL database and bring it to the current
-    /// schema (WAL pragma, migrations, foreign keys). Shared by replica and
-    /// local-only paths.
+    /// Post-open setup shared by every mode: pragmas + schema migrations.
     fn finish(
-        db: LibsqlDatabase,
-        runtime: &Arc<tokio::runtime::Runtime>,
+        conn: turso::Connection,
+        inner: Inner,
+        runtime: Arc<tokio::runtime::Runtime>,
         sync_enabled: bool,
     ) -> Result<Self> {
-        let db = Arc::new(db);
-        let conn = runtime.block_on(async { db.connect() })?;
-
-        // Local-only databases get WAL mode: the host opens the same file
-        // from several handles (main + cord.config + sync worker), and
-        // WAL is what makes that concurrent access safe instead of a
-        // SQLITE_BUSY minefield. Replica databases manage their own WAL
-        // internally.
-        if !sync_enabled {
-            runtime.block_on(async {
-                let mut rows = conn.query("PRAGMA journal_mode = WAL;", ()).await?;
-                while rows.next().await?.is_some() {}
-                Ok::<(), libsql::Error>(())
-            })?;
-        }
+        // Foreign keys must be re-enabled per connection.
+        runtime.block_on(async { conn.execute_batch("PRAGMA foreign_keys = ON;").await })?;
 
         // Apply schema + migrations. This runs on every startup; the
         // `_migrations` table records what has been applied so each
@@ -336,38 +241,31 @@ impl Database {
             Ok::<(), anyhow::Error>(())
         })?;
 
-        // Enable foreign keys
-        runtime.block_on(async { conn.execute("PRAGMA foreign_keys = ON;", ()).await })?;
-
         Ok(Self {
             conn,
-            db,
-            runtime: runtime.clone(),
+            inner,
+            runtime,
             sync_enabled,
         })
-    }
-
-    /// Open a local-only database at the default path.
-    pub fn open_local() -> Result<Self> {
-        let config = SyncConfig {
-            db_path: default_db_path(),
-            ..Default::default()
-        };
-        Self::open(&config)
     }
 
     pub fn is_sync_enabled(&self) -> bool {
         self.sync_enabled
     }
 
-    /// Sync with the remote Turso primary. Pulls remote changes and pushes
-    /// local writes. No-op if sync is not enabled.
+    /// Push local changes to Turso, then pull remote changes down. No-op
+    /// if sync is not enabled. Network failures propagate to the caller —
+    /// local data is never affected.
     pub fn sync(&self) -> Result<()> {
-        if !self.sync_enabled {
-            return Ok(());
+        match &self.inner {
+            Inner::Local(_) => Ok(()),
+            Inner::Synced(db) => self.runtime.block_on(async {
+                db.push().await?;
+                let changed = db.pull().await?;
+                tracing::debug!(changed, "sync pull finished");
+                Ok(())
+            }),
         }
-        self.runtime.block_on(async { self.db.sync().await })?;
-        Ok(())
     }
 
     /// Execute a statement that returns no rows (INSERT, UPDATE, DELETE).
@@ -393,11 +291,10 @@ impl Database {
 
     /// Execute a query and return all rows. Each row is a `Vec<Value>`.
     pub fn query(&self, sql: &str, params: Vec<Value>) -> Result<QueryResult> {
-        let stmt = self
-            .runtime
-            .block_on(async { self.conn.prepare(sql).await })?;
-
-        let mut rows = self.runtime.block_on(async { stmt.query(params).await })?;
+        let mut rows = self.runtime.block_on(async {
+            let mut stmt = self.conn.prepare(sql).await?;
+            stmt.query(params).await
+        })?;
 
         let mut result_rows = Vec::new();
         loop {
@@ -405,10 +302,8 @@ impl Database {
             match row_opt {
                 Ok(Some(row)) => {
                     let mut values = Vec::new();
-                    let col_count = row.column_count();
-                    for i in 0..col_count {
-                        let val = row.get_value(i)?;
-                        values.push(val);
+                    for i in 0..row.column_count() {
+                        values.push(row.get_value(i)?);
                     }
                     result_rows.push(values);
                 }
@@ -592,10 +487,7 @@ pub fn write_plugin_setting_at(path: &Path, plugin: &str, key: &str, value: &str
         .or_insert_with(|| toml::Value::Table(Default::default()))
         .as_table_mut()
         .with_context(|| format!("[plugins.{plugin}] section is not a table"))?;
-    entry.insert(
-        key.to_string(),
-        toml::Value::String(value.to_string()),
-    );
+    entry.insert(key.to_string(), toml::Value::String(value.to_string()));
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -615,280 +507,4 @@ pub fn write_plugin_setting(plugin: &str, key: &str, value: &str) -> Result<()> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_databases_open_in_wal_mode() {
-        let dir = std::env::temp_dir().join(format!(
-            "cordanui-sync-wal-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let config = SyncConfig {
-            db_path: dir.join("test.db"),
-            ..Default::default()
-        };
-        let db = Database::open(&config).unwrap();
-        let result = db
-            .query_simple("PRAGMA journal_mode;")
-            .unwrap();
-        let mode = result
-            .rows()
-            .first()
-            .and_then(|r| r.first())
-            .map(|v| match v {
-                Value::Text(s) => s.clone(),
-                _ => String::new(),
-            })
-            .unwrap_or_default();
-        assert_eq!(mode, "wal");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn plugin_settings_mirror_round_trip_preserves_other_sections() {
-        let dir = std::env::temp_dir().join(format!("cordanui-sync-mirror-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "[turso]\nurl = \"libsql://x.turso.io\"\n\n[keybinds]\nleader = \"ctrl+a\"\n",
-        )
-        .unwrap();
-
-        write_plugin_setting_at(&path, "my-plugin", "api_key", "sk-test").unwrap();
-        write_plugin_setting_at(&path, "my-plugin", "model", "glm-5.2").unwrap();
-        // Second plugin doesn't clobber the first.
-        write_plugin_setting_at(&path, "other", "variant", "moon").unwrap();
-
-        let mine = read_plugin_settings_at(&path, "my-plugin");
-        assert_eq!(mine.get("api_key").map(String::as_str), Some("sk-test"));
-        assert_eq!(mine.get("model").map(String::as_str), Some("glm-5.2"));
-        assert_eq!(
-            read_plugin_settings_at(&path, "other")
-                .get("variant")
-                .map(String::as_str),
-            Some("moon")
-        );
-
-        // Existing sections survived.
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("libsql://x.turso.io"), "{contents}");
-        assert!(contents.contains("ctrl+a"), "{contents}");
-    }
-
-    #[test]
-    fn turso_credentials_round_trip_preserves_other_sections() {
-        let dir = std::env::temp_dir().join(format!("cordanui-sync-config-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        std::fs::write(
-            &path,
-            "[keybinds]\nleader = \"ctrl+a\"\n\n[turso]\nurl = \"old\"\ntoken = \"oldtok\"\n",
-        )
-        .unwrap();
-
-        write_turso_credentials_at(&path, "libsql://new.turso.io", "tok2").unwrap();
-        let (url, token) = read_turso_credentials_at(&path);
-        assert_eq!(url.as_deref(), Some("libsql://new.turso.io"));
-        assert_eq!(token.as_deref(), Some("tok2"));
-
-        // [keybinds] survived the rewrite.
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            contents.contains("ctrl+a"),
-            "other sections must survive: {contents}"
-        );
-
-        // Fresh file creation works too.
-        let fresh = dir.join("fresh.toml");
-        write_turso_credentials_at(&fresh, "u", "t").unwrap();
-        assert_eq!(read_turso_credentials_at(&fresh).0.as_deref(), Some("u"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn open_local_database() {
-        let dir = std::env::temp_dir().join("cordanui-sync-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let db_path = dir.join("test.db");
-        let config = SyncConfig {
-            db_path,
-            ..Default::default()
-        };
-        let db = Database::open(&config).unwrap();
-        assert!(!db.is_sync_enabled());
-    }
-
-    #[test]
-    fn round_trip_goal() {
-        let dir = std::env::temp_dir().join("cordanui-sync-test2");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let db_path = dir.join("test.db");
-        let config = SyncConfig {
-            db_path,
-            ..Default::default()
-        };
-        let db = Database::open(&config).unwrap();
-
-        // Insert a goal
-        let id = cordanui_schema::new_id();
-        let ts = cordanui_schema::now_iso();
-        db.execute(
-            "INSERT INTO goals (id, title, description, status, parent_id, sort_order, created_at, updated_at) \
-             VALUES (?, ?, NULL, 'pending', NULL, 0, ?, ?)",
-            vec![
-                Value::from(id.clone()),
-                Value::from("Test goal"),
-                Value::from(ts.clone()),
-                Value::from(ts),
-            ],
-        )
-        .unwrap();
-
-        // Read it back
-        let result = db
-            .query_first(
-                "SELECT title FROM goals WHERE id = ?",
-                vec![Value::from(id)],
-            )
-            .unwrap();
-        assert!(result.is_some());
-        let row = result.unwrap();
-        match &row[0] {
-            Value::Text(s) => assert_eq!(s, "Test goal"),
-            v => panic!("expected text, got {v:?}"),
-        }
-    }
-
-    #[test]
-    fn config_loads_without_file() {
-        // When no config file exists, should return local-only config
-        // (we can't easily test the real path, but we can test the logic)
-        let config = SyncConfig::default();
-        assert!(!config.is_sync_enabled());
-    }
-
-    fn temp_db(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("cordanui-sync-mig-{name}"));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("test.db")
-    }
-
-    #[test]
-    fn fresh_db_records_migrations_without_running_them() {
-        let db = Database::open(&SyncConfig {
-            db_path: temp_db("fresh"),
-            ..Default::default()
-        })
-        .unwrap();
-
-        // Every migration is recorded as applied…
-        let result = db
-            .query_simple("SELECT version FROM _migrations ORDER BY version")
-            .unwrap();
-        let versions: Vec<i64> = result
-            .rows()
-            .iter()
-            .map(|r| match &r[0] {
-                Value::Integer(n) => *n,
-                v => panic!("expected integer version, got {v:?}"),
-            })
-            .collect();
-        let expected: Vec<i64> = cordanui_schema::MIGRATIONS
-            .iter()
-            .map(|m| m.version)
-            .collect();
-        assert_eq!(versions, expected);
-
-        // …and the final schema already reflects them (no `is_dark`).
-        assert!(db
-            .query_simple("SELECT is_dark FROM themes LIMIT 1")
-            .is_err());
-    }
-
-    #[test]
-    fn legacy_db_gets_migrated() {
-        use tokio::runtime::Builder;
-
-        let path = temp_db("legacy");
-
-        // Simulate a database created before the migration system: old
-        // themes shape (with `is_dark`) and no `_migrations` table.
-        {
-            let rt = Builder::new_current_thread().enable_all().build().unwrap();
-            let raw = rt
-                .block_on(async { libsql::Builder::new_local(&path).build().await })
-                .unwrap();
-            let conn = rt.block_on(async { raw.connect() }).unwrap();
-            rt.block_on(async {
-                conn.execute_batch(
-                    "CREATE TABLE goals (\
-                         id           TEXT PRIMARY KEY,\
-                         title        TEXT NOT NULL,\
-                         description  TEXT,\
-                         status       TEXT NOT NULL DEFAULT 'pending',\
-                         parent_id    TEXT REFERENCES goals(id) ON DELETE CASCADE,\
-                         sort_order   INTEGER NOT NULL DEFAULT 0,\
-                         created_at   TEXT NOT NULL,\
-                         updated_at   TEXT NOT NULL,\
-                         completed_at TEXT,\
-                         agent_status   TEXT,\
-                         agent_result   TEXT,\
-                         agent_progress TEXT,\
-                         metadata       TEXT\
-                     );",
-                )
-                .await
-                .unwrap();
-                conn.execute_batch(
-                    "CREATE TABLE themes (\
-                         id          TEXT PRIMARY KEY,\
-                         name        TEXT NOT NULL,\
-                         source      TEXT NOT NULL DEFAULT 'builtin',\
-                         is_dark     INTEGER NOT NULL DEFAULT 0,\
-                         colors_json TEXT NOT NULL\
-                     );",
-                )
-                .await
-                .unwrap();
-            });
-            // Drop the runtime so the file handle is released.
-            drop(conn);
-            drop(raw);
-            drop(rt);
-        }
-
-        let db = Database::open(&SyncConfig {
-            db_path: path,
-            ..Default::default()
-        })
-        .unwrap();
-
-        // Migration ran: the column is gone but the data survives.
-        assert!(db
-            .query_simple("SELECT is_dark FROM themes LIMIT 1")
-            .is_err());
-        db.execute(
-            "INSERT INTO themes (id, name, source, colors_json) VALUES ('t1', 'T', 'https://github.com/x/y', '{}')",
-            vec![],
-        )
-        .unwrap();
-
-        // …and it was recorded exactly once.
-        let result = db
-            .query_simple("SELECT COUNT(*) FROM _migrations WHERE name LIKE 'themes_drop_is_dark%'")
-            .unwrap();
-        match &result.rows()[0][0] {
-            Value::Integer(n) => assert_eq!(*n, 1),
-            v => panic!("expected count, got {v:?}"),
-        }
-    }
-}
+mod tests;

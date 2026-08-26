@@ -47,25 +47,14 @@ fn main() -> anyhow::Result<()> {
     let db = db::open()?;
     let mut app = app::App::new(db.clone())?;
     app.attach_plugin_config_db(db.clone());
-    // Sync worker handle: only when credentials are configured AND the
-    // database actually opened in replica mode. If Turso is unreachable,
-    // `Database::open` degrades to local-only instead of failing — the TUI
-    // keeps working offline and the status line says so.
+    // Sync worker handle: whenever credentials are configured. Opening the
+    // DB never touches the network (local-first); push/pull failures show
+    // up in the sync status + errors log at runtime instead.
     if cordanui_sync::SyncConfig::load()
         .map(|c| c.is_sync_enabled())
         .unwrap_or(false)
     {
-        if db.is_sync_enabled() {
-            app.attach_sync_db(db.clone());
-        } else {
-            let msg = "turso unreachable at startup — running local-only (edits won't sync)";
-            app.record_error(
-                "sync",
-                msg,
-                Some("check [turso] url/token in ~/.config/cordanui/config.toml, then restart"),
-            );
-            app.set_message(msg);
-        }
+        app.attach_sync_db(db.clone());
     }
     app.load_plugin_states();
     app.keybinds = keybinds;
