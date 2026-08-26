@@ -32,7 +32,7 @@ pub use protocol::{
 pub use spawn::{run_one_shot, run_streaming};
 pub use style::{parse_color, NullStyleHost, StyleHost, CORE_VARS, LEGACY_ALIASES};
 pub use ui::{
-    ConfigHost, NoUiHost, PanelHost, PanelSpec, PendingUi, ServiceHost, SharedConfigHost,
-    SharedPanelHost, SharedServiceHost, SharedUiHost, UiHost, UiLevel, UiRequest, UiResponse,
-    Widget,
+    ConfigHost, ErrorEntry, ErrorLogHost, NoUiHost, PanelHost, PanelSpec, PendingUi, ServiceHost,
+    SharedConfigHost, SharedErrorLogHost, SharedPanelHost, SharedServiceHost, SharedUiHost,
+    UiHost, UiLevel, UiRequest, UiResponse, Widget,
 };

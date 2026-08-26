@@ -418,15 +418,20 @@ pub fn clear_theme_selection(db: &Database) -> anyhow::Result<()> {
 
 /// All values stored for one plugin, with the namespace prefix stripped.
 /// Returns a map of bare field key → stored value.
+///
+/// Merge order: the local config.toml mirror (`[plugins.<name>]`) provides
+/// the base, DB rows (synced via Turso) win on conflict. A fresh device
+/// therefore restores its mirrored config even before the first sync
+/// lands.
 pub fn get_plugin_settings(
     db: &Database,
     plugin: &str,
 ) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut map = cordanui_sync::read_plugin_settings(plugin);
     let result = db.query_simple(&format!(
         "SELECT key, value FROM settings WHERE key LIKE '{}.%'",
         escape_like(plugin)
     ))?;
-    let mut map = std::collections::BTreeMap::new();
     let prefix = format!("{plugin}.");
     for row in result.rows() {
         if let (Some(Value::Text(k)), Some(Value::Text(v))) = (row.first(), row.get(1)) {
@@ -439,6 +444,11 @@ pub fn get_plugin_settings(
 }
 
 /// Store one setting under the plugin's namespace.
+///
+/// Writes to the shared `settings` table (the runtime source of truth,
+/// synced via Turso) AND mirrors into `[plugins.<name>]` in the local
+/// config.toml, so configuration survives without the remote. The mirror
+/// is best-effort: a config-file failure never fails the DB write.
 pub fn set_plugin_setting(
     db: &Database,
     plugin: &str,
@@ -450,6 +460,9 @@ pub fn set_plugin_setting(
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         vec![Value::from(format!("{plugin}.{key}")), Value::from(value)],
     )?;
+    if let Err(e) = cordanui_sync::write_plugin_setting(plugin, key, value) {
+        eprintln!("cordanui: could not mirror plugin setting to config.toml: {e:#}");
+    }
     Ok(())
 }
 
@@ -577,4 +590,66 @@ fn values_to_goal(row: &Vec<Value>) -> Goal {
         agent_progress: get_opt_str(11),
         metadata: get_opt_str(12),
     }
+}
+
+// ---------- errors view (diagnostics log) ----------
+
+/// One row of the `errors` table.
+#[derive(Debug, Clone)]
+pub struct ErrorRow {
+    pub context: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub created_at: String,
+}
+
+fn error_text(v: &Value) -> String {
+    match v {
+        Value::Text(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Log a failure into the `errors` table. Never fails the caller: error
+/// logging must not be able to cause errors. Failures to log are printed
+/// to stderr (visible when not in raw mode).
+pub fn log_error(db: &Database, context: &str, message: &str, detail: Option<&str>) {
+    let result = db.execute(
+        "INSERT INTO errors (id, context, message, detail, created_at) \
+         VALUES (?, ?, ?, ?, ?)",
+        vec![
+            Value::from(cordanui_schema::new_id()),
+            Value::from(context),
+            Value::from(message),
+            detail.map(Value::from).unwrap_or(Value::Null),
+            Value::from(cordanui_schema::now_iso()),
+        ],
+    );
+    if let Err(e) = result {
+        eprintln!("cordanui: could not record error ({context}): {e:#}");
+    }
+}
+
+/// Recent errors, newest first.
+pub fn get_errors(db: &Database, limit: i64) -> anyhow::Result<Vec<ErrorRow>> {
+    let result = db.query(
+        "SELECT context, message, detail, created_at FROM errors \
+         ORDER BY created_at DESC LIMIT ?",
+        vec![Value::from(limit)],
+    )?;
+    Ok(result
+        .rows()
+        .iter()
+        .map(|row| ErrorRow {
+            context: row.first().map(error_text).unwrap_or_default(),
+            message: row.get(1).map(error_text).unwrap_or_default(),
+            detail: row.get(2).map(error_text),
+            created_at: row.get(3).map(error_text).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Delete every logged error.
+pub fn clear_errors(db: &Database) -> anyhow::Result<()> {
+    db.execute_simple("DELETE FROM errors")
 }

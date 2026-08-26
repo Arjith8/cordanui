@@ -54,3 +54,15 @@ CREATE TABLE IF NOT EXISTS plugins (
     active       INTEGER NOT NULL DEFAULT 0,
     installed_at TEXT NOT NULL
 );
+
+-- Error / diagnostics log. Every client writes failures it couldn't handle
+-- (sync errors, agent crashes, plugin install failures, ...). Mirrors the
+-- mobile app's device-local `errors_mobile` table; reviewable in the TUI's
+-- errors view (<leader>e). Writers must never fail because of this table.
+CREATE TABLE IF NOT EXISTS errors (
+    id         TEXT PRIMARY KEY,          -- UUID
+    context    TEXT NOT NULL,             -- subsystem: 'sync', 'agent', 'plugin', ...
+    message    TEXT NOT NULL,
+    detail     TEXT,
+    created_at TEXT NOT NULL
+);

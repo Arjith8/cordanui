@@ -1157,10 +1157,11 @@ impl App {
                     break;
                 }
                 Ok(cordanui_plugin_runtime::AgentEvent::Error { message, detail }) => {
-                    let text = match detail {
+                    let text = match &detail {
                         Some(d) => format!("{message}: {d}"),
-                        None => message,
+                        None => message.clone(),
                     };
+                    self.record_error("agent", &message, detail.as_deref());
                     self.finish_agent_run("failed", text)?;
                     break;
                 }
@@ -1169,6 +1170,7 @@ impl App {
                     break;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.record_error("agent", "agent thread died", None);
                     self.finish_agent_run("failed", "agent thread died".into())?;
                     break;
                 }
@@ -1620,6 +1622,7 @@ impl App {
         let problems = self.load_plugin_states();
         self.input.clear();
         if let Some(first) = problems.first() {
+            self.record_error("plugin", "plugin failed to load", Some(first));
             self.set_message(&format!("✖ {first}"));
         } else if self.plugin_commands.is_empty() {
             self.set_message(
@@ -1694,6 +1697,7 @@ impl App {
         };
         match rx.try_recv() {
             Ok(outcome) => {
+                let plugin_name = outcome.plugin_name.clone();
                 self.command_rx = None;
                 self.command_running = false;
                 self.plugin_states
@@ -1703,7 +1707,14 @@ impl App {
                 match outcome.result {
                     Ok(Some(msg)) => self.set_message(&msg),
                     Ok(None) => self.set_message("done"),
-                    Err(e) => self.set_message(&format!("✖ {e:#}")),
+                    Err(e) => {
+                        self.record_error(
+                            "plugin",
+                            "plugin command failed",
+                            Some(&format!("{plugin_name}: {e:#}")),
+                        );
+                        self.set_message(&format!("✖ {e:#}"));
+                    }
                 }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -1726,7 +1737,16 @@ impl App {
     /// Manual sync (`<leader>s`): due immediately on the next frame.
     pub fn request_sync(&mut self) {
         if self.sync_db.is_none() {
-            self.set_message("sync not configured (set turso url + token in global settings)");
+            // Usually means the DB opened degraded (Turso unreachable at
+            // startup) or no credentials are configured. Surface it in the
+            // errors view too — a transient status line is easy to miss.
+            db::log_error(
+                &self.db,
+                "sync",
+                "sync requested but sync is not active",
+                Some("no credentials configured, or Turso was unreachable when the app started (degraded local-only mode)"),
+            );
+            self.set_message("sync is not active — failure logged (restart after fixing [turso] to re-enable)");
             return;
         }
         // Due immediately — even if a sync is currently running, the next
@@ -1753,6 +1773,7 @@ impl App {
                     self.sync_rx = None;
                 }
                 Ok(Err(e)) => {
+                    self.record_error("sync", "replica sync failed", Some(&e));
                     self.sync_status = SyncStatus::Failed {
                         at: std::time::Instant::now(),
                         error: e,
@@ -1789,6 +1810,12 @@ impl App {
             let result = db.lock().unwrap().sync().map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
+    }
+
+    /// Record a failure in the `errors` table from anywhere in the app.
+    /// Best-effort — never panics or fails.
+    pub fn record_error(&mut self, context: &str, message: &str, detail: Option<&str>) {
+        db::log_error(&self.db, context, message, detail);
     }
 
     /// Commit any pending style changes and re-resolve the palette if
@@ -1850,6 +1877,7 @@ impl App {
                     break;
                 }
                 Ok(crate::plugins::TaskEvent::Error(e)) => {
+                    self.record_error("plugin", "plugin task failed", Some(&e));
                     self.plugin_state = crate::plugins::TaskState::Error(e);
                     break;
                 }
@@ -1892,6 +1920,12 @@ impl App {
                     };
                     if !problems.is_empty() {
                         msg.push_str(&format!(" — ⚠ {}", problems.join("; ")));
+                    }
+                    for f in &failed {
+                        self.record_error("plugin", "plugin update failed", Some(f));
+                    }
+                    for p in &problems {
+                        self.record_error("plugin", "plugin failed to load after update", Some(p));
                     }
                     self.set_message(&msg);
                     self.plugin_state = crate::plugins::TaskState::Idle;

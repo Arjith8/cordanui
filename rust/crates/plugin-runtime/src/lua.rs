@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
 use crate::ui::{
-    ConfigHost, PanelSpec, SharedConfigHost, SharedPanelHost, SharedServiceHost, SharedUiHost,
-    UiLevel, UiRequest, UiResponse, Widget,
+    PanelSpec, SharedConfigHost, SharedErrorLogHost, SharedPanelHost, SharedServiceHost,
+    SharedUiHost, UiLevel, UiRequest, UiResponse, Widget,
 };
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
@@ -78,6 +78,7 @@ pub struct HostHooks {
     pub panels: Option<SharedPanelHost>,
     pub config: Option<SharedConfigHost>,
     pub services: Option<SharedServiceHost>,
+    pub errors: Option<SharedErrorLogHost>,
 }
 
 impl HostHooks {
@@ -108,6 +109,11 @@ impl HostHooks {
 
     pub fn with_services(mut self, services: SharedServiceHost) -> Self {
         self.services = Some(services);
+        self
+    }
+
+    pub fn with_errors(mut self, errors: SharedErrorLogHost) -> Self {
+        self.errors = Some(errors);
         self
     }
 }
@@ -150,6 +156,7 @@ impl LuaPlugin {
             hooks.panels,
             hooks.config,
             hooks.services,
+            hooks.errors,
             name,
         )
         .context("registering cord styling API")?;
@@ -474,12 +481,14 @@ fn register_cord(
     panels: Option<SharedPanelHost>,
     config: Option<SharedConfigHost>,
     services: Option<SharedServiceHost>,
+    errors: Option<SharedErrorLogHost>,
     plugin_name: &str,
 ) -> mlua::Result<()> {
     let cord = lua.create_table()?;
     register_cord_config(lua, &cord, config, plugin_name)?;
     register_cord_services(lua, &cord, services)?;
     register_cord_ui(lua, &cord, ui, panels)?;
+    register_cord_errors(lua, &cord, errors)?;
 
     for scope in ["g", "local"] {
         let persistent = scope == "g";
@@ -705,6 +714,65 @@ fn register_cord_services(
 /// Keys are scoped under the plugin's name by the host; values are
 /// strings stored in the shared `settings` table (same place the
 /// declarative fallback form reads and writes).
+/// The `cord.errors` table — read access to the host's error log.
+///
+/// ```lua
+/// local entries = cord.errors.list(50)   -- newest first
+/// for _, e in ipairs(entries) do
+///   print(e.created_at, e.context, e.message)
+/// end
+/// cord.errors.clear()
+/// ```
+fn register_cord_errors(
+    lua: &Lua,
+    cord: &Table,
+    errors: Option<SharedErrorLogHost>,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    // cord.errors.list(limit?) -> array of {created_at, context, message, detail}
+    let errors_list = errors.clone();
+    api.set(
+        "list",
+        lua.create_function(move |lua, limit: Option<u32>| {
+            let Some(host) = errors_list.as_ref() else {
+                return Err(mlua::Error::runtime(
+                    "cord.errors is not available in this host",
+                ));
+            };
+            let entries = host.list(limit.unwrap_or(200));
+            let out = lua.create_table()?;
+            for (i, e) in entries.iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("created_at", e.created_at.clone())?;
+                row.set("context", e.context.clone())?;
+                row.set("message", e.message.clone())?;
+                row.set("detail", e.detail.clone())?; // nil when absent
+                out.set(i + 1, row)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    // cord.errors.clear() -> true
+    let errors_clear = errors.clone();
+    api.set(
+        "clear",
+        lua.create_function(move |_, ()| {
+            let Some(host) = errors_clear.as_ref() else {
+                return Err(mlua::Error::runtime(
+                    "cord.errors is not available in this host",
+                ));
+            };
+            host.clear();
+            Ok(true)
+        })?,
+    )?;
+
+    cord.set("errors", api)?;
+    Ok(())
+}
+
 fn register_cord_config(
     lua: &Lua,
     cord: &Table,

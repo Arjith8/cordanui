@@ -52,6 +52,17 @@ pub const MIGRATIONS: &[Migration] = &[
                   installed_at TEXT NOT NULL\
               );",
     },
+    Migration {
+        version: 3,
+        name: "create_errors_table",
+        sql: "CREATE TABLE IF NOT EXISTS errors (\
+                  id         TEXT PRIMARY KEY,\
+                  context    TEXT NOT NULL,\
+                  message    TEXT NOT NULL,\
+                  detail     TEXT,\
+                  created_at TEXT NOT NULL\
+              );",
+    },
 ];
 
 /// Goal lifecycle status. Stored as TEXT in SQLite.

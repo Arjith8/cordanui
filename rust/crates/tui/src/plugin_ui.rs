@@ -127,8 +127,28 @@ impl ConfigHost for PluginUiBridge {
     }
 }
 
-impl PanelHost for PluginUiBridge {
-    fn open_panel(&self, spec: PanelSpec) {
+impl cordanui_plugin_runtime::ErrorLogHost for PluginUiBridge {
+    fn list(&self, limit: u32) -> Vec<cordanui_plugin_runtime::ErrorEntry> {
+        self.with_config_db(move |db| crate::db::get_errors(db, limit as i64).unwrap_or_default())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| cordanui_plugin_runtime::ErrorEntry {
+                created_at: e.created_at,
+                context: e.context,
+                message: e.message,
+                detail: e.detail,
+            })
+            .collect()
+    }
+
+    fn clear(&self) {
+        self.with_config_db(move |db| {
+            let _ = crate::db::clear_errors(db);
+        });
+    }
+}
+
+impl PanelHost for PluginUiBridge {    fn open_panel(&self, spec: PanelSpec) {
         let _ = self.panel_tx.send(PanelCommand::Open(spec));
     }
 
@@ -151,6 +171,7 @@ pub fn plugin_runtime_hooks(
         .with_panels(ui.clone())
         .with_config(ui.clone())
         .with_services(services)
+        .with_errors(ui.clone())
 }
 
 #[cfg(test)]

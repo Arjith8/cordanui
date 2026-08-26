@@ -6,10 +6,16 @@
 //!
 //! ```toml
 //! [keybinds]
-//! leader       = "ctrl+a"   # prefix key that arms command mode
-//! new_goal     = "n"        # <leader> new goal
-//! show_details = "tab"      # <leader> toggle description + subgoals
-//! cycle_status = "tab"      # bare key: cycle pending → wip → done
+//! leader        = "ctrl+a"   # prefix key that arms command mode
+//! new_goal      = "n"        # <leader> new goal
+//! show_details  = "tab"      # <leader> toggle description + subgoals
+//! cycle_status  = "tab"      # bare key: cycle pending → wip → done
+//! help          = "h"        # <leader> open the help page
+//! plugins       = "p"        # <leader> open the plugin manager
+//! run_agent     = "r"        # <leader> run goal with an agent
+//! commands      = ";"        # <leader> open the plugin-command line
+//! global_config = ","        # <leader> open the global settings page
+//! sync          = "s"        # <leader> sync with Turso now
 //! ```
 //!
 //! Key syntax: lowercase key names joined by `+`, modifiers first
@@ -252,11 +258,28 @@ impl Keybinds {
             &d.plugins,
             "<leader> + key — open the plugin manager",
         );
+        // `run_agent` is deliberately absent from the help page: agent runs
+        // are a plugin-facilitated capability. The binding still works
+        // (`<leader>r`) but only does something once the user has installed
+        // an active provider plugin — advertising it out of the box just
+        // produces "no active provider plugins" errors.
         push(
-            "run_agent",
-            &self.run_agent,
-            &d.run_agent,
-            "<leader> + key — run goal with an agent",
+            "commands",
+            &self.commands,
+            &d.commands,
+            "<leader> + key — open the plugin-command line",
+        );
+        push(
+            "global_config",
+            &self.global_config,
+            &d.global_config,
+            "<leader> + key — open the global settings page",
+        );
+        push(
+            "sync",
+            &self.sync,
+            &d.sync,
+            "<leader> + key — sync with Turso now",
         );
         v
     }

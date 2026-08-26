@@ -41,21 +41,31 @@ fn main() -> anyhow::Result<()> {
     // Keybinds from the [keybinds] section of config.toml.
     let keybinds = config::Keybinds::load();
 
-    // Open DB
+    // Open DB — once. Clones share the same underlying handles; repeated
+    // `Database::open` calls each redo schema setup and (with a dead Turso
+    // host) each pay ~1s of failed replica handshake.
     let db = db::open()?;
-    // A second handle on the same database backs `cord.config` reads and
-    // writes from plugin threads.
-    let config_db = db::open()?;
-    let mut app = app::App::new(db)?;
-    app.attach_plugin_config_db(config_db);
-    // Sync worker handle: only when credentials are configured. The
-    // first sync fires on the next loop iteration (startup pull).
+    let mut app = app::App::new(db.clone())?;
+    app.attach_plugin_config_db(db.clone());
+    // Sync worker handle: only when credentials are configured AND the
+    // database actually opened in replica mode. If Turso is unreachable,
+    // `Database::open` degrades to local-only instead of failing — the TUI
+    // keeps working offline and the status line says so.
     if cordanui_sync::SyncConfig::load()
         .map(|c| c.is_sync_enabled())
         .unwrap_or(false)
     {
-        let sync_db = db::open()?;
-        app.attach_sync_db(sync_db);
+        if db.is_sync_enabled() {
+            app.attach_sync_db(db.clone());
+        } else {
+            let msg = "turso unreachable at startup — running local-only (edits won't sync)";
+            app.record_error(
+                "sync",
+                msg,
+                Some("check [turso] url/token in ~/.config/cordanui/config.toml, then restart"),
+            );
+            app.set_message(msg);
+        }
     }
     app.load_plugin_states();
     app.keybinds = keybinds;

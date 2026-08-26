@@ -234,6 +234,29 @@ pub trait ConfigHost: Send + Sync {
 /// Convenience alias for hosts sharing one bridge across runtimes.
 pub type SharedConfigHost = std::sync::Arc<dyn ConfigHost>;
 
+/// One entry of the host's error/diagnostics log.
+#[derive(Debug, Clone)]
+pub struct ErrorEntry {
+    pub created_at: String,
+    pub context: String,
+    pub message: String,
+    pub detail: Option<String>,
+}
+
+/// Host side of `cord.errors` — read access to the shared error log
+/// (`errors` table). Read-only by design: plugins may review diagnostics
+/// but every writer (host or plugin) appends through the same
+/// never-fails logging path, not through this trait.
+pub trait ErrorLogHost: Send + Sync {
+    /// Recent entries, newest first.
+    fn list(&self, limit: u32) -> Vec<ErrorEntry>;
+    /// Delete all entries.
+    fn clear(&self);
+}
+
+/// Convenience alias for hosts sharing one bridge across runtimes.
+pub type SharedErrorLogHost = std::sync::Arc<dyn ErrorLogHost>;
+
 /// Host side of `cord.services` — lifecycle control for plugin-declared
 /// `[service]` processes. The service itself is any-language binary; this
 /// interface is how Lua plugins drive it.

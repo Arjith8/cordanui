@@ -13,6 +13,10 @@
 //!   Reads are local (fast, offline-capable). Writes go to the local file
 //!   and are pushed to Turso in the background. `sync()` pulls remote
 //!   changes.
+//! - **Degraded**: if the replica can't be created (Turso unreachable, bad
+//!   credentials, …) the same file opens local-only instead of failing, so
+//!   hosts keep working offline. `is_sync_enabled()` reports false while
+//!   degraded; writes made then are best-effort (see `Database::open`).
 //!
 //! ## config
 //!
@@ -41,10 +45,16 @@ pub use libsql::Value;
 
 /// A synchronous database connection. Wraps an async libsql connection,
 /// blocking on each operation via an internal tokio runtime.
+///
+/// Cheap to clone: everything inside is an Arc handle. Hosts should open
+/// the database ONCE per process and clone for additional handles — every
+/// fresh `Database::open` repeats schema/migration setup and, when sync is
+/// configured but Turso is down, pays the failed-handshake cost again.
+#[derive(Clone)]
 pub struct Database {
     conn: LibsqlConnection,
     db: Arc<LibsqlDatabase>,
-    runtime: tokio::runtime::Runtime,
+    runtime: Arc<tokio::runtime::Runtime>,
     sync_enabled: bool,
 }
 
@@ -147,59 +157,115 @@ impl Database {
         if let Some(dir) = config.db_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = Arc::new(tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .build()?;
+            .build()?);
 
-        let (db, sync_enabled) = if config.is_sync_enabled() {
+        let database = if config.is_sync_enabled() {
             let url = config.turso_url.as_ref().unwrap();
             let token = config.turso_token.as_ref().unwrap();
             tracing::info!(url = %url, "opening embedded replica with Turso sync");
 
             let build_replica = || {
                 runtime.block_on(async {
+                    // Pin sync protocol V1 (classic embedded replica). The
+                    // default (Auto) probes the server and upgrades to V2,
+                    // which delegates every write to the remote primary over
+                    // HTTP — that both fails with `Write delegation: NotFound`
+                    // on databases whose edge doesn't serve the V2 proxy
+                    // route, and makes each write block on a network round
+                    // trip. V1 keeps writes local-first: they land in the
+                    // local file immediately and are pushed to Turso as
+                    // replication frames during `Database::sync()`.
                     libsql::Builder::new_remote_replica(
                         &config.db_path,
                         url.clone(),
                         token.clone(),
                     )
+                    .sync_protocol(libsql::SyncProtocol::V1)
                     .build()
                     .await
                 })
             };
 
-            let db = match build_replica() {
-                Ok(db) => db,
-                Err(err) if is_wal_index_error(&err) => {
-                    // The local file predates sync (plain local SQLite) and
-                    // cannot be opened as a replica in place. Start fresh:
-                    // set the old file aside as a backup and initialize the
-                    // replica from the remote.
-                    tracing::info!(
-                        "existing local-only database detected —                          starting fresh replica (old file kept as *.pre-replica)"
-                    );
-                    let moved = set_aside_plain_local(&config.db_path)?;
-                    let db = match build_replica() {
-                        Ok(db) => db,
-                        Err(e) => {
-                            restore_plain_local(&moved);
-                            return Err(anyhow::anyhow!(
-                                "replica creation failed after migration;                                  local database restored: {e}"
-                            ));
+            // Replica open, with the legacy plain-local → replica migration
+            // folded in. Any failure bubbles up as degraded mode.
+            let try_replica = || -> std::result::Result<LibsqlDatabase, anyhow::Error> {
+                match build_replica() {
+                    Ok(db) => Ok(db),
+                    Err(err) if is_wal_index_error(&err) => {
+                        // The local file predates sync (plain local SQLite)
+                        // and cannot be opened as a replica in place. Start
+                        // fresh: set the old file aside as a backup and
+                        // initialize the replica from the remote.
+                        tracing::info!(
+                            "existing local-only database detected — \
+                             starting fresh replica (old file kept as *.pre-replica)"
+                        );
+                        let moved = set_aside_plain_local(&config.db_path)?;
+                        match build_replica() {
+                            Ok(db) => Ok(db),
+                            Err(e) => {
+                                restore_plain_local(&moved);
+                                tracing::warn!(
+                                    error = %e,
+                                    "replica creation failed after migration"
+                                );
+                                Err(e.into())
+                            }
                         }
-                    };
-                    db
+                    }
+                    Err(err) => Err(err.into()),
                 }
-                Err(err) => return Err(err.into()),
             };
-            (db, true)
+
+            // NOTE on divergence: writes made while degraded live only in
+            // the local file and are NOT in the replication stream. When
+            // replica mode resumes, pulled frames can overwrite those pages.
+            // Treat degraded-mode edits as best-effort.
+            //
+            // The replica handshake is lazy — `build_replica` can succeed
+            // against a dead host and the first delegated write (schema
+            // setup below) is where the connection error actually shows up.
+            // So the fallback must cover the FULL attempt, not just the
+            // build.
+            match try_replica().and_then(|db| Self::finish(db, &runtime, true)) {
+                Ok(database) => {
+                    tracing::info!("embedded replica ready");
+                    return Ok(database);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = %format!("{err:#}"),
+                        "turso unreachable — continuing in local-only mode"
+                    );
+                }
+            }
+
+            Self::open_local_at(&config.db_path, &runtime)
+                .context("turso replica open failed and local-only fallback failed too")
         } else {
             tracing::info!(path = %config.db_path.display(), "opening local-only database");
-            let db = runtime
-                .block_on(async { libsql::Builder::new_local(&config.db_path).build().await })?;
-            (db, false)
-        };
+            Self::open_local_at(&config.db_path, &runtime)
+        }?;
 
+        Ok(database)
+    }
+
+    /// Open `<path>` as a plain local database and run schema setup.
+    fn open_local_at(path: &Path, runtime: &Arc<tokio::runtime::Runtime>) -> Result<Self> {
+        let db = runtime.block_on(async { libsql::Builder::new_local(path).build().await })?;
+        Self::finish(db, runtime, false)
+    }
+
+    /// Connect to an opened libSQL database and bring it to the current
+    /// schema (WAL pragma, migrations, foreign keys). Shared by replica and
+    /// local-only paths.
+    fn finish(
+        db: LibsqlDatabase,
+        runtime: &Arc<tokio::runtime::Runtime>,
+        sync_enabled: bool,
+    ) -> Result<Self> {
         let db = Arc::new(db);
         let conn = runtime.block_on(async { db.connect() })?;
 
@@ -276,7 +342,7 @@ impl Database {
         Ok(Self {
             conn,
             db,
-            runtime,
+            runtime: runtime.clone(),
             sync_enabled,
         })
     }
@@ -467,6 +533,87 @@ pub fn write_turso_credentials(url: &str, token: &str) -> Result<()> {
     write_turso_credentials_at(&config_file_path(), url, token)
 }
 
+// ---------- plugin settings: local mirror ----------
+
+// Plugin settings created through the UI (declarative forms,
+// `cord.config.set`) live in the shared `settings` table — which syncs via
+// Turso. These helpers mirror them into `[plugins.<name>]` in the local
+// config.toml so a device's plugin configuration survives without the
+// remote and can be inspected/edited by hand. The database stays the
+// runtime source of truth; the file is a durable shadow copy.
+
+/// Read one plugin's mirrored settings from `path` (`[plugins.<name>]`).
+pub fn read_plugin_settings_at(
+    path: &Path,
+    plugin: &str,
+) -> std::collections::BTreeMap<String, String> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Default::default();
+    };
+    let Ok(parsed) = toml::from_str::<toml::Value>(&contents) else {
+        return Default::default();
+    };
+    parsed
+        .get("plugins")
+        .and_then(|p| p.get(plugin))
+        .and_then(|t| t.as_table())
+        .map(|table| {
+            table
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read one plugin's mirrored settings from the default config file.
+pub fn read_plugin_settings(plugin: &str) -> std::collections::BTreeMap<String, String> {
+    read_plugin_settings_at(&config_file_path(), plugin)
+}
+
+/// Mirror one plugin setting into `path` under `[plugins.<name>]`,
+/// preserving every other section.
+pub fn write_plugin_setting_at(path: &Path, plugin: &str, key: &str, value: &str) -> Result<()> {
+    let mut root = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
+        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+
+    let table = root
+        .as_table_mut()
+        .context("config.toml root is not a table")?;
+    let plugins = table
+        .entry("plugins")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("[plugins] section is not a table")?;
+    let entry = plugins
+        .entry(plugin.to_string())
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .with_context(|| format!("[plugins.{plugin}] section is not a table"))?;
+    entry.insert(
+        key.to_string(),
+        toml::Value::String(value.to_string()),
+    );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(
+        path,
+        toml::to_string_pretty(&root).context("serializing config.toml")?,
+    )
+    .with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+/// Mirror one plugin setting into the default config file.
+pub fn write_plugin_setting(plugin: &str, key: &str, value: &str) -> Result<()> {
+    write_plugin_setting_at(&config_file_path(), plugin, key, value)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +644,39 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(mode, "wal");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plugin_settings_mirror_round_trip_preserves_other_sections() {
+        let dir = std::env::temp_dir().join(format!("cordanui-sync-mirror-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "[turso]\nurl = \"libsql://x.turso.io\"\n\n[keybinds]\nleader = \"ctrl+a\"\n",
+        )
+        .unwrap();
+
+        write_plugin_setting_at(&path, "my-plugin", "api_key", "sk-test").unwrap();
+        write_plugin_setting_at(&path, "my-plugin", "model", "glm-5.2").unwrap();
+        // Second plugin doesn't clobber the first.
+        write_plugin_setting_at(&path, "other", "variant", "moon").unwrap();
+
+        let mine = read_plugin_settings_at(&path, "my-plugin");
+        assert_eq!(mine.get("api_key").map(String::as_str), Some("sk-test"));
+        assert_eq!(mine.get("model").map(String::as_str), Some("glm-5.2"));
+        assert_eq!(
+            read_plugin_settings_at(&path, "other")
+                .get("variant")
+                .map(String::as_str),
+            Some("moon")
+        );
+
+        // Existing sections survived.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("libsql://x.turso.io"), "{contents}");
+        assert!(contents.contains("ctrl+a"), "{contents}");
     }
 
     #[test]

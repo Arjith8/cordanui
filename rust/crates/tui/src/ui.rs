@@ -637,6 +637,8 @@ fn render_help_overlay(app: &App, frame: &mut Frame, c: &Palette) {
         Line::from(""),
     ];
 
+    // NOTE: `run_agent` is intentionally not listed — agent runs are a
+    // plugin-facilitated feature (see config.rs::entries).
     for entry in app.keybinds.entries() {
         let origin = if entry.is_default {
             "default"
@@ -649,7 +651,7 @@ fn render_help_overlay(app: &App, frame: &mut Frame, c: &Palette) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:<24}", entry.desc),
+                format!("{:<46}", entry.desc),
                 Style::default().fg(c.on_background),
             ),
             Span::styled(
@@ -670,8 +672,9 @@ fn render_help_overlay(app: &App, frame: &mut Frame, c: &Palette) {
             Style::default().fg(c.primary).add_modifier(Modifier::BOLD),
         )]),
         Line::from("    j / k, arrows   move selection"),
-        Line::from("    Esc             cancel leader / input"),
-        Line::from("    C-d / C-c       quit"),
+        Line::from("    <leader>q       quit"),
+        Line::from("    C-d / C-c       quit (always active)"),
+        Line::from("    Esc             cancel leader / clear message"),
         Line::from(""),
         Line::from(Span::styled(
             "  To rebind: edit [keybinds] in ~/.config/cordanui/config.toml",
@@ -1224,10 +1227,13 @@ fn render_plugin_help(app: &App, frame: &mut Frame) {
         )]),
         Line::from(""),
         Line::from("  ↑ / ↓, j / k     move selection"),
-        Line::from("    Enter / a      activate · deactivate plugin"),
+        Line::from("    Enter / a / ␣  activate · deactivate plugin"),
         Line::from("    d              uninstall (files + registry)"),
-        Line::from("    i              open the install input box"),
+        Line::from("    i / n          open the install input box"),
         Line::from("    Enter          install from the input"),
+        Line::from("    u              update all plugins (re-clone + build)"),
+        Line::from("    c              configure the selected plugin"),
+        Line::from("    s              start / stop the selected [service]"),
         Line::from("    ?              this help"),
         Line::from("    Esc            close"),
         Line::from(""),
