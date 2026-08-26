@@ -98,6 +98,19 @@ pub struct PluginCommand {
     pub desc: String,
 }
 
+/// One tab of the help page. Tab 0 is the built-in keybinds page
+/// (`plugin: None`); every active plugin that ships `[[help]]` manifest
+/// sections gets its own tab with the sections concatenated.
+#[derive(Debug, Clone)]
+pub struct HelpTab {
+    /// Short label shown in the tab bar.
+    pub title: String,
+    /// Owning plugin id; `None` = built-in keybinds tab.
+    pub plugin: Option<String>,
+    /// Body text (plugin tabs only; empty for built-in).
+    pub text: String,
+}
+
 /// Live replication state for the status bar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncStatus {
@@ -272,6 +285,13 @@ pub struct App {
     /// Every command exposed by loaded plugins (name + description +
     /// owning plugin), refreshed when states load.
     pub plugin_commands: Vec<PluginCommand>,
+    /// Tabs for the help page: built-in keybinds first, then one tab per
+    /// active plugin that ships `[[help]]` manifest sections.
+    pub help_tabs: Vec<HelpTab>,
+    /// Currently selected help tab.
+    pub help_selected: usize,
+    /// Scroll offset within the selected tab's content.
+    pub help_scroll: usize,
     /// In-flight plugin command result channel + guard.
     pub(crate) command_rx: Option<std::sync::mpsc::Receiver<PluginCommandOutcome>>,
     pub command_running: bool,
@@ -357,6 +377,9 @@ impl App {
             plugin_panel: None,
             plugin_states: std::sync::Mutex::new(HashMap::new()),
             plugin_commands: Vec::new(),
+            help_tabs: Vec::new(),
+            help_selected: 0,
+            help_scroll: 0,
             command_rx: None,
             command_running: false,
             sync_db: None,
@@ -1816,6 +1839,63 @@ impl App {
     /// Best-effort — never panics or fails.
     pub fn record_error(&mut self, context: &str, message: &str, detail: Option<&str>) {
         db::log_error(&self.db, context, message, detail);
+    }
+
+    /// Open the help page: rebuild the tab list (built-in keybinds first,
+    /// then one tab per active plugin with `[[help]]` manifest sections)
+    /// and select the built-in tab.
+    pub fn open_help(&mut self) {
+        let _ = self.reload_installed_plugins();
+
+        let mut tabs = vec![HelpTab {
+            title: "keybinds".into(),
+            plugin: None,
+            text: String::new(),
+        }];
+
+        for p in &self.installed_plugins {
+            if !p.active {
+                continue;
+            }
+            let dir = std::path::PathBuf::from(&p.dir);
+            let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
+                continue;
+            };
+            if manifest.help.is_empty() {
+                continue;
+            }
+            // Concatenate sections: heading, rule, wrapped body.
+            let mut text = String::new();
+            for s in &manifest.help {
+                text.push_str(&s.title);
+                text.push('\n');
+                text.push_str(&"-".repeat(s.title.len().min(60)));
+                text.push('\n');
+                text.push_str(s.text.trim());
+                text.push_str("\n\n");
+            }
+            tabs.push(HelpTab {
+                title: manifest.plugin.name.clone(),
+                plugin: Some(p.id.clone()),
+                text,
+            });
+        }
+
+        self.help_tabs = tabs;
+        self.help_selected = 0;
+        self.help_scroll = 0;
+        self.mode = Mode::Help;
+    }
+
+    /// Cycle the selected help tab (wraps around).
+    pub fn cycle_help_tab(&mut self, delta: i32) {
+        if self.help_tabs.is_empty() {
+            return;
+        }
+        let n = self.help_tabs.len() as i32;
+        let next = (self.help_selected as i32 + delta).rem_euclid(n);
+        self.help_selected = next as usize;
+        self.help_scroll = 0;
     }
 
     /// Commit any pending style changes and re-resolve the palette if

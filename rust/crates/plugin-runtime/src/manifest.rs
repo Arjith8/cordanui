@@ -36,6 +36,40 @@ pub struct PluginManifest {
     /// subprocess invocation as the request's `config` object.
     #[serde(default, flatten)]
     pub ui: Option<UiSpec>,
+    /// Plugin-authored help, shown as a dedicated tab on the host's help
+    /// page. Authored as `[[help]]` entries at the manifest root:
+    ///
+    /// ```toml
+    /// [[help]]
+    /// title = "Getting started"
+    /// text = """
+    /// Press <leader>; to run commands...
+    /// """
+    /// ```
+    #[serde(default)]
+    pub help: Vec<HelpSection>,
+}
+
+/// One `[[help]]` entry: a titled block of free-form text rendered on the
+/// plugin's help-page tab.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HelpSection {
+    /// Tab-section heading shown above the text.
+    pub title: String,
+    /// Free-form body. Long lines are wrapped by the host.
+    #[serde(default)]
+    pub text: String,
+}
+
+impl HelpSection {
+    /// Human-readable problems; empty = valid.
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        if self.title.trim().is_empty() {
+            problems.push("[[help]] entry with empty title".into());
+        }
+        problems
+    }
 }
 
 /// A declarative settings form: `[[field]]` entries in `cordanui.toml`.
@@ -285,6 +319,14 @@ impl PluginManifest {
             if !ui.fields.is_empty() {
                 problems.extend(ui.validate());
             }
+        }
+        for section in &self.help {
+            problems.extend(
+                section
+                    .validate()
+                    .into_iter()
+                    .map(|p| format!("help: {p}")),
+            );
         }
         problems
     }
@@ -561,5 +603,47 @@ type = "select"
         let ui = bad.ui.unwrap();
         let problems = ui.validate();
         assert_eq!(problems.len(), 3); // duplicate, unknown type, select w/o options
+    }
+
+    #[test]
+    fn parse_help_sections() {
+        let toml = r#"
+[plugin]
+name = "errors-view"
+version = "0.1.0"
+
+[[help]]
+title = "Getting started"
+text = """
+Run `errors.show` from the command line.
+New entries appear live.
+"""
+
+[[help]]
+title = "Keys"
+text = "j/k move · x clear · q quit"
+
+[[help]]
+title = ""
+text = "bad — empty title"
+"#;
+        let m = PluginManifest::from_str(toml).unwrap();
+        assert_eq!(m.help.len(), 3);
+        assert_eq!(m.help[0].title, "Getting started");
+        assert!(m.help[0].text.contains("command line"));
+        assert_eq!(m.help[1].title, "Keys");
+
+        let problems: Vec<String> = m.help.iter().flat_map(|s| s.validate()).collect();
+        assert_eq!(problems.len(), 1);
+        assert!(m.validate().iter().any(|p| p.contains("help:")));
+    }
+
+    #[test]
+    fn help_is_optional() {
+        let m = PluginManifest::from_str(
+            "[plugin]\nname = \"x\"\nversion = \"0.1\"\n",
+        )
+        .unwrap();
+        assert!(m.help.is_empty());
     }
 }

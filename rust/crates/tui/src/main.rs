@@ -185,7 +185,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
                 app.start_add_goal(parent_id);
             }
             _ if binds.show_details.matches(key) => app.toggle_details(),
-            _ if binds.help.matches(key) => app.mode = Mode::Help,
+            _ if binds.help.matches(key) => app.open_help(),
             _ if binds.plugins.matches(key) => app.open_plugin_manager()?,
             _ if binds.run_agent.matches(key) => {
                 if let Some(row) = app.selected_row() {
@@ -423,6 +423,18 @@ fn handle_help_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter => {
             app.mode = Mode::Normal;
+        }
+        // Tab switching: arrows, h/l, and Tab/BackTab.
+        KeyCode::Left | KeyCode::Char('h') => app.cycle_help_tab(-1),
+        KeyCode::Right | KeyCode::Char('l') => app.cycle_help_tab(1),
+        KeyCode::Tab => app.cycle_help_tab(1),
+        KeyCode::BackTab => app.cycle_help_tab(-1),
+        // Content scrolling.
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.help_scroll = app.help_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.help_scroll = app.help_scroll.saturating_add(1);
         }
         _ => {}
     }

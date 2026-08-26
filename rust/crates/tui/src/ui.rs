@@ -572,7 +572,14 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::EditTitle { .. } => "Enter to save · Esc to cancel".into(),
         Mode::EditDescription { .. } => "Enter to save · Esc to cancel".into(),
         Mode::ConfirmDelete { .. } => "y to confirm · n/Esc to cancel".into(),
-        Mode::Help => "Esc/q to close help".into(),
+        Mode::Help => {
+            let tabs = if app.help_tabs.len() > 1 {
+                " · ←/→ tab · j/k scroll"
+            } else {
+                " · j/k scroll"
+            };
+            format!("Esc/q to close{tabs}")
+        }
         Mode::PluginManager {
             pane: PluginPane::Install,
         } => "GitHub link / owner/repo / terms · Enter install · Esc back".into(),
@@ -619,32 +626,104 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
 
 fn render_help_overlay(app: &App, frame: &mut Frame, c: &Palette) {
     let area = centered_rect(70, 70, frame.area());
+    let tab_hint = if app.help_tabs.len() > 1 {
+        " \u{2190}/\u{2192} switch tab"
+    } else {
+        ""
+    };
     let block = Block::default()
-        .title(" Help — [keybinds] from ~/.config/cordanui/config.toml ")
+        .title(format!(
+            " Help{} \u{2014} [keybinds] from ~/.config/cordanui/config.toml ",
+            tab_hint
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(c.primary));
 
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "  Configured keybinds",
-            Style::default().fg(c.primary).add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(Span::styled(
-            "  (values marked ·default· come from the built-ins, others were set in config.toml)",
-            Style::default().fg(c.outline_variant),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = vec![Line::from("")];
 
-    // NOTE: `run_agent` is intentionally not listed — agent runs are a
-    // plugin-facilitated feature (see config.rs::entries).
+    // --- tab bar ---
+    {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, tab) in app.help_tabs.iter().enumerate() {
+            if i == app.help_selected {
+                spans.push(Span::styled(
+                    format!("[ {} ]", tab.title),
+                    Style::default().fg(c.primary).add_modifier(Modifier::BOLD),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("  {}  ", tab.title),
+                    Style::default().fg(c.outline_variant),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::from(""));
+    }
+
+    // --- active tab content ---
+    match app.help_tabs.get(app.help_selected).map(|t| t.plugin.as_deref()) {
+        Some(None) | None => render_help_keybinds_tab(app, c, &mut lines),
+        Some(Some(_)) => {
+            if let Some(tab) = app.help_tabs.get(app.help_selected) {
+                let raw: Vec<&str> = tab.text.lines().collect();
+                for (i, line) in raw.iter().enumerate() {
+                    let next_is_rule = raw
+                        .get(i + 1)
+                        .map(|n| !n.is_empty() && n.chars().all(|ch| ch == '-'))
+                        .unwrap_or(false);
+                    if !line.is_empty() && next_is_rule {
+                        // Section heading (the rule line under it is skipped).
+                        lines.push(Line::from(Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(c.primary).add_modifier(Modifier::BOLD),
+                        )));
+                    } else if !line.is_empty() && line.chars().all(|ch| ch == '-') {
+                        continue;
+                    } else if line.is_empty() {
+                        lines.push(Line::from(""));
+                    } else {
+                        lines.push(Line::from(Span::styled(
+                            format!("  {line}"),
+                            Style::default().fg(c.on_background),
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  To rebind: edit [keybinds] in ~/.config/cordanui/config.toml",
+        Style::default().fg(c.outline_variant),
+    )));
+
+    let paragraph = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().fg(c.on_background))
+        .scroll((app.help_scroll as u16, 0))
+        .wrap(Wrap { trim: false });
+    frame.render_widget(&paragraph, area);
+}
+
+/// The built-in "keybinds" tab content: configured bindings + fixed keys.
+/// (The `run_agent` binding is intentionally absent — agent runs are a
+/// plugin-facilitated feature; see config.rs::entries.)
+fn render_help_keybinds_tab(app: &App, c: &Palette, lines: &mut Vec<Line>) {
+    lines.push(Line::from(vec![Span::styled(
+        "  Configured keybinds",
+        Style::default().fg(c.primary).add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(Span::styled(
+        "  (values marked \u{b7}default\u{b7} come from the built-ins, others were set in config.toml)",
+        Style::default().fg(c.outline_variant),
+    )));
+    lines.push(Line::from(""));
+
     for entry in app.keybinds.entries() {
-        let origin = if entry.is_default {
-            "default"
-        } else {
-            "custom"
-        };
+        let origin = if entry.is_default { "default" } else { "custom" };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("    {:<14}", entry.binding.label()),
@@ -675,20 +754,8 @@ fn render_help_overlay(app: &App, frame: &mut Frame, c: &Palette) {
         Line::from("    <leader>q       quit"),
         Line::from("    C-d / C-c       quit (always active)"),
         Line::from("    Esc             cancel leader / clear message"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  To rebind: edit [keybinds] in ~/.config/cordanui/config.toml",
-            Style::default().fg(c.outline_variant),
-        )),
     ]);
-
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .style(Style::default().fg(c.on_background))
-        .wrap(Wrap { trim: false });
-    frame.render_widget(&paragraph, area);
 }
-
 fn render_delete_confirm(frame: &mut Frame, goal_id: &str, c: &Palette) {
     let area = centered_rect(50, 25, frame.area());
     frame.render_widget(Clear, area);
