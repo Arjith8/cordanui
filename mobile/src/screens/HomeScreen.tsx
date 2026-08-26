@@ -301,8 +301,10 @@ export default function HomeScreen() {
           onPress={() => setShowErrors(true)}
           hitSlop={8}
           style={[styles.profileBtn, { backgroundColor: colors.surface }]}
+          accessibilityRole="button"
+          accessibilityLabel="Open profile, sync and settings"
         >
-          <Text style={[styles.profileIcon, { color: colors.tertiary }]}>◉</Text>
+          <Text style={[styles.profileIcon, { color: colors.primary }]}>⚙</Text>
         </Pressable>
       </View>
 

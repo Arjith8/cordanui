@@ -142,16 +142,7 @@ const MIGRATIONS: Migration[] = [
     // Tables are created by SCHEMA_SQL on fresh installs; this seeds the
     // builtin themes and is guarded for every other case.
     up: async (database) => {
-      await database.runAsync(
-        `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
-         VALUES (?, ?, 'builtin', 1, ?)`,
-        ['builtin-dark', 'Cordanui Dark', JSON.stringify(DARK_THEME_COLORS)],
-      );
-      await database.runAsync(
-        `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
-         VALUES (?, ?, 'builtin', 0, ?)`,
-        ['builtin-light', 'Cordanui Light', JSON.stringify(LIGHT_THEME_COLORS)],
-      );
+      await seedBuiltinThemes(database);
     },
   },
   {
@@ -162,6 +153,7 @@ const MIGRATIONS: Migration[] = [
     // two builtin rows so fresh and migrated installs agree; plugin themes
     // keep their stored JSON and are aliased on read by themeColorsOf().
     up: async (database) => {
+      // UPDATE instead of seed: migrated installs already have the rows.
       await database.runAsync(
         `UPDATE themes SET colors_json = ?
          WHERE id = 'builtin-dark' AND source = 'builtin'`,
@@ -172,9 +164,31 @@ const MIGRATIONS: Migration[] = [
          WHERE id = 'builtin-light' AND source = 'builtin'`,
         [JSON.stringify(LIGHT_THEME_COLORS)],
       );
+      // Cover purged databases too: schema_migrations says v2/v3 applied,
+      // so without this INSERT the builtin rows would never come back.
+      await seedBuiltinThemes(database);
     },
   },
 ];
+
+/**
+ * (Re-)insert the two builtin theme rows. Idempotent (INSERT OR IGNORE).
+ * Called by migration v2 AND by purgeAllData — wiping the themes table
+ * must restore these, because schema_migrations still records v2 as
+ * applied and that seeding migration will never run again on its own.
+ */
+async function seedBuiltinThemes(database: SQLite.SQLiteDatabase): Promise<void> {
+  await database.runAsync(
+    `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
+     VALUES (?, ?, 'builtin', 1, ?)`,
+    ['builtin-dark', 'Cordanui Dark', JSON.stringify(DARK_THEME_COLORS)],
+  );
+  await database.runAsync(
+    `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
+     VALUES (?, ?, 'builtin', 0, ?)`,
+    ['builtin-light', 'Cordanui Light', JSON.stringify(LIGHT_THEME_COLORS)],
+  );
+}
 
 /**
  * Compares the applied versions in `schema_migrations` against
@@ -201,6 +215,11 @@ async function migrate(database: SQLite.SQLiteDatabase): Promise<void> {
       [migration.version, migration.name, now()],
     );
   }
+
+  // Self-heal: databases purged before this seeding fix lost the builtin
+  // rows while schema_migrations still says "applied". INSERT OR IGNORE,
+  // so this is free when they are present.
+  await seedBuiltinThemes(database);
 
   await verifySchema(database);
 }
@@ -318,6 +337,9 @@ export async function purgeAllData(): Promise<void> {
       "DELETE FROM settings WHERE key NOT IN ('turso_url', 'turso_token') AND key NOT LIKE 'sync.%'",
     );
     await db.runAsync('DELETE FROM errors_mobile');
+    // Restore the builtin theme rows: schema_migrations still records
+    // v2/v3 as applied, so their seeding migrations will never re-run.
+    await seedBuiltinThemes(db);
     await db.execAsync('COMMIT');
   } catch (e) {
     await db.execAsync('ROLLBACK');
