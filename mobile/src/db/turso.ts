@@ -18,6 +18,7 @@
  */
 
 import { getDb } from '@/db/goalsDb';
+import { logError } from '@/db/errorsDb';
 
 export interface TursoCreds {
   url: string;
@@ -186,16 +187,16 @@ const GOAL_COLS =
 
 /** Pull remote goals + settings + themes, push dirty local goals. */
 export async function syncNow(): Promise<SyncOutcome> {
-  const creds = await getTursoCreds();
-  if (!creds) {
-    return { ok: false, message: 'not configured', pulledGoals: 0, pushedGoals: 0 };
-  }
-
-  const db = await getDb();
   let pulledGoals = 0;
   let pushedGoals = 0;
 
   try {
+    const creds = await getTursoCreds();
+    if (!creds) {
+      return { ok: false, message: 'not configured', pulledGoals, pushedGoals };
+    }
+
+    const db = await getDb();
     // --- goals: pull everything and merge LWW by updated_at ---
     const lastPull = (await getMeta(LAST_PULL_KEY)) ?? '';
     const results = await pipeline(creds, [
@@ -311,9 +312,13 @@ export async function syncNow(): Promise<SyncOutcome> {
       );
     }
   } catch (e) {
+    // Every sync failure is recorded in the on-device error log so it
+    // shows up on the profile page. logError never throws.
+    const message = e instanceof Error ? e.message : String(e);
+    await logError('sync', `sync failed: ${message}`);
     return {
       ok: false,
-      message: e instanceof Error ? e.message : String(e),
+      message,
       pulledGoals,
       pushedGoals,
     };

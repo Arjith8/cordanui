@@ -328,8 +328,10 @@ export async function deleteSheet(id: string): Promise<void> {
  */
 export async function purgeAllData(): Promise<void> {
   const db = await getDb();
-  await db.execAsync('BEGIN');
-  try {
+  // withTransactionAsync (NOT manual BEGIN/COMMIT): awaited statements in
+  // between let unrelated queries interleave into the open transaction,
+  // which wedges the connection and surfaces as native-call rejections.
+  await db.withTransactionAsync(async () => {
     await db.runAsync('DELETE FROM goals');
     await db.runAsync('DELETE FROM goal_sheets');
     await db.runAsync('DELETE FROM themes');
@@ -340,11 +342,7 @@ export async function purgeAllData(): Promise<void> {
     // Restore the builtin theme rows: schema_migrations still records
     // v2/v3 as applied, so their seeding migrations will never re-run.
     await seedBuiltinThemes(db);
-    await db.execAsync('COMMIT');
-  } catch (e) {
-    await db.execAsync('ROLLBACK');
-    throw e;
-  }
+  });
 }
 
 // ---------- goals ----------
