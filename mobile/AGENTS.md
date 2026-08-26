@@ -806,3 +806,42 @@ Contract:
   else is ignored. Errors surface as `✖ <message>` on the status line.
 - **Capabilities**: set `command = true` under `[capabilities]` if your
   plugin exists primarily to provide commands.
+
+---
+
+## 15. Help page tabs (`[[help]]`) — your plugin on the host help screen
+
+The host's help page (`<leader>h`) has a tab bar: a built-in *keybinds*
+tab plus **one tab per active plugin that declares `[[help]]` entries** in
+its `cordanui.toml`. Users cycle tabs with `←/→` (or `Tab`/`BackTab`) and
+scroll content with `j/k`.
+
+```toml
+[[help]]
+title = "Getting started"
+text = """
+Run `errors.show` from the command line (<leader>;).
+New log entries appear live while the panel is open.
+"""
+
+[[help]]
+title = "Keys"
+text = "j/k move · x clear all · r refresh · q quit"
+```
+
+Contract:
+
+- `title` (required) — heading shown above the text block; must be
+  non-empty. Also used as section separators if you declare several.
+- `text` (optional) — free-form body. Multi-line strings (`"""…"""`) work;
+  long lines are wrapped by the host at render time.
+- Declare as many `[[help]]` entries as you like; they render in order,
+  each under its own styled title, inside your single plugin tab named
+  after `[plugin].name`.
+- No code involved: this is pure manifest data — binary and Lua plugins
+  alike can ship it.
+- Validation: an empty `title` is reported as a manifest problem on
+  install; missing `text` renders just the heading.
+
+Keep it short and task-oriented: keybinds, usage steps, one-line
+troubleshooting. The help overlay is small — walls of text will scroll.
