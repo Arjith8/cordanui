@@ -5,21 +5,26 @@
  * `EXPO_PUBLIC_`. Set these in `.env` or in your environment:
  *
  *   EXPO_PUBLIC_TURSO_URL=libsql://your-db.turso.io
- *   EXPO_PUBLIC_TURSO_TOKEN=your-auth-token
- *   EXPO_PUBLIC_AGENT_URL=http://192.168.1.100:3000
- *   EXPO_PUBLIC_AGENT_TOKEN=your-agent-auth-token
+ *   EXPO_PUBLIC_TURSO_TOKEN=[redacted]
  *
  * If TURSO_URL / TURSO_TOKEN are not set, the app runs in local-only
- * mode (no sync). If AGENT_URL is not set, agent triggers are hidden.
+ * mode (no sync).
+ *
+ * Agent capability is discovered at runtime: the TUI writes `agent.url`
+ * to the synced settings table when it has an active provider plugin.
+ * Mobile reads that setting to show/hide the "assign to agent" UI. An
+ * EXPO_PUBLIC_AGENT_URL env var is still supported as a fallback for
+ * users who configure the backend directly.
  */
 
 export interface AppConfig {
   tursoUrl: string | null;
   tursoToken: string | null;
+  /** Agent backend URL from env var (fallback). The primary source is
+   * the synced `agent.url` setting written by the TUI. */
   agentUrl: string | null;
   agentToken: string | null;
   syncEnabled: boolean;
-  agentEnabled: boolean;
 }
 
 export function loadConfig(): AppConfig {
@@ -34,7 +39,6 @@ export function loadConfig(): AppConfig {
     agentUrl,
     agentToken,
     syncEnabled: tursoUrl !== null && tursoToken !== null,
-    agentEnabled: agentUrl !== null,
   };
 }
 

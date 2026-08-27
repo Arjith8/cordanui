@@ -251,7 +251,7 @@ impl Theme {
             SEED_BUILTINS_SQL,
             vec![
                 Value::from(BUILTIN_DARK_ID),
-                Value::from("Cordanui Dark"),
+                Value::Text("Cordanui Dark".to_string()),
                 Value::from(dark_seed_json()),
             ],
         )?;
@@ -259,7 +259,7 @@ impl Theme {
             SEED_BUILTINS_SQL,
             vec![
                 Value::from(BUILTIN_LIGHT_ID),
-                Value::from("Cordanui Light"),
+                Value::Text("Cordanui Light".to_string()),
                 Value::from(light_seed_json()),
             ],
         )?;

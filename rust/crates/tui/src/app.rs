@@ -114,7 +114,7 @@ pub struct HelpTab {
     pub text: String,
 }
 
-/// Live replication state for the status bar.
+/// Live sync state for the status bar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncStatus {
     /// No Turso credentials configured.
@@ -136,7 +136,7 @@ impl Default for SyncStatus {
     }
 }
 
-/// How often the replica syncs (when credentials are configured).
+/// How often the push/pull sync runs (when credentials are configured).
 pub const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Human delta for the status bar ("just now", "4m ago", "2h ago").
@@ -1323,6 +1323,53 @@ impl App {
         Ok(())
     }
 
+    /// Announce agent capability to other clients (mobile) by writing or
+    /// clearing `agent.url` in the synced `settings` table.
+    ///
+    /// When the TUI has at least one active provider plugin with a built
+    /// binary (or a Lua provider), it writes a non-empty `agent.url` so
+    /// mobile shows the "assign to agent" UI. When no provider is available,
+    /// it writes an empty string to hide the UI on other clients.
+    ///
+    /// The URL itself is the agent backend's wake endpoint — read from the
+    /// `agent.url` config key if set, else a sensible default. Mobile reads
+    /// this synced setting to decide whether to show agent triggers.
+    pub fn announce_agent_capability(&mut self) -> anyhow::Result<()> {
+        let has_provider = self.installed_plugins.iter().any(|p| {
+            if !p.active {
+                return false;
+            }
+            let dir = std::path::PathBuf::from(&p.dir);
+            let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
+                return false;
+            };
+            if !manifest.capabilities.provider {
+                return false;
+            }
+            // Lua plugins are always "built" (no build step). Binary plugins
+            // need the compiled binary to exist.
+            if manifest.is_lua() {
+                return true;
+            }
+            manifest.binary_path(&dir).exists()
+        });
+
+        let url = if has_provider {
+            // The agent backend URL. Read from settings if a user has
+            // configured it, else use the default. This is the wake-and-point
+            // endpoint that mobile POSTs to when assigning a task.
+            match db::get_setting(&self.db, "agent.url") {
+                Some(u) if !u.is_empty() => u,
+                _ => "http://localhost:8081".to_string(),
+            }
+        } else {
+            String::new()
+        };
+
+        db::set_setting(&self.db, "agent.url", &url)?;
+        Ok(())
+    }
+
     /// Activate/deactivate the selected plugin. Activating a theme-capable
     /// plugin applies its first theme pack live; deactivating reverts to
     /// builtin dark.
@@ -1374,7 +1421,10 @@ impl App {
         }
 
         self.set_message(&msg);
-        self.reload_installed_plugins()
+        self.reload_installed_plugins()?;
+        // Re-announce: activating/deactivating a provider changes whether
+        // mobile should show the agent UI.
+        self.announce_agent_capability()
     }
 
     /// Uninstall the selected plugin: delete files + registry row.
@@ -1388,7 +1438,8 @@ impl App {
         }
         db::remove_plugin_row(&self.db, &p.id)?;
         self.set_message("plugin uninstalled");
-        self.reload_installed_plugins()
+        self.reload_installed_plugins()?;
+        self.announce_agent_capability()
     }
 
     /// Dispatch a plugin task for whatever is in the input buffer:
@@ -1795,9 +1846,9 @@ impl App {
         }
     }
 
-    /// Give the sync worker its own replica handle (same local file).
-    /// Call at startup when credentials are configured; the first sync
-    /// fires on the next loop iteration (startup pull).
+    /// Give the sync worker its own DB handle (same local file, separate
+    /// connection). Call at startup when credentials are configured; the
+    /// first sync fires on the next loop iteration (startup pull).
     pub fn attach_sync_db(&mut self, db: Database) {
         self.sync_db = Some(std::sync::Arc::new(std::sync::Mutex::new(db)));
         self.sync_status = SyncStatus::Syncing;
@@ -1807,16 +1858,15 @@ impl App {
     /// Manual sync (`<leader>s`): due immediately on the next frame.
     pub fn request_sync(&mut self) {
         if self.sync_db.is_none() {
-            // Usually means the DB opened degraded (Turso unreachable at
-            // startup) or no credentials are configured. Surface it in the
-            // errors view too — a transient status line is easy to miss.
+            // No credentials configured — sync is not active. Surface it in
+            // the errors view too — a transient status line is easy to miss.
             db::log_error(
                 &self.db,
                 "sync",
                 "sync requested but sync is not active",
-                Some("no credentials configured, or Turso was unreachable when the app started (degraded local-only mode)"),
+                Some("no [turso] credentials configured — add them in the global settings page to enable sync"),
             );
-            self.set_message("sync is not active — failure logged (restart after fixing [turso] to re-enable)");
+            self.set_message("sync is not active — set [turso] credentials to enable");
             return;
         }
         // Due immediately — even if a sync is currently running, the next
@@ -1829,7 +1879,7 @@ impl App {
         self.set_message("syncing…");
     }
 
-    /// Fire the periodic replica sync when due and drain finished syncs.
+    /// Fire the periodic push/pull sync when due and drain finished syncs.
     /// Called every loop iteration. The worker runs on its own thread —
     /// sync is network I/O and must never block the UI.
     pub fn poll_sync(&mut self) {
@@ -1843,7 +1893,7 @@ impl App {
                     self.sync_rx = None;
                 }
                 Ok(Err(e)) => {
-                    self.record_error("sync", "replica sync failed", Some(&e));
+                    self.record_error("sync", "sync failed", Some(&e));
                     self.sync_status = SyncStatus::Failed {
                         at: std::time::Instant::now(),
                         error: e,

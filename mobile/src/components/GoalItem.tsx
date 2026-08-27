@@ -7,6 +7,7 @@ import { statusColor } from '@/theme/types';
 import type { Goal, GoalStatus } from '@/types/goal';
 import { orderGoals } from '@/utils/order';
 
+import AgentStatusBadge from '@/components/AgentStatusBadge';
 import EditableText from '@/components/EditableText';
 import InlineAddInput from '@/components/InlineAddInput';
 import StatusCircle from '@/components/StatusCircle';
@@ -213,6 +214,11 @@ export default function GoalItem({
                   <Text style={{ color: colors.error, fontSize: 15 }}>🗑</Text>
                 </Pressable>
               </View>
+
+              {/* Agent status badge — only for goals in agent_mode. */}
+              {goal.status === 'agent_mode' ? (
+                <AgentStatusBadge goal={goal} />
+              ) : null}
             </View>
           </View>
 

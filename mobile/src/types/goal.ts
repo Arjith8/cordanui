@@ -24,6 +24,7 @@ export interface Goal {
   agent_result: string | null;
   agent_progress: string | null;
   metadata: string | null; // JSON string
+  deleted_at: string | null; // soft-delete tombstone (sync); NULL = active
 }
 
 export interface GoalSheet {

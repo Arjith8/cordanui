@@ -1,8 +1,9 @@
-import { useState } from 'react';
-import { Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { useEffect, useState } from 'react';
+import { Alert, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { useTheme } from '@/theme/ThemeProvider';
 import type { Goal } from '@/types/goal';
+import { assignToAgent, getAgentUrl, isAgentAvailable } from '@/db/agentDb';
 
 export interface GoalEditModalProps {
   goal: Goal | null;
@@ -10,6 +11,8 @@ export interface GoalEditModalProps {
   onClose: () => void;
   onSave: (id: string, title: string, description: string) => void;
   onDelete: (id: string) => void;
+  /** Called after a goal is assigned to the agent (to trigger a refresh). */
+  onAgentAssigned?: (id: string) => void;
 }
 
 export default function GoalEditModal({
@@ -18,10 +21,12 @@ export default function GoalEditModal({
   onClose,
   onSave,
   onDelete,
+  onAgentAssigned,
 }: GoalEditModalProps) {
   const { colors } = useTheme();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  const [agentAvailable, setAgentAvailable] = useState(false);
 
   // Reset local state whenever a new goal is opened.
   const [lastId, setLastId] = useState<string | null>(null);
@@ -31,10 +36,35 @@ export default function GoalEditModal({
     setDescription(goal.description ?? '');
   }
 
+  // Check agent availability when the modal opens for a new goal.
+  useEffect(() => {
+    if (visible && goal) {
+      isAgentAvailable().then(setAgentAvailable);
+    }
+  }, [visible, goal]);
+
   // No goal selected — render an inert modal shell.
   if (!goal) {
     return <Modal visible={false} animationType="slide" transparent onRequestClose={onClose} />;
   }
+
+  const handleAssign = () => {
+    Alert.alert(
+      'Assign to agent',
+      'The agent backend will process this goal and write the result back. You can track progress here.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Assign',
+          onPress: async () => {
+            await assignToAgent(goal.id);
+            onAgentAssigned?.(goal.id);
+            onClose();
+          },
+        },
+      ],
+    );
+  };
 
   return (
     <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -66,6 +96,37 @@ export default function GoalEditModal({
             multiline
             numberOfLines={4}
           />
+
+          {agentAvailable && goal.status !== 'agent_mode' ? (
+            <Pressable
+              style={[styles.agentBtn, { backgroundColor: colors.tertiary }]}
+              onPress={handleAssign}
+            >
+              <Text style={[styles.agentBtnText, { color: colors.onTertiary }]}>
+                ⤴ Assign to agent
+              </Text>
+            </Pressable>
+          ) : null}
+
+          {goal.status === 'agent_mode' ? (
+            <View style={[styles.agentStatus, { backgroundColor: colors.surfaceVariant }]}>
+              <Text style={[styles.agentStatusText, { color: colors.tertiary }]}>
+                ⤴ Agent {goal.agent_status ?? 'queued'}
+              </Text>
+              {goal.agent_result ? (
+                <Text style={[styles.agentResult, { color: colors.onSurfaceVariant }]}>
+                  {(() => {
+                    try {
+                      const r = JSON.parse(goal.agent_result);
+                      return typeof r === 'string' ? r : r.content ?? JSON.stringify(r);
+                    } catch {
+                      return goal.agent_result;
+                    }
+                  })()}
+                </Text>
+              ) : null}
+            </View>
+          ) : null}
 
           <View style={styles.actions}>
             <Pressable style={styles.deleteBtn} onPress={() => onDelete(goal.id)}>
@@ -121,6 +182,31 @@ const styles = StyleSheet.create({
   multiline: {
     minHeight: 96,
     textAlignVertical: 'top',
+  },
+  agentBtn: {
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  agentBtnText: {
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  agentStatus: {
+    borderRadius: 8,
+    padding: 12,
+    marginTop: 16,
+  },
+  agentStatusText: {
+    fontSize: 14,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  agentResult: {
+    fontSize: 13,
+    lineHeight: 18,
   },
   actions: {
     flexDirection: 'row',

@@ -68,8 +68,8 @@ export async function getThemeState(scheme: 'light' | 'dark'): Promise<{
   if (!active) {
     // System mode (or the explicit selection vanished): match builtin to OS.
     const row = await db.getFirstAsync<ThemeRecord>(
-      "SELECT * FROM themes WHERE source = 'builtin' AND is_dark = ? LIMIT 1",
-      [scheme === 'dark' ? 1 : 0],
+      "SELECT * FROM themes WHERE source = 'builtin' AND id = ? LIMIT 1",
+      [scheme === 'dark' ? 'builtin-dark' : 'builtin-light'],
     );
     if (!row) throw new Error('theme-system: builtin themes missing — migration did not run');
     active = row;
@@ -103,20 +103,18 @@ export async function upsertTheme(input: {
   id?: string;
   name: string;
   source: 'builtin' | 'plugin';
-  isDark: boolean;
   colorsJson: string;
 }): Promise<string> {
   const db = await getDb();
   const id = input.id ?? Crypto.randomUUID();
   await db.runAsync(
-    `INSERT INTO themes (id, name, source, is_dark, colors_json)
-     VALUES (?, ?, ?, ?, ?)
+    `INSERT INTO themes (id, name, source, colors_json)
+     VALUES (?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        name = excluded.name,
        source = excluded.source,
-       is_dark = excluded.is_dark,
        colors_json = excluded.colors_json`,
-    [id, input.name, input.source, input.isDark ? 1 : 0, input.colorsJson],
+    [id, input.name, input.source, input.colorsJson],
   );
   return id;
 }

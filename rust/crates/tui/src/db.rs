@@ -1,30 +1,32 @@
 //! Database access layer for the TUI.
 //!
-//! Uses `cordanui_sync::Database` (libSQL) — local-first with optional
-//! Turso embedded replica sync. Same schema, same queries as before, just
-//! backed by libSQL instead of rusqlite.
+//! Uses `cordanui_sync::Database` (rusqlite, bundled SQLite) — local-first,
+//! synchronous, no async runtime. When `~/.config/cordanui/config.toml`
+//! contains a `[turso]` section, sync is enabled: writes mark rows dirty in
+//! the device-local `_outbox`, and a background worker pushes/pulls over the
+//! same Hrana-over-HTTP protocol mobile uses. Otherwise it's local-only.
 //!
-//! When `~/.config/cordanui/config.toml` contains a `[turso]` section, the
-//! database opens as an embedded replica and syncs to Turso. Otherwise it's
-//! local-only.
+//! Deletes are soft (`deleted_at` tombstone) so they propagate to other
+//! clients via sync. All read paths filter `deleted_at IS NULL`.
 
 use cordanui_schema::{AgentStatus, CreateGoalInput, Goal, GoalStatus, UpdateGoalInput};
 use cordanui_sync::{Database, SyncConfig, Value};
 
 /// Open the database. If a Turso config exists at
-/// `~/.config/cordanui/config.toml`, opens as an embedded replica.
-/// Otherwise opens local-only.
+/// `~/.config/cordanui/config.toml`, sync is enabled (push/pull over
+/// Hrana-over-HTTP). Otherwise opens local-only. Never touches the network.
 pub fn open() -> anyhow::Result<Database> {
     let config = SyncConfig::load()?;
     Database::open(&config)
 }
 
-/// Whether sync (embedded replica) is enabled.
+/// Whether sync (push/pull over Hrana) is enabled.
 pub fn is_sync_enabled(db: &Database) -> bool {
     db.is_sync_enabled()
 }
 
-/// Trigger a manual sync. No-op if sync is not enabled.
+/// Trigger a manual sync (push outbox + pull remote). No-op if sync is not
+/// enabled. Network failures propagate; local data is never affected.
 pub fn sync(db: &Database) -> anyhow::Result<()> {
     db.sync()
 }
@@ -35,19 +37,19 @@ const SELECT_COLS: &str = "id, title, description, status, parent_id, sort_order
      created_at, updated_at, completed_at, agent_status, agent_result, \
      agent_progress, metadata";
 
-/// Fetch all goals, ordered: roots first, then children grouped by parent,
-/// each bucket sorted by `sort_order` then `created_at`.
+/// Fetch all (non-deleted) goals, ordered: roots first, then children grouped
+/// by parent, each bucket sorted by `sort_order` then `created_at`.
 pub fn get_all(db: &Database) -> anyhow::Result<Vec<Goal>> {
     let result = db.query_simple(
-        &format!("SELECT {SELECT_COLS} FROM goals ORDER BY parent_id IS NOT NULL, parent_id, sort_order, created_at"),
+        &format!("SELECT {SELECT_COLS} FROM goals WHERE deleted_at IS NULL ORDER BY parent_id IS NOT NULL, parent_id, sort_order, created_at"),
     )?;
     Ok(result.rows().iter().map(values_to_goal).collect())
 }
 
-/// Fetch a single goal by ID. Returns `None` if not found.
+/// Fetch a single (non-deleted) goal by ID. Returns `None` if not found.
 pub fn get(db: &Database, id: &str) -> anyhow::Result<Option<Goal>> {
     let result = db.query_first(
-        &format!("SELECT {SELECT_COLS} FROM goals WHERE id = ?"),
+        &format!("SELECT {SELECT_COLS} FROM goals WHERE id = ? AND deleted_at IS NULL"),
         vec![Value::from(id)],
     )?;
     Ok(result.map(|row| values_to_goal(&row)))
@@ -84,6 +86,7 @@ pub fn create(db: &Database, input: CreateGoalInput) -> anyhow::Result<Goal> {
             Value::from(ts),
         ],
     )?;
+    db.mark_dirty("goals", &id)?;
     get(db, &id)?.ok_or_else(|| anyhow::anyhow!("create: insert returned no row"))
 }
 
@@ -107,7 +110,7 @@ pub fn update(db: &Database, id: &str, input: UpdateGoalInput) -> anyhow::Result
     }
     if let Some(status) = input.status {
         fields.push("status = ?");
-        params.push(Value::from(status.as_str()));
+        params.push(Value::Text(status.as_str().to_string()));
     }
     if let Some(sort) = input.sort_order {
         fields.push("sort_order = ?");
@@ -121,7 +124,7 @@ pub fn update(db: &Database, id: &str, input: UpdateGoalInput) -> anyhow::Result
         fields.push("agent_status = ?");
         params.push(
             agent_status
-                .map(|s| Value::from(s.as_str()))
+                .map(|s| Value::Text(s.as_str().to_string()))
                 .unwrap_or(Value::Null),
         );
     }
@@ -146,6 +149,7 @@ pub fn update(db: &Database, id: &str, input: UpdateGoalInput) -> anyhow::Result
 
     let sql = format!("UPDATE goals SET {} WHERE id = ?", fields.join(", "));
     db.execute(&sql, params)?;
+    db.mark_dirty("goals", id)?;
     get(db, id)
 }
 
@@ -176,10 +180,57 @@ pub fn uncomplete(db: &Database, id: &str) -> anyhow::Result<Option<Goal>> {
     )
 }
 
-/// Delete a goal. `ON DELETE CASCADE` removes all subgoals.
+/// Soft-delete a goal and all its descendants.
+///
+/// Sets `deleted_at = now` on the row and every nested subgoal (tombstones),
+/// bumps `updated_at` so the change wins LWW and propagates via sync, and
+/// marks every affected row dirty in the outbox. Reads (`get`, `get_all`, …)
+/// filter `deleted_at IS NULL`, so tombstoned rows vanish from the UI.
 pub fn delete(db: &Database, id: &str) -> anyhow::Result<()> {
-    db.execute("DELETE FROM goals WHERE id = ?", vec![Value::from(id)])?;
+    let ts = cordanui_schema::now_iso();
+    // Recursively collect this goal and all descendant IDs. We tombstone
+    // instead of hard-delete so the deletion propagates to other clients
+    // via sync; `ON DELETE CASCADE` therefore never fires.
+    let ids: Vec<String> = collect_subtree(db, id)?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = vec!["?"; ids.len()].join(", ");
+    let params: Vec<Value> = ids.iter().map(|i| Value::from(i.clone())).collect();
+    db.execute(
+        &format!(
+            "UPDATE goals SET deleted_at = ?, updated_at = ? WHERE id IN ({placeholders})"
+        ),
+        {
+            let mut p = vec![Value::from(ts.clone()), Value::from(ts)];
+            p.extend(params);
+            p
+        },
+    )?;
+    for id in &ids {
+        db.mark_dirty("goals", id)?;
+    }
     Ok(())
+}
+
+/// Collect a goal's ID and every descendant ID (any depth). Deleted rows
+/// are excluded so a re-delete is a no-op.
+fn collect_subtree(db: &Database, root: &str) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_string()];
+    while let Some(id) = stack.pop() {
+        out.push(id.clone());
+        let children = db.query(
+            "SELECT id FROM goals WHERE parent_id = ? AND deleted_at IS NULL",
+            vec![Value::from(id)],
+        )?;
+        for row in children.rows() {
+            if let Some(Value::Text(c)) = row.first() {
+                stack.push(c.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Fetch root goals (parent_id IS NULL).
@@ -280,16 +331,16 @@ mod tests {
 
 pub fn get_roots(db: &Database) -> anyhow::Result<Vec<Goal>> {
     let result = db.query_simple(&format!(
-        "SELECT {SELECT_COLS} FROM goals WHERE parent_id IS NULL ORDER BY sort_order, created_at"
+        "SELECT {SELECT_COLS} FROM goals WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY sort_order, created_at"
     ))?;
     Ok(result.rows().iter().map(values_to_goal).collect())
 }
 
-/// Fetch immediate children of a goal.
+/// Fetch immediate (non-deleted) children of a goal.
 pub fn get_children(db: &Database, parent_id: &str) -> anyhow::Result<Vec<Goal>> {
     let result = db.query(
         &format!(
-            "SELECT {SELECT_COLS} FROM goals WHERE parent_id = ? ORDER BY sort_order, created_at"
+            "SELECT {SELECT_COLS} FROM goals WHERE parent_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at"
         ),
         vec![Value::from(parent_id)],
     )?;
@@ -297,15 +348,16 @@ pub fn get_children(db: &Database, parent_id: &str) -> anyhow::Result<Vec<Goal>>
 }
 
 /// Get the next available sort_order for a new goal under `parent_id`
-/// (or at the root level if `parent_id` is None).
+/// (or at the root level if `parent_id` is None). Only counts non-deleted
+/// siblings.
 pub fn next_sort_order(db: &Database, parent_id: Option<&str>) -> anyhow::Result<i64> {
     match parent_id {
         Some(pid) => db.query_scalar_i64(
-            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id = ?",
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id = ? AND deleted_at IS NULL",
             vec![Value::from(pid)],
         ),
         None => db.query_scalar_i64(
-            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id IS NULL",
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id IS NULL AND deleted_at IS NULL",
             vec![],
         ),
     }
@@ -386,6 +438,7 @@ pub fn upsert_theme(
             Value::from(colors_json),
         ],
     )?;
+    db.mark_dirty("themes", id)?;
     Ok(())
 }
 
@@ -401,6 +454,33 @@ pub fn set_active_theme(db: &Database, theme_id: &str) -> anyhow::Result<()> {
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         vec![Value::from(theme_id)],
     )?;
+    Ok(())
+}
+
+/// Read a single setting value by key, or None if not present.
+pub fn get_setting(db: &Database, key: &str) -> Option<String> {
+    db.query_first(
+        "SELECT value FROM settings WHERE key = ?",
+        vec![Value::from(key)],
+    )
+    .ok()
+    .flatten()
+    .and_then(|row| match row.first() {
+        Some(Value::Text(v)) => Some(v.clone()),
+        _ => None,
+    })
+}
+
+/// Write a setting value (upsert). Used for synced keys like `agent.url`.
+pub fn set_setting(db: &Database, key: &str, value: &str) -> anyhow::Result<()> {
+    db.execute(
+        "INSERT INTO settings (key, value) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        vec![Value::from(key), Value::from(value)],
+    )?;
+    // Note: we intentionally do NOT mark_dirty here — settings sync uses
+    // the full-replace strategy (push entire settings table). The push
+    // path in sync.rs already includes all non-device-local keys.
     Ok(())
 }
 
@@ -656,13 +736,25 @@ pub fn clear_errors(db: &Database) -> anyhow::Result<()> {
 
 // ---------- purge (danger zone) ----------
 
-/// Delete ALL data rows: goals, themes, settings, plugins registry, error
-/// log. Bookkeeping (`_migrations`) is deliberately preserved — purging it
-/// would make the next open re-run shipped migrations against an already
-/// final schema and crash. The schema itself stays in place.
+/// Delete ALL data rows: goals, goal_sheets, themes, settings, plugins
+/// registry, error log. Bookkeeping (`_migrations`) is deliberately
+/// preserved — purging it would make the next open re-run shipped
+/// migrations against an already final schema and crash. The schema itself
+/// stays in place. Sync bookkeeping (`_outbox` / `_sync_state`) is reset
+/// so the next sync pulls the full remote state instead of appearing to
+/// do nothing.
 pub fn purge_all(db: &Database) -> anyhow::Result<()> {
-    for table in ["goals", "themes", "settings", "plugins", "errors"] {
+    for table in [
+        "goals",
+        "goal_sheets",
+        "themes",
+        "settings",
+        "plugins",
+        "errors",
+    ] {
         db.execute_simple(&format!("DELETE FROM {table}"))?;
     }
+    db.execute_simple("DELETE FROM _outbox")?;
+    db.execute_simple("DELETE FROM _sync_state")?;
     Ok(())
 }

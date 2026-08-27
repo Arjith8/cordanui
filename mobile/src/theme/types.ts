@@ -101,7 +101,6 @@ export interface ThemeRecord {
   id: string;
   name: string;
   source: ThemeSource;
-  is_dark: boolean;
   colors_json: string;
   last_used_at: string | null;
 }

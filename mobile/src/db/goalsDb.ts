@@ -1,80 +1,31 @@
 /**
  * Local SQLite database layer for the mobile client.
  *
- * Phase 1 (local-first): backed by expo-sqlite. When phase 2 (Turso sync)
- * lands, this module's internals swap to libSQL — the public API stays the
- * same, only the driver changes.
+ * The schema + migrations are the SHARED contract, generated from the
+ * canonical source in the Rust workspace:
  *
- * The schema is the shared contract (see rust/schema/schema.sql). This file
- * embeds the same schema so the mobile app can bootstrap a local DB on
- * first run.
+ *   rust/schema/schema.sql            (tables)
+ *   rust/crates/schema MIGRATIONS     (versioned migrations)
+ *
+ * ...via `cargo run -p cordanui-schema --example export_ts`, which writes
+ * ./schema.generated.ts (committed; a Rust drift test fails if stale).
+ * Mobile runs the exact same migration list as the TUI and records
+ * applied versions in the same `_migrations` table, so any database file
+ * has identical schema state no matter which client created it.
  */
 
 import * as Crypto from 'expo-crypto';
 import * as SQLite from 'expo-sqlite';
 
+import {
+  LATEST_SCHEMA_VERSION,
+  SCHEMA_SQL,
+  SHARED_MIGRATIONS,
+} from './schema.generated';
 import { DARK_THEME_COLORS, LIGHT_THEME_COLORS } from '@/theme/types';
 import type { CreateGoalInput, Goal, GoalSheet, UpdateGoalInput } from '@/types/goal';
 
 const DB_NAME = 'cordanui.db';
-
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version    INTEGER PRIMARY KEY,
-    name       TEXT NOT NULL,
-    applied_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS goals (
-    id           TEXT PRIMARY KEY,
-    title        TEXT NOT NULL,
-    description  TEXT,
-    status       TEXT NOT NULL DEFAULT 'pending',
-    parent_id    TEXT REFERENCES goals(id) ON DELETE CASCADE,
-    sort_order   INTEGER NOT NULL DEFAULT 0,
-    created_at   TEXT NOT NULL,
-    updated_at   TEXT NOT NULL,
-    completed_at TEXT,
-    agent_status   TEXT,
-    agent_result   TEXT,
-    agent_progress TEXT,
-    metadata      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS goal_sheets (
-    id         TEXT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    sort_order INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS errors_mobile (
-    id         TEXT PRIMARY KEY,
-    context    TEXT NOT NULL,
-    message    TEXT NOT NULL,
-    detail     TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS themes (
-    id           TEXT PRIMARY KEY,
-    name         TEXT NOT NULL,
-    source       TEXT NOT NULL DEFAULT 'builtin',
-    is_dark      INTEGER NOT NULL DEFAULT 0,
-    colors_json  TEXT NOT NULL,
-    last_used_at TEXT
-);
-
-CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_goals_parent_id ON goals(parent_id);
-CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
-CREATE INDEX IF NOT EXISTS idx_goals_sort_order ON goals(sort_order);
-CREATE INDEX IF NOT EXISTS idx_errors_created_at ON errors_mobile(created_at);
-`;
 
 /**
  * Memoized as a *promise*, not a value: concurrent callers (e.g. initDb and
@@ -103,75 +54,6 @@ async function openAndMigrate(): Promise<SQLite.SQLiteDatabase> {
 }
 
 /**
- * The newest schema version this build of the app understands. Bump this and
- * add a matching entry to MIGRATIONS whenever the schema changes. On open we
- * compare the version recorded in the local `schema_migrations` table against
- * this variable and apply everything missing.
- */
-export const LATEST_SCHEMA_VERSION = 3;
-
-interface Migration {
-  version: number;
-  name: string;
-  up: (database: SQLite.SQLiteDatabase) => Promise<void>;
-}
-
-const MIGRATIONS: Migration[] = [
-  {
-    version: 1,
-    name: 'goal-sheets',
-    // Adds sheet tracking. Guarded so it is a no-op on databases that already
-    // received this change (fresh installs included).
-    up: async (database) => {
-      const cols = await database.getAllAsync<{ name: string }>('PRAGMA table_info(goals)');
-      const hasSheetId = cols.some((c) => c.name === 'sheet_id');
-      if (!hasSheetId) {
-        await database.execAsync(
-          'ALTER TABLE goals ADD COLUMN sheet_id TEXT REFERENCES goal_sheets(id) ON DELETE CASCADE',
-        );
-        await database.execAsync(
-          'CREATE INDEX IF NOT EXISTS idx_goals_sheet_id ON goals(sheet_id)',
-        );
-      }
-    },
-  },
-  {
-    version: 2,
-    name: 'theme-system',
-    // Themes (builtin now, plugin-provided later) + a settings KV store.
-    // Tables are created by SCHEMA_SQL on fresh installs; this seeds the
-    // builtin themes and is guarded for every other case.
-    up: async (database) => {
-      await seedBuiltinThemes(database);
-    },
-  },
-  {
-    version: 3,
-    name: 'theme-token-roles',
-    // Token vocabulary switched to Compose/Material 3 roles
-    // (`background`, `primary`, ... — see src/theme/types.ts). Re-seed the
-    // two builtin rows so fresh and migrated installs agree; plugin themes
-    // keep their stored JSON and are aliased on read by themeColorsOf().
-    up: async (database) => {
-      // UPDATE instead of seed: migrated installs already have the rows.
-      await database.runAsync(
-        `UPDATE themes SET colors_json = ?
-         WHERE id = 'builtin-dark' AND source = 'builtin'`,
-        [JSON.stringify(DARK_THEME_COLORS)],
-      );
-      await database.runAsync(
-        `UPDATE themes SET colors_json = ?
-         WHERE id = 'builtin-light' AND source = 'builtin'`,
-        [JSON.stringify(LIGHT_THEME_COLORS)],
-      );
-      // Cover purged databases too: schema_migrations says v2/v3 applied,
-      // so without this INSERT the builtin rows would never come back.
-      await seedBuiltinThemes(database);
-    },
-  },
-];
-
-/**
  * (Re-)insert the two builtin theme rows. Idempotent (INSERT OR IGNORE).
  * Called by migration v2 AND by purgeAllData — wiping the themes table
  * must restore these, because schema_migrations still records v2 as
@@ -179,13 +61,13 @@ const MIGRATIONS: Migration[] = [
  */
 async function seedBuiltinThemes(database: SQLite.SQLiteDatabase): Promise<void> {
   await database.runAsync(
-    `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
-     VALUES (?, ?, 'builtin', 1, ?)`,
+    `INSERT OR IGNORE INTO themes (id, name, source, colors_json)
+     VALUES (?, ?, 'builtin', ?)`,
     ['builtin-dark', 'Cordanui Dark', JSON.stringify(DARK_THEME_COLORS)],
   );
   await database.runAsync(
-    `INSERT OR IGNORE INTO themes (id, name, source, is_dark, colors_json)
-     VALUES (?, ?, 'builtin', 0, ?)`,
+    `INSERT OR IGNORE INTO themes (id, name, source, colors_json)
+     VALUES (?, ?, 'builtin', ?)`,
     ['builtin-light', 'Cordanui Light', JSON.stringify(LIGHT_THEME_COLORS)],
   );
 }
@@ -196,41 +78,117 @@ async function seedBuiltinThemes(database: SQLite.SQLiteDatabase): Promise<void>
  * its own transaction with the applied version recorded after it commits.
  */
 async function migrate(database: SQLite.SQLiteDatabase): Promise<void> {
-  const row = await database.getFirstAsync<{ applied: number | null }>(
-    'SELECT MAX(version) AS applied FROM schema_migrations',
-  );
-  const current = row?.applied ?? 0;
-
-  if (current > LATEST_SCHEMA_VERSION) {
-    throw new Error(
-      `Database is newer (v${current}) than this app supports (v${LATEST_SCHEMA_VERSION}). Update the app.`,
-    );
+  // --- legacy alignment ---
+  // Databases created before the shared-schema switch used a mobile-only
+  // migration list recorded in `schema_migrations`. Bring them to the
+  // shared baseline with code (schema-shape guards instead of blind DDL),
+  // then adopt the shared `_migrations` bookkeeping.
+  const legacy = await tableExists(database, 'schema_migrations');
+  if (legacy) {
+    await alignLegacyMobileDb(database);
+    await database.execAsync('DROP TABLE schema_migrations');
   }
 
-  for (const migration of MIGRATIONS) {
-    if (migration.version <= current) continue;
-    await database.withTransactionAsync(() => migration.up(database));
-    await database.runAsync(
-      'INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)',
-      [migration.version, migration.name, now()],
+  // --- shared migrations (identical to the TUI) ---
+  for (const m of SHARED_MIGRATIONS) {
+    const done = await database.getFirstAsync<{ v: number | null }>(
+      'SELECT 1 AS v FROM _migrations WHERE version = ?',
+      [m.version],
     );
+    if (done) continue;
+    await database.withTransactionAsync(async () => {
+      await database.execAsync(m.sql);
+      await database.runAsync(
+        'INSERT INTO _migrations (version, name, applied_at) VALUES (?, ?, ?)',
+        [m.version, m.name, now()],
+      );
+    });
   }
 
-  // Self-heal: databases purged before this seeding fix lost the builtin
-  // rows while schema_migrations still says "applied". INSERT OR IGNORE,
-  // so this is free when they are present.
+  // Self-heal: purged databases lost their builtin theme rows while
+  // _migrations still says "applied". INSERT OR IGNORE — free when present.
   await seedBuiltinThemes(database);
 
   await verifySchema(database);
 }
 
-/** Fail fast with a readable message instead of "no such column" deep in UI code. */
+/** True if the table exists in sqlite_master. */
+async function tableExists(database: SQLite.SQLiteDatabase, name: string): Promise<boolean> {
+  const row = await database.getFirstAsync<{ n: number }>(
+    "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = ?",
+    [name],
+  );
+  return (row?.n ?? 0) > 0;
+}
+
+/**
+ * One-time shape alignment for pre-shared-schema mobile databases:
+ * add sheet_id if missing, drop the legacy is_dark column if present,
+ * merge errors_mobile into errors, and record every shared migration as
+ * applied (the shapes they produce are already in place).
+ */
+async function alignLegacyMobileDb(database: SQLite.SQLiteDatabase): Promise<void> {
+  const goalCols = await database.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(goals)',
+  );
+  const hasSheetId = goalCols.some((c) => c.name === 'sheet_id');
+  if (!hasSheetId) {
+    await database.execAsync(
+      'ALTER TABLE goals ADD COLUMN sheet_id TEXT REFERENCES goal_sheets(id) ON DELETE SET NULL',
+    );
+    await database.execAsync(
+      'CREATE INDEX IF NOT EXISTS idx_goals_sheet_id ON goals(sheet_id)',
+    );
+  }
+
+  const themeCols = await database.getAllAsync<{ name: string }>(
+    'PRAGMA table_info(themes)',
+  );
+  if (themeCols.some((c) => c.name === 'is_dark')) {
+    // DROP COLUMN needs SQLite >= 3.35; rebuild the table if unavailable.
+    try {
+      await database.execAsync('ALTER TABLE themes DROP COLUMN is_dark');
+    } catch {
+      // Rebuild with the canonical shape (keeps the primary key — a plain
+      // CREATE AS SELECT would drop it and break ON CONFLICT upserts).
+      await database.execAsync(
+        'CREATE TABLE themes_new (' +
+          'id TEXT PRIMARY KEY, name TEXT NOT NULL, ' +
+          "source TEXT NOT NULL DEFAULT 'builtin', " +
+          'colors_json TEXT NOT NULL, last_used_at TEXT)',
+      );
+      await database.execAsync(
+        'INSERT INTO themes_new (id, name, source, colors_json, last_used_at) ' +
+          'SELECT id, name, source, colors_json, last_used_at FROM themes',
+      );
+      await database.execAsync('DROP TABLE themes');
+      await database.execAsync('ALTER TABLE themes_new RENAME TO themes');
+    }
+  }
+
+  if (await tableExists(database, 'errors_mobile')) {
+    await database.execAsync(
+      'INSERT OR IGNORE INTO errors (id, context, message, detail, created_at) ' +
+      'SELECT id, context, message, detail, created_at FROM errors_mobile',
+    );
+    await database.execAsync('DROP TABLE errors_mobile');
+  }
+
+  // Adopt the shared bookkeeping: every shared migration's resulting
+  // shape is already present, so record them all as applied.
+  for (const m of SHARED_MIGRATIONS) {
+    await database.runAsync(
+      'INSERT OR REPLACE INTO _migrations (version, name, applied_at) VALUES (?, ?, ?)',
+      [m.version, m.name, now()],
+    );
+  }
+}
 async function verifySchema(database: SQLite.SQLiteDatabase): Promise<void> {
   const tables = await database.getAllAsync<{ name: string }>(
     "SELECT name FROM sqlite_master WHERE type = 'table'",
   );
   const tableNames = new Set(tables.map((t) => t.name));
-  for (const t of ['goals', 'goal_sheets', 'errors_mobile']) {
+  for (const t of ['goals', 'goal_sheets', 'errors']) {
     if (!tableNames.has(t)) {
       throw new Error(`Local DB schema invalid: missing table "${t}"`);
     }
@@ -249,6 +207,7 @@ async function verifySchema(database: SQLite.SQLiteDatabase): Promise<void> {
     'created_at',
     'updated_at',
     'completed_at',
+    'deleted_at',
   ]) {
     if (!colNames.has(c)) {
       throw new Error(`Local DB schema invalid: goals."${c}" is missing`);
@@ -278,7 +237,7 @@ export async function initDb(): Promise<void> {
 async function getFirstSheet(): Promise<GoalSheet | null> {
   const database = await getDb();
   const row = await database.getFirstAsync<GoalSheet>(
-    'SELECT * FROM goal_sheets ORDER BY sort_order, created_at LIMIT 1',
+    'SELECT * FROM goal_sheets WHERE deleted_at IS NULL ORDER BY sort_order, created_at LIMIT 1',
   );
   return row ?? null;
 }
@@ -286,7 +245,7 @@ async function getFirstSheet(): Promise<GoalSheet | null> {
 export async function getSheets(): Promise<GoalSheet[]> {
   const database = await getDb();
   return database.getAllAsync<GoalSheet>(
-    'SELECT * FROM goal_sheets ORDER BY sort_order, created_at',
+    'SELECT * FROM goal_sheets WHERE deleted_at IS NULL ORDER BY sort_order, created_at',
   );
 }
 
@@ -311,8 +270,14 @@ export async function renameSheet(id: string, name: string): Promise<void> {
 
 export async function deleteSheet(id: string): Promise<void> {
   const database = await getDb();
-  // ON DELETE CASCADE removes the sheet's goals.
-  await database.runAsync('DELETE FROM goal_sheets WHERE id = ?', [id]);
+  // Soft-delete (tombstone) so the deletion propagates via sync. The goals
+  // in this sheet are left in place (their sheet_id FK ON DELETE SET NULL
+  // no longer fires — they keep referencing the tombstoned sheet id, which
+  // reads treat as "no sheet" since the sheet is filtered out).
+  await database.runAsync(
+    'UPDATE goal_sheets SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL',
+    [now(), id],
+  );
 }
 
 // ---------- danger zone ----------
@@ -323,8 +288,10 @@ export async function deleteSheet(id: string): Promise<void> {
  * `turso_token`) and sync bookkeeping (`sync.*`) are deliberately kept so
  * sync stays configured after a purge — mirrors the TUI's purge behavior.
  *
- * Note: deletes do NOT propagate through Turso sync (no tombstones), so
- * rows already pushed to the cloud will not vanish on other devices.
+ * Purge is a local-only hard delete (danger zone). It does NOT tombstone,
+ * so rows already pushed to the cloud will reappear on the next sync
+ * pull — purge is meant for a fresh start on this device, not a global
+ * wipe. Use individual delete (tombstone) for deletions that propagate.
  */
 export async function purgeAllData(): Promise<void> {
   const db = await getDb();
@@ -338,7 +305,14 @@ export async function purgeAllData(): Promise<void> {
     await db.runAsync(
       "DELETE FROM settings WHERE key NOT IN ('turso_url', 'turso_token') AND key NOT LIKE 'sync.%'",
     );
-    await db.runAsync('DELETE FROM errors_mobile');
+    // Reset the incremental-sync cursors. Keeping them would make the next
+    // pull skip every remote row older than the cursor — i.e. after a
+    // purge, sync would appear to do nothing while the cloud still has
+    // data. Cursors reset = next sync pulls the full remote state.
+    await db.runAsync("DELETE FROM settings WHERE key LIKE 'sync.%'");
+    await db.runAsync('DELETE FROM errors');
+    await db.runAsync('DELETE FROM _outbox');
+    await db.runAsync('DELETE FROM _sync_state');
     // Restore the builtin theme rows: schema_migrations still records
     // v2/v3 as applied, so their seeding migrations will never re-run.
     await seedBuiltinThemes(db);
@@ -351,19 +325,22 @@ export async function getAllGoals(sheetId?: string): Promise<Goal[]> {
   const database = await getDb();
   if (sheetId) {
     return database.getAllAsync<Goal>(
-      `SELECT * FROM goals WHERE sheet_id = ?
+      `SELECT * FROM goals WHERE sheet_id = ? AND deleted_at IS NULL
        ORDER BY parent_id IS NOT NULL, parent_id, sort_order, created_at`,
       [sheetId],
     );
   }
   return database.getAllAsync<Goal>(
-    'SELECT * FROM goals ORDER BY parent_id IS NOT NULL, parent_id, sort_order, created_at',
+    'SELECT * FROM goals WHERE deleted_at IS NULL ORDER BY parent_id IS NOT NULL, parent_id, sort_order, created_at',
   );
 }
 
 export async function getGoal(id: string): Promise<Goal | null> {
   const database = await getDb();
-  const row = await database.getFirstAsync<Goal>('SELECT * FROM goals WHERE id = ?', [id]);
+  const row = await database.getFirstAsync<Goal>(
+    'SELECT * FROM goals WHERE id = ? AND deleted_at IS NULL',
+    [id],
+  );
   return row ?? null;
 }
 
@@ -374,7 +351,7 @@ export async function createGoal(input: CreateGoalInput): Promise<Goal> {
   // Append to the bottom of its sibling list unless explicitly positioned.
   const nextRow = await database.getFirstAsync<{ next: number }>(
     `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM goals
-     WHERE parent_id IS ? AND sheet_id IS ?`,
+     WHERE parent_id IS ? AND sheet_id IS ? AND deleted_at IS NULL`,
     [input.parent_id ?? null, input.sheet_id ?? null],
   );
   const sortOrder = input.sort_order ?? nextRow?.next ?? 0;
@@ -441,8 +418,33 @@ export async function uncompleteGoal(id: string): Promise<Goal | null> {
 
 export async function deleteGoal(id: string): Promise<void> {
   const database = await getDb();
-  // ON DELETE CASCADE handles subgoals.
-  await database.runAsync('DELETE FROM goals WHERE id = ?', [id]);
+  const ts = now();
+  // Soft-delete (tombstone) this goal and all descendants so the deletion
+  // propagates to other clients via sync. We set deleted_at + bump
+  // updated_at (wins LWW); reads filter deleted_at IS NULL.
+  const ids = await collectSubtree(database, id);
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(', ');
+  await database.runAsync(
+    `UPDATE goals SET deleted_at = ?, updated_at = ? WHERE id IN (${placeholders})`,
+    [ts, ts, ...ids],
+  );
+}
+
+/** Collect a goal's ID and every descendant ID (any depth). */
+async function collectSubtree(database: SQLite.SQLiteDatabase, root: string): Promise<string[]> {
+  const out: string[] = [];
+  const stack: string[] = [root];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    out.push(id);
+    const children = await database.getAllAsync<{ id: string }>(
+      'SELECT id FROM goals WHERE parent_id = ? AND deleted_at IS NULL',
+      [id],
+    );
+    for (const c of children) stack.push(c.id);
+  }
+  return out;
 }
 
 /** Persist a reorder: explicit sort_order values for the affected siblings. */
@@ -464,7 +466,7 @@ export async function updateSortOrders(
 export async function getChildren(parentId: string): Promise<Goal[]> {
   const database = await getDb();
   return database.getAllAsync<Goal>(
-    'SELECT * FROM goals WHERE parent_id = ? ORDER BY sort_order, created_at',
+    'SELECT * FROM goals WHERE parent_id = ? AND deleted_at IS NULL ORDER BY sort_order, created_at',
     [parentId],
   );
 }
@@ -472,6 +474,6 @@ export async function getChildren(parentId: string): Promise<Goal[]> {
 export async function getRoots(): Promise<Goal[]> {
   const database = await getDb();
   return database.getAllAsync<Goal>(
-    'SELECT * FROM goals WHERE parent_id IS NULL ORDER BY sort_order, created_at',
+    'SELECT * FROM goals WHERE parent_id IS NULL AND deleted_at IS NULL ORDER BY sort_order, created_at',
   );
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/schema", "crates/tui", "crates/plugin-runtime", "crates/sync"]
+members = ["crates/schema", "crates/tui", "crates/plugin-runtime", "crates/sync", "crates/agents"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,15 +21,13 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 dirs = "5"
 anyhow = "1"
 
-# sync crate
-libsql = "0.9"
+# sync crate — Hrana-over-HTTP via reqwest blocking; no async runtime needed
+# (the sync worker runs on its own std::thread, calling db.sync() directly)
 
 # plugin-runtime + cordanui-agents
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
 toml = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest = { version = "0.12", features = ["json"] }
 
 # plugin-runtime — embedded Lua runtime for script plugins

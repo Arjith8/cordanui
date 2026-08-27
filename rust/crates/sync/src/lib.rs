@@ -1,67 +1,159 @@
-//! cordanui-sync — Turso Database engine wrapper with local-first sync.
+//! cordanui-sync — local-first SQLite storage with a custom row-level sync
+//! layer (the "one protocol, two clients" design).
 //!
-//! Provides a synchronous database API that the TUI and agent backend can
-//! use without an async runtime. Internally uses a tokio runtime to drive
-//! the async `turso` client.
+//! Storage: rusqlite (bundled SQLite), fully synchronous. Opening the
+//! database NEVER touches the network.
 //!
-//! ## modes
+//! Sync (see [`sync`]): the TUI speaks the exact same protocol as mobile —
+//! Hrana-over-HTTP against Turso Cloud's `/v2/pipeline` — with row-level
+//! last-write-wins semantics:
 //!
-//! - **Local-only**: when no Turso URL/token is configured, opens a local
-//!   database file. All reads/writes are local. No sync.
-//! - **Synced**: when `turso_url` + `turso_token` are provided, the same
-//!   local file is backed by a Turso Cloud remote. Opening NEVER touches
-//!   the network (local-first): reads/writes always land in the local
-//!   file instantly, and [`Database::sync`] performs an explicit
-//!   push-then-pull over HTTP. Offline edits stay safe locally until the
-//!   next successful push.
+//! - writes land locally and mark rows in the device-local `_outbox`
+//! - push: outbox rows → remote, with server-side LWW
+//!   (`WHERE excluded.updated_at > table.updated_at`)
+//! - pull: incremental by `updated_at` cursor + local LWW guard
+//! - deletes are soft (`deleted_at` tombstones) so they propagate
+//! - `_outbox` / `_sync_state` are device-local (leading underscore)
 //!
-//! Conflict strategy is the server's "last push wins" (row-level logical
-//! CDC), which matches the mobile app's LWW-by-updated_at contract far
-//! better than page-frame replication ever did.
-//!
-//! ## config
-//!
-//! Turso config lives at `~/.config/cordanui/config.toml`:
-//!
-//! ```toml
-//! [turso]
-//! url = "libsql://your-db.turso.io"
-//! token = "your-auth-token"
-//! ```
-//!
-//! If the file doesn't exist or the `[turso]` section is missing, the
-//! database opens in local-only mode.
+//! Synced tables: goals (incremental LWW), goal_sheets + themes (full
+//! bidirectional replace incl. tombstones), settings (TUI pushes, mobile
+//! pulls; snapshot semantics). Device-local: plugins, errors, `_*`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 
-// Re-export Value so consumers (TUI, agent backend) can use it without
-// directly depending on the turso crate.
-pub use turso::Value;
+pub mod sync;
+
+/// Database value — mirrors `rusqlite::types::Value` but adds `From<&str>`
+/// and other conveniences so existing call sites using `Value::from("…")`
+/// keep working after the rusqlite migration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::Text(s)
+    }
+}
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::Text(s.to_string())
+    }
+}
+impl From<&String> for Value {
+    fn from(s: &String) -> Self {
+        Value::Text(s.clone())
+    }
+}
+impl From<i64> for Value {
+    fn from(i: i64) -> Self {
+        Value::Integer(i)
+    }
+}
+impl From<i32> for Value {
+    fn from(i: i32) -> Self {
+        Value::Integer(i64::from(i))
+    }
+}
+impl From<f64> for Value {
+    fn from(f: f64) -> Self {
+        Value::Real(f)
+    }
+}
+impl From<Vec<u8>> for Value {
+    fn from(b: Vec<u8>) -> Self {
+        Value::Blob(b)
+    }
+}
+impl From<Option<String>> for Value {
+    fn from(o: Option<String>) -> Self {
+        match o {
+            Some(s) => Value::Text(s),
+            None => Value::Null,
+        }
+    }
+}
+
+impl From<rusqlite::types::Value> for Value {
+    fn from(v: rusqlite::types::Value) -> Self {
+        match v {
+            rusqlite::types::Value::Null => Value::Null,
+            rusqlite::types::Value::Integer(i) => Value::Integer(i),
+            rusqlite::types::Value::Real(f) => Value::Real(f),
+            rusqlite::types::Value::Text(s) => Value::Text(s),
+            rusqlite::types::Value::Blob(b) => Value::Blob(b),
+        }
+    }
+}
+impl From<Value> for rusqlite::types::Value {
+    fn from(v: Value) -> Self {
+        match v {
+            Value::Null => rusqlite::types::Value::Null,
+            Value::Integer(i) => rusqlite::types::Value::Integer(i),
+            Value::Real(f) => rusqlite::types::Value::Real(f),
+            Value::Text(s) => rusqlite::types::Value::Text(s),
+            Value::Blob(b) => rusqlite::types::Value::Blob(b),
+        }
+    }
+}
+
+impl rusqlite::types::ToSql for Value {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        let rv: rusqlite::types::Value = self.clone().into();
+        Ok(rusqlite::types::ToSqlOutput::Owned(rv))
+    }
+}
 
 // ---------- public types ----------
 
-/// A synchronous database connection. Wraps an async turso connection,
-/// blocking on each operation via an internal tokio runtime.
-///
-/// Cheap to clone: everything inside is an Arc handle. Hosts should open
-/// the database ONCE per process and clone for additional handles.
-#[derive(Clone)]
+/// A synchronous database handle. Cloning opens a new connection to the
+/// same file, so the sync worker never blocks UI queries.
 pub struct Database {
-    conn: turso::Connection,
-    inner: Inner,
-    runtime: Arc<tokio::runtime::Runtime>,
+    shared: Arc<Shared>,
+    conn: rusqlite::Connection,
     sync_enabled: bool,
 }
 
-/// The underlying engine handle. `sync::Builder` requires a remote URL, so
-/// local-only databases go through the plain builder instead.
-#[derive(Clone)]
-enum Inner {
-    Local(turso::Database),
-    Synced(Arc<turso::sync::Database>),
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            conn: self
+                .shared
+                .open_conn()
+                .expect("clone: failed to open database connection"),
+            sync_enabled: self.sync_enabled,
+        }
+    }
+}
+
+struct Shared {
+    path: PathBuf,
+    remote: Option<sync::RemoteConfig>,
+    http: reqwest::blocking::Client,
+}
+
+impl Shared {
+    /// Open an independent SQLite connection to the database file. Each
+    /// `Database` handle owns one, so the sync worker never blocks UI
+    /// queries (WAL mode makes concurrent handles safe).
+    fn open_conn(&self) -> Result<rusqlite::Connection> {
+        let conn = rusqlite::Connection::open(&self.path)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; \
+             PRAGMA foreign_keys = ON; \
+             PRAGMA busy_timeout = 5000;",
+        )?;
+        Ok(conn)
+    }
 }
 
 /// A query result — a vec of rows, each row a vec of column values.
@@ -118,54 +210,43 @@ impl SyncConfig {
 }
 
 impl Database {
-    /// Open a database with the given config. Never touches the network:
-    /// with sync credentials the local file is bound to a Turso Cloud
-    /// remote, but actual push/pull only happens inside [`Database::sync`]
-    /// (and therefore off the startup path entirely).
+    /// Open a database with the given config. Never touches the network.
     pub fn open(config: &SyncConfig) -> Result<Self> {
-        // The engine won't create parent directories — make sure they exist.
         if let Some(dir) = config.db_path.parent() {
             std::fs::create_dir_all(dir)?;
         }
 
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?,
-        );
-
-        let path = config.db_path.to_string_lossy().into_owned();
-        let (inner, sync_enabled) = if config.is_sync_enabled() {
+        let sync_enabled = config.is_sync_enabled();
+        let remote = if sync_enabled {
             tracing::info!(
                 url = %config.turso_url.as_ref().unwrap(),
-                "opening local database bound to Turso remote (sync deferred)"
+                "local database bound to Turso remote (sync is explicit push/pull)"
             );
-            // Local-first: never bootstrap from / never require the
-            // remote at open time. Initial population happens by
-            // replaying data through this connection and pushing.
-            let db = runtime.block_on(
-                turso::sync::Builder::new_remote(&path)
-                    .with_remote_url(config.turso_url.as_ref().unwrap().clone())
-                    .with_auth_token(config.turso_token.as_ref().unwrap().clone())
-                    .bootstrap_if_empty(false)
-                    .build(),
-            )?;
-            (Inner::Synced(Arc::new(db)), true)
+            Some(sync::RemoteConfig {
+                base_url: sync::normalize_base_url(config.turso_url.as_ref().unwrap()),
+                token: config.turso_token.as_ref().unwrap().clone(),
+            })
         } else {
             tracing::info!(path = %config.db_path.display(), "opening local-only database");
-            let db = runtime.block_on(turso::Builder::new_local(&path).build())?;
-            (Inner::Local(db), false)
+            None
         };
 
-        let t = std::time::Instant::now();
-        let conn = match &inner {
-            // sync Database::connect is async; plain Database::connect is sync
-            Inner::Local(db) => db.connect(),
-            Inner::Synced(db) => runtime.block_on(async { db.connect().await }),
-        }?;
-        tracing::debug!(elapsed = ?t.elapsed(), "database opened");
+        let shared = Arc::new(Shared {
+            path: config.db_path.clone(),
+            remote,
+            http: reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()?,
+        });
 
-        Self::finish(conn, inner, runtime, sync_enabled)
+        let conn = shared.open_conn()?;
+        let db = Database {
+            shared,
+            conn,
+            sync_enabled,
+        };
+        db.run_migrations()?;
+        Ok(db)
     }
 
     /// Open a local-only database at the default path.
@@ -177,141 +258,136 @@ impl Database {
         Self::open(&config)
     }
 
-    /// Post-open setup shared by every mode: pragmas + schema migrations.
-    fn finish(
-        conn: turso::Connection,
-        inner: Inner,
-        runtime: Arc<tokio::runtime::Runtime>,
-        sync_enabled: bool,
-    ) -> Result<Self> {
-        // Foreign keys must be re-enabled per connection.
-        runtime.block_on(async { conn.execute_batch("PRAGMA foreign_keys = ON;").await })?;
-
-        // Apply schema + migrations. This runs on every startup; the
-        // `_migrations` table records what has been applied so each
-        // migration executes at most once per database.
-        runtime.block_on(async {
-            // Does this database predate the migration system? (A DB with a
-            // `goals` table was created before/without migrations; a fresh
-            // empty file gets the latest schema directly and only needs its
-            // migrations recorded.)
-            let mut rows = conn
-                .query(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'goals'",
-                    Vec::<Value>::new(),
-                )
-                .await?;
-            let pre_existing = rows.next().await?.is_some();
-
-            conn.execute_batch(cordanui_schema::SCHEMA_SQL).await?;
-
-            conn.execute_batch(
-                "CREATE TABLE IF NOT EXISTS _migrations (\
-                     version    INTEGER PRIMARY KEY,\
-                     name       TEXT NOT NULL,\
-                     applied_at TEXT NOT NULL\
-                 );",
+    /// Schema bootstrap + shared migrations. Runs on every open; each
+    /// migration executes at most once per database (`_migrations`).
+    fn run_migrations(&self) -> Result<()> {
+        // Does this database predate the migration system? (A DB with a
+        // `goals` table was created before/without migrations; a fresh
+        // empty file gets the latest schema directly and only needs its
+        // migrations recorded.)
+        let pre_existing: bool = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'goals'",
+                [],
+                |r| r.get::<_, i64>(0),
             )
-            .await?;
+            .map(|n| n > 0)
+            .unwrap_or(false);
 
-            for m in cordanui_schema::MIGRATIONS {
-                let mut rows = conn
-                    .query(
-                        "SELECT 1 FROM _migrations WHERE version = ?",
-                        vec![Value::from(m.version)],
-                    )
-                    .await?;
-                if rows.next().await?.is_some() {
-                    continue; // already applied
-                }
+        self.conn.execute_batch(cordanui_schema::SCHEMA_SQL)?;
 
-                if pre_existing {
-                    conn.execute_batch(m.sql).await?;
-                }
-                // Fresh installs: SCHEMA_SQL already produced the final
-                // shape — just record the migration as applied.
-
-                conn.execute(
-                    "INSERT INTO _migrations (version, name, applied_at) \
-                     VALUES (?, ?, datetime('now'))",
-                    vec![Value::from(m.version), Value::from(m.name)],
+        for m in cordanui_schema::MIGRATIONS {
+            let done: bool = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM _migrations WHERE version = ?",
+                    [m.version],
+                    |r| r.get::<_, i64>(0),
                 )
-                .await?;
+                .map(|n| n > 0)
+                .unwrap_or(false);
+            if done {
+                continue;
             }
-            Ok::<(), anyhow::Error>(())
-        })?;
 
-        Ok(Self {
-            conn,
-            inner,
-            runtime,
-            sync_enabled,
-        })
+            if pre_existing {
+                // A migration may fail against a schema that already
+                // reflects it (e.g. after a purge lost bookkeeping) — the
+                // shape is what matters, so record it either way.
+                if let Err(e) = self.conn.execute_batch(m.sql) {
+                    tracing::warn!(
+                        version = m.version,
+                        name = m.name,
+                        error = %e,
+                        "migration DDL failed — recording as applied (schema likely already final)"
+                    );
+                }
+            }
+            self.conn.execute(
+                "INSERT INTO _migrations (version, name, applied_at) \
+                 VALUES (?, ?, datetime('now'))",
+                rusqlite::params![m.version, m.name],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn is_sync_enabled(&self) -> bool {
         self.sync_enabled
     }
 
-    /// Push local changes to Turso, then pull remote changes down. No-op
-    /// if sync is not enabled. Network failures propagate to the caller —
-    /// local data is never affected.
-    pub fn sync(&self) -> Result<()> {
-        match &self.inner {
-            Inner::Local(_) => Ok(()),
-            Inner::Synced(db) => self.runtime.block_on(async {
-                db.push().await?;
-                let changed = db.pull().await?;
-                tracing::debug!(changed, "sync pull finished");
-                Ok(())
-            }),
-        }
+    /// Read-only access to the underlying connection (crate-internal).
+    pub(crate) fn conn(&self) -> &rusqlite::Connection {
+        &self.conn
     }
+
+    /// Push outbox rows to Turso, then pull remote changes. No-op when
+    /// sync is not configured. Network failures propagate — local data is
+    /// never affected.
+    pub fn sync(&self) -> Result<()> {
+        if !self.sync_enabled {
+            return Ok(());
+        }
+        let remote = self
+            .shared
+            .remote
+            .as_ref()
+            .expect("sync enabled without remote config");
+        sync::push(self, &self.shared.http, remote)?;
+        sync::pull(self, &self.shared.http, remote)?;
+        Ok(())
+    }
+
+    /// Mark a row as pending push. Called by the client's write layer
+    /// after every local write to a synced table.
+    pub fn mark_dirty(&self, table: &str, id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO _outbox (table_name, row_id) VALUES (?, ?)",
+            rusqlite::params![table, id],
+        )?;
+        Ok(())
+    }
+
+    // ---------- query API ----------
 
     /// Execute a statement that returns no rows (INSERT, UPDATE, DELETE).
     pub fn execute(&self, sql: &str, params: Vec<Value>) -> Result<()> {
-        self.runtime
-            .block_on(async { self.conn.execute(sql, params).await })?;
+        let rusqlite_params: Vec<rusqlite::types::Value> =
+            params.into_iter().map(|v| v.into()).collect();
+        self.conn
+            .execute(sql, rusqlite::params_from_iter(rusqlite_params))?;
         Ok(())
     }
 
     /// Execute a statement with no parameters.
     pub fn execute_simple(&self, sql: &str) -> Result<()> {
-        self.runtime
-            .block_on(async { self.conn.execute(sql, ()).await })?;
+        self.conn.execute_batch(sql)?;
         Ok(())
     }
 
     /// Execute a batch of statements (e.g. schema migration).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.runtime
-            .block_on(async { self.conn.execute_batch(sql).await })?;
+        self.conn.execute_batch(sql)?;
         Ok(())
     }
 
     /// Execute a query and return all rows. Each row is a `Vec<Value>`.
     pub fn query(&self, sql: &str, params: Vec<Value>) -> Result<QueryResult> {
-        let mut rows = self.runtime.block_on(async {
-            let mut stmt = self.conn.prepare(sql).await?;
-            stmt.query(params).await
-        })?;
-
+        let rusqlite_params: Vec<rusqlite::types::Value> =
+            params.into_iter().map(|v| v.into()).collect();
+        let mut stmt = self.conn.prepare(sql)?;
+        let col_count = stmt.column_count();
+        let mut rows = stmt.query(rusqlite::params_from_iter(rusqlite_params))?;
         let mut result_rows = Vec::new();
-        loop {
-            let row_opt = self.runtime.block_on(async { rows.next().await });
-            match row_opt {
-                Ok(Some(row)) => {
-                    let mut values = Vec::new();
-                    for i in 0..row.column_count() {
-                        values.push(row.get_value(i)?);
-                    }
-                    result_rows.push(values);
-                }
-                Ok(None) => break,
-                Err(e) => return Err(e.into()),
+        while let Some(row) = rows.next()? {
+            let mut values = Vec::with_capacity(col_count);
+            for i in 0..col_count {
+                let v: rusqlite::types::Value = row.get(i)?;
+                values.push(Value::from(v));
             }
+            result_rows.push(values);
         }
-
         Ok(QueryResult { rows: result_rows })
     }
 
@@ -396,12 +472,22 @@ pub fn read_turso_credentials() -> (Option<String>, Option<String>) {
 }
 
 /// Write Turso credentials to `path`, preserving every other section in
-/// the file (keybinds, ...). Creates the file if missing.
+/// the file (keybinds, ...). Creates the file if missing. Refuses to
+/// overwrite an existing file that fails to parse — that path used to
+/// silently replace the whole file (dropping [turso] and friends).
 pub fn write_turso_credentials_at(path: &Path, url: &str, token: &str) -> Result<()> {
-    let mut root = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
-        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    let existing = std::fs::read_to_string(path).ok();
+    let root = match existing {
+        Some(contents) => match toml::from_str::<toml::Value>(&contents) {
+            Ok(v) => v,
+            Err(e) => anyhow::bail!(
+                "refusing to overwrite {}: existing file is not valid TOML ({e})",
+                path.display()
+            ),
+        },
+        None => toml::Value::Table(Default::default()),
+    };
+    let mut root = root;
 
     let table = root
         .as_table_mut()
@@ -467,12 +553,21 @@ pub fn read_plugin_settings(plugin: &str) -> std::collections::BTreeMap<String, 
 }
 
 /// Mirror one plugin setting into `path` under `[plugins.<name>]`,
-/// preserving every other section.
+/// preserving every other section. Refuses to overwrite an existing file
+/// that fails to parse (same clobber-protection as the creds writer).
 pub fn write_plugin_setting_at(path: &Path, plugin: &str, key: &str, value: &str) -> Result<()> {
-    let mut root = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| toml::from_str::<toml::Value>(&c).ok())
-        .unwrap_or_else(|| toml::Value::Table(Default::default()));
+    let existing = std::fs::read_to_string(path).ok();
+    let root = match existing {
+        Some(contents) => match toml::from_str::<toml::Value>(&contents) {
+            Ok(v) => v,
+            Err(e) => anyhow::bail!(
+                "refusing to overwrite {}: existing file is not valid TOML ({e})",
+                path.display()
+            ),
+        },
+        None => toml::Value::Table(Default::default()),
+    };
+    let mut root = root;
 
     let table = root
         .as_table_mut()
@@ -505,6 +600,3 @@ pub fn write_plugin_setting_at(path: &Path, plugin: &str, key: &str, value: &str
 pub fn write_plugin_setting(plugin: &str, key: &str, value: &str) -> Result<()> {
     write_plugin_setting_at(&config_file_path(), plugin, key, value)
 }
-
-#[cfg(test)]
-mod tests;

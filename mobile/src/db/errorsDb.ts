@@ -1,6 +1,6 @@
 /**
  * Error tracking on-device. Every caught error in the app is logged into the
- * errors_mobile table so it can be reviewed on the profile/errors page.
+ * shared `errors` table so it can be reviewed on the profile/errors page.
  *
  * logError never throws: error logging must not be able to cause errors.
  */
@@ -23,7 +23,7 @@ export async function logError(context: string, error: unknown, detail?: string)
     const message = error instanceof Error ? error.message : String(error);
     const stack = error instanceof Error ? (error.stack ?? null) : null;
     await db.runAsync(
-      'INSERT INTO errors_mobile (id, context, message, detail, created_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO errors (id, context, message, detail, created_at) VALUES (?, ?, ?, ?, ?)',
       [Crypto.randomUUID(), context, message, detail ?? stack, new Date().toISOString()],
     );
   } catch {
@@ -34,12 +34,12 @@ export async function logError(context: string, error: unknown, detail?: string)
 export async function getErrors(limit = 200): Promise<LoggedError[]> {
   const db = await getDb();
   return db.getAllAsync<LoggedError>(
-    'SELECT * FROM errors_mobile ORDER BY created_at DESC LIMIT ?',
+    'SELECT * FROM errors ORDER BY created_at DESC LIMIT ?',
     [limit],
   );
 }
 
 export async function clearErrors(): Promise<void> {
   const db = await getDb();
-  await db.runAsync('DELETE FROM errors_mobile');
+  await db.runAsync('DELETE FROM errors');
 }

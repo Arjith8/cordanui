@@ -274,6 +274,15 @@ export default function HomeScreen() {
     [refresh, fail],
   );
 
+  /** Called after a goal is assigned to the agent — refresh the list so
+   * the status change to 'agent_mode' is visible immediately. */
+  const handleAgentAssigned = useCallback(
+    async (id: string) => {
+      await refresh();
+    },
+    [refresh],
+  );
+
   if (loading) {
     return (
       <View style={[styles.container, styles.center, { backgroundColor: colors.background }]}>
@@ -428,6 +437,7 @@ export default function HomeScreen() {
         onClose={() => setModalVisible(false)}
         onSave={handleSave}
         onDelete={handleDelete}
+        onAgentAssigned={handleAgentAssigned}
       />
     </View>
   );

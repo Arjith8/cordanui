@@ -5,6 +5,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { LoggedError } from '@/db/errorsDb';
 import { clearErrors, getErrors } from '@/db/errorsDb';
 import { purgeAllData } from '@/db/goalsDb';
+import DBViewerPage from '@/components/DBViewerPage';
 import {
   formatLastSync,
   getTursoCreds,
@@ -25,6 +26,7 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
   const [errors, setErrors] = useState<LoggedError[]>([]);
   const [loading, setLoading] = useState(true);
   const [showThemes, setShowThemes] = useState(false);
+  const [showDbViewer, setShowDbViewer] = useState(false);
 
   // Sync state.
   const [syncUrl, setSyncUrl] = useState('');
@@ -54,6 +56,11 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
     setSyncStatus('saved');
   }, [syncUrl, syncToken, refreshSync]);
 
+  const refresh = useCallback(async () => {
+    setErrors(await getErrors());
+    setLoading(false);
+  }, []);
+
   const handleSyncNow = useCallback(async () => {
     setSyncing(true);
     setSyncStatus('syncing…');
@@ -61,12 +68,9 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
     setSyncing(false);
     setSyncStatus(outcome.message);
     await refreshSync();
-  }, [refreshSync]);
-
-  const refresh = useCallback(async () => {
-    setErrors(await getErrors());
-    setLoading(false);
-  }, []);
+    // Failed syncs are logged into errors_mobile — surface them here too.
+    await refresh();
+  }, [refresh, refreshSync]);
 
   useEffect(() => {
     refresh();
@@ -101,6 +105,10 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
       ],
     );
   }, [refresh, selectTheme]);
+
+  if (showDbViewer) {
+    return <DBViewerPage onBack={() => setShowDbViewer(false)} />;
+  }
 
   return (
     <View
@@ -248,6 +256,18 @@ export default function ErrorsPage({ onBack }: { onBack: () => void }) {
         <Text style={[styles.purgeTitle, { color: colors.error }]}>Purge all data</Text>
         <Text style={[styles.purgeDetail, { color: colors.outlineVariant }]}>
           goals · sheets · themes · settings · error log
+        </Text>
+      </Pressable>
+
+      <Pressable
+        onPress={() => setShowDbViewer(true)}
+        style={[styles.purgeRow, { borderColor: colors.outline }]}
+      >
+        <Text style={[styles.purgeTitle, { color: colors.onBackground }]}>
+          🗄 Database viewer
+        </Text>
+        <Text style={[styles.purgeDetail, { color: colors.outlineVariant }]}>
+          inspect local tables and rows (read-only)
         </Text>
       </Pressable>
 

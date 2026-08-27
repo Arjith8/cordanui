@@ -42,14 +42,14 @@ fn main() -> anyhow::Result<()> {
     let keybinds = config::Keybinds::load();
 
     // Open DB — once. Clones share the same underlying handles; repeated
-    // `Database::open` calls each redo schema setup and (with a dead Turso
-    // host) each pay ~1s of failed replica handshake.
+    // `Database::open` calls each redo schema setup, so we open once and
+    // clone handles for the app, plugin config, and sync worker.
     let db = db::open()?;
     let mut app = app::App::new(db.clone())?;
     app.attach_plugin_config_db(db.clone());
-    // Sync worker handle: whenever credentials are configured. Opening the
-    // DB never touches the network (local-first); push/pull failures show
-    // up in the sync status + errors log at runtime instead.
+    // Sync worker: whenever credentials are configured. Opening the DB
+    // never touches the network (local-first); push/pull failures show up
+    // in the sync status + errors log at runtime instead.
     if cordanui_sync::SyncConfig::load()
         .map(|c| c.is_sync_enabled())
         .unwrap_or(false)
@@ -57,6 +57,11 @@ fn main() -> anyhow::Result<()> {
         app.attach_sync_db(db.clone());
     }
     app.load_plugin_states();
+    // Announce agent capability (writes agent.url to synced settings so
+    // mobile can show/hide the "assign to agent" UI).
+    if let Err(e) = app.announce_agent_capability() {
+        eprintln!("cordanui: could not announce agent capability: {e:#}");
+    }
     app.keybinds = keybinds;
 
     // Setup terminal

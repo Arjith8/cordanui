@@ -25,11 +25,12 @@ you flip it to "agent mode" and an agent picks it up and gets it done.
 │  - goal list (base, no AI)                            │
 │  - plugin manager (lazy.nvim-style: search GH,       │
 │    clone, cargo build, load)                          │
-│  - libSQL embedded replica (local SQLite + sync)      │
+│  - rusqlite (local SQLite) + Hrana-over-HTTP sync     │
 │  - plugins = Rust CLIs, spawned as subprocesses       │
 │    comms = JSON over stdio                            │
 └──────────────┬──────────────────┬───────────────────┘
-               │ sync (libSQL)      │ HTTP (wake + point)
+               │ Hrana over HTTP    │ HTTP (wake + point)
+               │ (same as mobile)   │
                ▼                   ▼
 ┌──────────────────────┐   ┌──────────────────────────┐
 │  Turso (libSQL cloud)│   │  Agent Backend            │
@@ -38,7 +39,7 @@ you flip it to "agent mode" and an agent picks it up and gets it done.
 │  - schema = contract │   │  - runs provider plugin   │
 │                      │   │  - writes results to Turso│
 └───────────┬──────────┘   └──────────────────────────┘
-            │ sync
+            │ Hrana over HTTP (same as TUI)
             ▼
 ┌──────────────────────────┐
 │  Mobile (minimal)         │
@@ -55,6 +56,12 @@ you flip it to "agent mode" and an agent picks it up and gets it done.
 - **TUI and Mobile are fully independent peers.** They share Turso and
   nothing else. No client-to-client coordination. If one triggers the
   agent, the other sees the result through Turso sync.
+- **One protocol, two clients.** Both the TUI (rusqlite) and mobile
+  (expo-sqlite) store data in a local SQLite file and sync to Turso Cloud
+  over the same Hrana-over-HTTP pipeline (`POST {url}/v2/pipeline`), with
+  row-level last-write-wins on `updated_at`. Deletes are soft
+  (`deleted_at` tombstones) so they propagate. No embedded-replica engine,
+  no opaque bootstrap — plain SQL over HTTP, proven against the cloud DB.
 - **Turso is the only shared state.** The HTTP call to the backend is a
   wake-and-point (just a task ID), not a data transfer. The backend reads
   the task from Turso and writes results back to Turso.
@@ -123,13 +130,16 @@ CREATE TABLE goals (
     agent_progress TEXT,   -- streaming progress, JSON
     -- plugin extensibility
     metadata    TEXT      -- JSON, plugins can attach arbitrary data
+    deleted_at  TEXT      -- soft-delete tombstone (sync); NULL = active
 );
 ```
 
-Sync works because libSQL embedded replicas handle the replication — each
-client writes locally, Turso syncs in the background. Last-write-wins on
-`updated_at` for conflict resolution (simple, good enough for a personal
-goal tracker).
+Sync is explicit push/pull over Hrana-over-HTTP — both clients (TUI and
+mobile) speak the same protocol against Turso Cloud's `/v2/pipeline`.
+Each client writes locally, then pushes dirty rows and pulls remote
+changes. Last-write-wins on `updated_at` for conflict resolution (simple,
+good enough for a personal goal tracker). Deletes are soft tombstones
+(`deleted_at`) so they propagate to other clients.
 
 ## agent flow
 

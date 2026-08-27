@@ -1,20 +1,46 @@
 # cordanui-sync
 
-libSQL wrapper with Turso embedded replica sync.
+Local-first SQLite storage with a custom row-level sync layer — the "one
+protocol, two clients" design. The TUI speaks the exact same Hrana-over-HTTP
+protocol as the mobile client against Turso Cloud.
 
-Provides a synchronous database API that the TUI and agent backend can use
-without an async runtime. Internally uses a tokio runtime to drive the
-async libsql client.
+## storage
 
-## modes
+`rusqlite` (bundled SQLite), fully synchronous. Opening the database never
+touches the network — there is no replica handshake, no degraded mode. A
+local DB file always opens instantly.
 
-- **Local-only** (default): when no Turso config is present, opens a local
-  libSQL database file. All reads/writes are local. No sync.
-- **Embedded replica**: when `~/.config/cordanui/config.toml` contains a
-  `[turso]` section with `url` and `token`, opens a local file as an
-  embedded replica of a remote Turso primary. Reads are local (fast,
-  offline-capable). Writes go to the local file and are pushed to Turso.
-  `sync()` pulls remote changes.
+## sync
+
+When `~/.config/cordanui/config.toml` contains a `[turso]` section with `url`
+and `token`, sync is enabled. The TUI's write layer marks every changed row
+dirty in a device-local `_outbox` table; a background worker (on its own
+`std::thread`) periodically:
+
+1. **push** — uploads outbox rows to Turso via `POST {url}/v2/pipeline`
+   (Hrana over HTTPS) with server-side last-write-wins
+   (`WHERE excluded.updated_at > table.updated_at`), then clears the outbox.
+2. **pull** — fetches remote changes incrementally (by `updated_at` cursor
+   for goals; full table for the small tables) and applies them with a local
+   LWW guard.
+
+Network failures are just failed pushes/pulls — logged in the `errors`
+table, surfaced in the status bar. Local data is never affected.
+
+## per-table strategy
+
+| table       | direction        | strategy                                   |
+| ----------- | ---------------- | ------------------------------------------ |
+| `goals`     | two-way          | incremental LWW both ways (`updated_at` cursors + guards) |
+| `goal_sheets` | two-way        | full bidirectional upsert (small table, tombstones included) |
+| `themes`    | two-way          | full bidirectional upsert (tombstones included) |
+| `settings`  | TUI pushes, mobile pulls | snapshot of non-device-local keys |
+
+Device-local (never synced): `plugins`, `errors`, `_outbox`, `_sync_state`,
+`_migrations`, and anything prefixed `_`.
+
+Deletes are soft (`deleted_at` tombstone) so they propagate to other clients.
+Read paths filter `deleted_at IS NULL`.
 
 ## setup
 
@@ -57,19 +83,22 @@ let result = db.query(
     vec![Value::from("abc")],
 )?;
 
-// Manual sync (pull remote changes + push local writes)
+// Mark a row pending push (called by the write layer after every local
+// write to a synced table).
+db.mark_dirty("goals", "abc")?;
+
+// Manual sync (push outbox + pull remote)
 db.sync()?;
 ```
 
 ## how it works
 
-The `Database` struct wraps an async libsql connection. Each method
-(`execute`, `query`, `sync`) blocks on the internal tokio runtime via
-`block_on`. This lets the TUI (which is synchronous — crossterm event loop)
-use libSQL without managing an async runtime.
+The `Database` struct wraps a `rusqlite::Connection` (bundled SQLite, WAL
+mode). All methods are synchronous — no tokio runtime, no async juggling.
+The sync worker clones a `Database` handle (each clone opens its own
+connection to the same file) and calls `db.sync()` directly on a background
+`std::thread`; the UI thread is never blocked.
 
-When sync is enabled, libSQL's embedded replica handles replication:
-- Writes go to the local file first (fast, offline)
-- libSQL pushes writes to the Turso primary in the background
-- `sync()` pulls remote changes from the primary to the local replica
-- Last-write-wins on `updated_at` for conflict resolution
+Sync uses `reqwest::blocking` to POST Hrana pipeline requests to Turso over
+HTTPS. The wire protocol is identical to the mobile client's, so both
+clients interoperate against the same cloud DB.
