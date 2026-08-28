@@ -56,6 +56,7 @@ pub struct App {
     /// In-flight plugin command result channel + guard.
     pub(crate) command_rx: Option<std::sync::mpsc::Receiver<PluginCommandOutcome>>,
     pub command_running: bool,
+    pub command_selected: usize,
     /// Second database handle (same file) used by the sync worker, so
     /// network I/O never blocks the UI thread. `None` = sync not
     /// configured.
@@ -147,6 +148,7 @@ impl App {
             help_scroll: 0,
             command_rx: None,
             command_running: false,
+            command_selected: 0,
             sync_db: None,
             sync_status: SyncStatus::NotConfigured,
             sync_rx: None,
@@ -1406,12 +1408,22 @@ impl App {
             self.set_message("this plugin declares no [service]");
             return Ok(());
         };
-        self.services.register(&p.id, &dir, spec);
+        self.services.register(&p.id, &dir, spec.clone());
         if self.services.is_running(&p.id) {
             self.services.stop_service(&p.id)?;
             self.set_message(&format!("{} service stopped", p.id));
         } else {
-            self.services.start_registered(&p.id, &[])?;
+            if let Err(e) = self.services.start_registered(&p.id, &[]) {
+                let hint = if e.to_string().contains("No such file or directory") {
+                    format!(" — '{}' not found in PATH. Install it (e.g. `curl -fsSL https://bun.sh/install | bash` or `brew install oven-sh/bun/bun`) and ensure TUI's PATH includes it", spec.cmd)
+                } else {
+                    String::new()
+                };
+                let msg = format!("✖ failed to start {}: {e:#}{hint}", p.id);
+                self.record_error("service", "service start failed", Some(&msg));
+                self.set_message(&msg);
+                return Ok(());
+            }
             self.set_message(&format!("{} service started", p.id));
         }
         Ok(())
@@ -1570,19 +1582,27 @@ impl App {
     }
 
     pub fn poll_plugin_ui_requests(&mut self) {
-        let Some(event) = self.plugin_ui.try_take_event() else {
+        // Drain all pending notifies first — they are fire-and-forget and would
+        // otherwise be lost when a command's return string overwrites the status
+        // line on the next `poll_command_results` tick (e.g. cordanui-chat open
+        // notifying "backend not active" then returning "chat opened").
+        let mut pending_modal: Option<crate::plugin_ui::PluginUiEvent> = None;
+        while let Some(event) = self.plugin_ui.try_take_event() {
+            if let crate::plugin_ui::PluginUiEvent::Notify { level, message } = event {
+                let prefixed = match level {
+                    cordanui_plugin_runtime::UiLevel::Info => message.clone(),
+                    cordanui_plugin_runtime::UiLevel::Warn => format!("⚠ {message}"),
+                    cordanui_plugin_runtime::UiLevel::Error => format!("✖ {message}"),
+                };
+                self.set_message(&prefixed);
+            } else {
+                pending_modal = Some(event);
+                break;
+            }
+        }
+        let Some(event) = pending_modal else {
             return;
         };
-        // Notifications never block and never get refused.
-        if let crate::plugin_ui::PluginUiEvent::Notify { level, message } = &event {
-            let prefixed = match level {
-                cordanui_plugin_runtime::UiLevel::Info => message.clone(),
-                cordanui_plugin_runtime::UiLevel::Warn => format!("⚠ {message}"),
-                cordanui_plugin_runtime::UiLevel::Error => format!("✖ {message}"),
-            };
-            self.set_message(&prefixed);
-            return;
-        }
         let crate::plugin_ui::PluginUiEvent::Modal(pending) = event else {
             return;
         };
@@ -1776,8 +1796,10 @@ impl App {
         let Ok(plugins) = db::list_plugins(&self.db) else {
             return problems;
         };
-        let mut states = self.plugin_states.lock().unwrap();
-        states.clear();
+        {
+            let mut states = self.plugin_states.lock().unwrap();
+            states.clear();
+        }
         self.plugin_commands.clear();
 
         for row in plugins {
@@ -1825,7 +1847,10 @@ impl App {
                             desc: cmd.desc,
                         });
                     }
-                    states.insert(name, state);
+                    self.plugin_states
+                        .lock()
+                        .unwrap()
+                        .insert(name, state);
                 }
                 Err(e) => problems.push(format!("{name}: {e:#}")),
             }
@@ -1837,6 +1862,7 @@ impl App {
     pub fn open_command_mode(&mut self) {
         let problems = self.load_plugin_states();
         self.input.clear();
+        self.command_selected = 0;
         if let Some(first) = problems.first() {
             self.record_error("plugin", "plugin failed to load", Some(first));
             self.set_message(&format!("✖ {first}"));
@@ -1846,6 +1872,26 @@ impl App {
             );
         }
         self.mode = Mode::Command;
+    }
+
+    pub fn move_command_selection(&mut self, delta: i32) {
+        let len = self.command_matches().len();
+        if len == 0 {
+            self.command_selected = 0;
+            return;
+        }
+        let cur = self.command_selected as i32;
+        let next = (cur + delta).clamp(0, len as i32 - 1);
+        self.command_selected = next as usize;
+    }
+
+    pub fn clamp_command_selection(&mut self) {
+        let len = self.command_matches().len();
+        if len == 0 {
+            self.command_selected = 0;
+        } else if self.command_selected >= len {
+            self.command_selected = len - 1;
+        }
     }
 
     pub fn command_matches(&self) -> Vec<PluginCommand> {

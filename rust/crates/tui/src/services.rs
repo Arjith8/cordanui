@@ -129,9 +129,17 @@ impl ServiceManager {
             .stdout(Stdio::from(logfile))
             .stderr(Stdio::from(stderr));
 
-        let child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("spawning '{}' in {}: {e}", spec.cmd, dir.display()))?;
+        let child = cmd.spawn().map_err(|e| {
+            let base = format!("spawning '{}' in {}: {e}", spec.cmd, dir.display());
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "{base} — binary not found in PATH. Install '{}' or use absolute `cmd` in cordanui.toml [service]",
+                    spec.cmd
+                )
+            } else {
+                anyhow::anyhow!(base)
+            }
+        })?;
 
         let pid = child.id();
         std::fs::write(pidfile_path(plugin), pid.to_string())?;
@@ -309,7 +317,18 @@ fn cli_start(plugin: Option<&String>, extra: Vec<String>) -> anyhow::Result<()> 
                 .append(true)
                 .open(logfile_path(plugin))?,
         ));
-    let child = cmd.spawn()?;
+    let child = cmd.spawn().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            anyhow::anyhow!(
+                "spawning '{}' in {}: {e} — binary not found in PATH. Install '{}' (bun.sh) or use absolute `cmd` in cordanui.toml [service]",
+                spec.cmd,
+                row.dir,
+                spec.cmd
+            )
+        } else {
+            anyhow::anyhow!("spawning '{}' in {}: {e}", spec.cmd, row.dir)
+        }
+    })?;
     let pid = child.id();
     // Intentionally not waited: the CLI exits, the child re-parents to
     // init (no zombie) and keeps running headless.

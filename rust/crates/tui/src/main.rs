@@ -487,23 +487,38 @@ fn handle_confirm_delete_key(app: &mut app::App, key: KeyEvent) -> anyhow::Resul
     Ok(())
 }
 
-/// Keys in the command line. Enter runs the first matching command on a
-/// worker thread; its result surfaces via the status line.
+/// Keys in the command palette. Type to filter, ↑/↓ to choose.
+/// Enter runs the selected command on a worker thread; its result surfaces
+/// via the status line.
 fn handle_command_key(app: &mut app::App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel(),
         KeyCode::Enter => {
-            let cmd = app.command_matches().into_iter().next();
-            if let Some(cmd) = cmd {
-                app.execute_plugin_command(&cmd);
-            } else {
+            let matches = app.command_matches();
+            if matches.is_empty() {
                 app.set_message("no matching command");
+            } else {
+                let idx = app.command_selected.min(matches.len().saturating_sub(1));
+                let cmd = matches[idx].clone();
+                app.execute_plugin_command(&cmd);
             }
         }
+        KeyCode::Up => app.move_command_selection(-1),
+        KeyCode::Down => app.move_command_selection(1),
         KeyCode::Backspace => {
             app.input.backspace();
+            app.clamp_command_selection();
         }
-        KeyCode::Char(c) if !c.is_control() => app.input.push_char(c),
+        KeyCode::Left => app.input.move_left(),
+        KeyCode::Right => app.input.move_right(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.input.clear();
+            app.clamp_command_selection();
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            app.input.push_char(c);
+            app.clamp_command_selection();
+        }
         _ => {}
     }
 }

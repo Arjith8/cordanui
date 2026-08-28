@@ -119,13 +119,27 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 }
 
 /// The command-line match list: up to 8 commands filtered by the input.
+/// The selected entry is highlighted so the palette works as a picker
+/// without typing — ↑/↓ moves, Enter runs.
 fn render_command_matches(app: &App, frame: &mut Frame) {
     let c = &app.theme.colors;
     let matches = app.command_matches();
     if matches.is_empty() {
         return;
     }
-    let rows = matches.len().min(8);
+    let selected = app.command_selected.min(matches.len().saturating_sub(1));
+    let visible = 8usize;
+    let rows = matches.len().min(visible);
+    // Keep the selected entry in the visible window.
+    let start = if matches.len() <= visible {
+        0
+    } else if selected < visible / 2 {
+        0
+    } else if selected + visible / 2 >= matches.len() {
+        matches.len() - visible
+    } else {
+        selected - visible / 2
+    };
     let area = centered_rect(60, 30, frame.area());
     let area = Rect {
         x: area.x,
@@ -137,15 +151,27 @@ fn render_command_matches(app: &App, frame: &mut Frame) {
 
     let lines: Vec<Line> = matches
         .iter()
-        .take(8)
-        .map(|cmd| {
-            Line::from(vec![
-                Span::styled(cmd.name.clone(), Style::default().fg(c.primary)),
-                Span::styled(
-                    format!("  — {}", cmd.desc),
-                    Style::default().fg(c.outline_variant),
-                ),
-            ])
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(i, cmd)| {
+            let is_selected = i == selected;
+            let prefix = if is_selected { "▶ " } else { "  " };
+            let name_style = if is_selected {
+                Style::default().fg(c.on_primary).bg(c.primary).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(c.primary)
+            };
+            let desc_style = if is_selected {
+                Style::default().fg(c.on_primary).bg(c.primary)
+            } else {
+                Style::default().fg(c.outline_variant)
+            };
+            let line = Line::from(vec![
+                Span::styled(format!("{prefix}{}", cmd.name), name_style),
+                Span::styled(format!("  — {}", cmd.desc), desc_style),
+            ]);
+            line
         })
         .collect();
     frame.render_widget(
@@ -517,7 +543,11 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::ConfirmPurge => (" CONFIRM PURGE ".to_string(), String::new()),
         Mode::Help => (" HELP ".to_string(), String::new()),
         Mode::PluginManager { .. } | Mode::PluginHelp | Mode::PluginConfigure { .. } => {
-            (" PLUGIN ".to_string(), app.input.text.clone())
+            if let Some(msg) = &app.message {
+                (format!(" {} ", msg), String::new())
+            } else {
+                (" PLUGIN ".to_string(), app.input.text.clone())
+            }
         }
         Mode::AgentPicker { .. } | Mode::AgentRunning { .. } => {
             (" AGENT ".to_string(), String::new())
@@ -632,7 +662,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::ConfirmDeleteSheet { .. } => "y to confirm · n/Esc to cancel".into(),
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
         Mode::PluginPanel => "plugin panel — keys go to the plugin".into(),
-        Mode::Command => "type to filter · Enter run · Esc close".into(),
+        Mode::Command => "↑↓ select · type to filter · Enter run · Esc close".into(),
         Mode::GlobalConfig => {
             let field_count = app.global_spec.as_ref().map(|s| s.fields.len()).unwrap_or(0);
             if app.config_editing.is_some() {
