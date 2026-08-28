@@ -163,8 +163,12 @@ pub fn plugin_runtime_hooks(
     styles: &std::sync::Arc<crate::style::StyleBridge>,
     ui: &std::sync::Arc<PluginUiBridge>,
     services: &std::sync::Arc<crate::services::ServiceManager>,
+    sheets: &std::sync::Arc<crate::sheets::SheetManager>,
+    buffers: &std::sync::Arc<crate::buffers::BufferManager>,
 ) -> cordanui_plugin_runtime::HostHooks {
     let services: std::sync::Arc<dyn cordanui_plugin_runtime::ServiceHost> = services.clone();
+    let sheets: std::sync::Arc<dyn cordanui_plugin_runtime::ui::SheetsHost> = sheets.clone();
+    let buffers: std::sync::Arc<dyn cordanui_plugin_runtime::ui::BuffersHost> = buffers.clone();
     cordanui_plugin_runtime::HostHooks::new()
         .with_styles(styles.clone())
         .with_ui(ui.clone())
@@ -172,6 +176,8 @@ pub fn plugin_runtime_hooks(
         .with_config(ui.clone())
         .with_services(services)
         .with_errors(ui.clone())
+        .with_sheets(sheets)
+        .with_buffers(buffers)
 }
 
 #[cfg(test)]

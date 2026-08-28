@@ -2162,6 +2162,8 @@ impl App {
                     &self.styles,
                     &self.plugin_ui,
                     &self.services,
+                    &self.sheet_manager,
+                    &self.buffer_manager,
                 ),
             ) {
                 Ok(state) => {
