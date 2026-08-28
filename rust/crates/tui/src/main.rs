@@ -17,6 +17,7 @@ mod services;
 mod sheets;
 mod style;
 mod theme;
+mod types;
 mod ui;
 
 use std::io::{self, stdout};
