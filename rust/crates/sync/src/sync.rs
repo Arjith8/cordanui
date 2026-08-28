@@ -32,15 +32,6 @@ pub struct RemoteConfig {
     pub token: String,
 }
 
-/// `libsql://` and `turso://` are address schemes meaning HTTPS.
-pub fn normalize_base_url(url: &str) -> String {
-    url.trim()
-        .replacen("libsql://", "https://", 1)
-        .replacen("turso://", "https://", 1)
-        .trim_end_matches('/')
-        .to_string()
-}
-
 // ---------- table configuration ----------
 
 struct TableSync {
