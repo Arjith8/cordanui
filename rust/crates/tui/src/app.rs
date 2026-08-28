@@ -30,16 +30,11 @@ pub use crate::types::{
 /// The full TUI application state.
 pub struct App {
     pub db: Database,
-    /// Configured key bindings ([keybinds] in config.toml).
     pub keybinds: crate::config::Keybinds,
-    /// Resolved style palette (builtin ← theme ← global ← session).
     /// Re-resolved whenever [`Self::styles`] reports changes.
     pub theme: crate::theme::Theme,
-    /// Live style overrides — the host side of `cord.g` / `cord["local"]`.
     pub styles: std::sync::Arc<crate::style::StyleBridge>,
-    /// Supervises plugin `[service]` processes.
     pub services: std::sync::Arc<crate::services::ServiceManager>,
-    /// Host side of the `cord.ui.*` dialog API. Plugins submit requests
     /// here; the loop drains them into [`Self::plugin_modal`].
     pub plugin_ui: std::sync::Arc<crate::plugin_ui::PluginUiBridge>,
     /// The open plugin modal, if any. Always paired with
@@ -52,15 +47,11 @@ pub struct App {
     /// out to a worker thread while a command runs and re-inserted on
     /// completion.
     pub(crate) plugin_states: std::sync::Mutex<HashMap<String, cordanui_plugin_runtime::LuaPlugin>>,
-    /// Every command exposed by loaded plugins (name + description +
     /// owning plugin), refreshed when states load.
     pub plugin_commands: Vec<PluginCommand>,
-    /// Tabs for the help page: built-in keybinds first, then one tab per
     /// active plugin that ships `[[help]]` manifest sections.
     pub help_tabs: Vec<HelpTab>,
-    /// Currently selected help tab.
     pub help_selected: usize,
-    /// Scroll offset within the selected tab's content.
     pub help_scroll: usize,
     /// In-flight plugin command result channel + guard.
     pub(crate) command_rx: Option<std::sync::mpsc::Receiver<PluginCommandOutcome>>,
@@ -69,63 +60,44 @@ pub struct App {
     /// network I/O never blocks the UI thread. `None` = sync not
     /// configured.
     pub(crate) sync_db: Option<std::sync::Arc<std::sync::Mutex<Database>>>,
-    /// Replication status shown in the title bar.
     pub sync_status: SyncStatus,
     /// Set while a sync worker is running.
     pub(crate) sync_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     pub(crate) sync_in_flight: bool,
     pub(crate) last_sync_attempt: Option<std::time::Instant>,
-    /// All goals loaded from the DB.
     pub goals: Vec<Goal>,
-    /// IDs of expanded nodes in the tree.
     pub expanded: HashSet<String>,
-    /// ID of the goal whose details (description) are shown, if any.
     pub detailed: Option<String>,
     /// Ratatui list state — tracks selection + scroll offset of the goal list.
     pub list_state: ListState,
     /// Whether the leader key (Ctrl+A) was just pressed and we're waiting
     /// for the command key.
     pub leader_pending: bool,
-    /// Current interaction mode.
     pub mode: Mode,
     /// Text input buffer (reused across modes).
     pub input: InputBuffer,
-    /// Transient status message shown in the status bar.
     pub message: Option<String>,
     /// Plugin manager: in-flight task channel (background thread).
     pub plugin_rx: Option<std::sync::mpsc::Receiver<crate::plugins::TaskEvent>>,
     /// Plugin manager: current task state rendered in the popup.
     pub plugin_state: crate::plugins::TaskState,
-    /// Installed plugins (most recent first).
     pub installed_plugins: Vec<db::PluginRow>,
-    /// Selection index into `installed_plugins`.
     pub plugin_selected: usize,
-    /// Configure form: the [ui] spec of the plugin being configured.
     pub config_spec: Option<cordanui_plugin_runtime::UiSpec>,
-    /// Global settings page: synthetic spec (turso url/token) + values.
     pub global_spec: Option<cordanui_plugin_runtime::UiSpec>,
     pub global_values: std::collections::BTreeMap<String, String>,
-    /// Active Lua plugins that own a configurator: (name, description).
     pub global_plugin_entries: Vec<(String, String)>,
-    /// Configure form: current editable values (bare field key → value).
     pub config_values: std::collections::BTreeMap<String, String>,
-    /// Configure form: selected field index.
     pub config_selected: usize,
     /// Configure form: in-progress edit buffer (None = not editing).
     pub config_editing: Option<String>,
-    /// Agent picker choices (provider × model) for the current picker.
     pub agent_choices: Vec<AgentChoice>,
-    /// Agent picker selection index.
     pub agent_selected: usize,
     /// In-flight agent run event channel.
     pub agent_rx: Option<std::sync::mpsc::Receiver<cordanui_plugin_runtime::AgentEvent>>,
-    /// Live log of the running agent's progress events.
     pub agent_log: Vec<String>,
-    /// Goal the in-flight agent run belongs to (survives navigation).
     pub agent_goal: Option<String>,
-    /// Move picker: candidate parents (None = root) for the goal being moved.
     pub move_choices: Vec<(Option<String>, String)>,
-    /// Move picker selection index.
     pub move_selected: usize,
     /// Goal sheets (buffers) for work/project separation.
     pub sheets: Vec<cordanui_schema::GoalSheet>,
@@ -217,13 +189,10 @@ impl App {
         Ok(app)
     }
 
-    /// Index into `flat_rows()` of the currently selected row.
     pub fn selected_index(&self) -> usize {
         self.list_state.selected().unwrap_or(0)
     }
 
-    /// Reload goals from the DB. The trailing dummy row (for root creation)
-    /// is always present, so selection is clamped to `flat_len_with_dummy()`.
     pub fn reload(&mut self) -> anyhow::Result<()> {
         self.goals = db::get_all(&self.db)?;
         let max = self.flat_len_with_dummy().saturating_sub(1);
@@ -233,10 +202,6 @@ impl App {
         Ok(())
     }
 
-    /// Build the flattened tree for rendering. Returns owned `FlatRow`s so
-    /// callers can hold them across `&mut self` calls.
-    /// When a sheet (buffer) is active, only goals in that sheet are shown.
-    /// When a plugin buffer is active, goals are hidden (buffer owns the view).
     pub fn flat_rows(&self) -> Vec<FlatRow> {
         if self.active_buffer_id.lock().unwrap().is_some() {
             return Vec::new();
@@ -294,24 +259,18 @@ impl App {
         }
     }
 
-    /// The currently selected row, if any (owned, so no borrow conflicts).
-    /// Returns `None` when the dummy "add root" row is selected.
     pub fn selected_row(&self) -> Option<FlatRow> {
         self.flat_rows().get(self.selected_index()).cloned()
     }
 
-    /// Whether the dummy "add root goal" row at the end is selected.
     pub fn is_dummy_selected(&self) -> bool {
         self.selected_index() == self.flat_rows().len()
     }
 
-    /// Total rows including the trailing dummy for root creation.
     pub fn flat_len_with_dummy(&self) -> usize {
         self.flat_rows().len() + 1
     }
 
-    /// IDs of goals marked completed whose subtree is not fully completed —
-    /// rendered with a green ringed circle instead of the normal check.
     pub fn partially_complete_ids(&self) -> HashSet<String> {
         let mut by_parent: HashMap<Option<String>, Vec<&Goal>> = HashMap::new();
         for g in &self.goals {
@@ -361,7 +320,6 @@ impl App {
         }
     }
 
-    /// Jump to the first / last visible row (including dummy).
     pub fn select_first(&mut self) {
         self.list_state.select(Some(0));
     }
@@ -588,7 +546,6 @@ impl App {
         self.input.clear();
     }
 
-    /// Danger zone (global settings, last row): arm the purge confirmation.
     pub fn request_purge(&mut self) {
         if self.config_editing.is_some() {
             return;
@@ -596,8 +553,6 @@ impl App {
         self.mode = Mode::ConfirmPurge;
     }
 
-    /// Actually purge: delete all data rows, then re-resolve every piece
-    /// of in-memory state that was derived from them.
     pub fn confirm_purge(&mut self) -> anyhow::Result<()> {
         if self.mode != Mode::ConfirmPurge {
             return Ok(());
@@ -611,7 +566,6 @@ impl App {
         Ok(())
     }
 
-    /// Leader + plugins: open the plugin manager popup (list focused).
     pub fn open_plugin_manager(&mut self) -> anyhow::Result<()> {
         self.input.clear();
         self.reload_installed_plugins()?;
@@ -622,7 +576,6 @@ impl App {
         Ok(())
     }
 
-    /// `i` from the list: open the install input overlay.
     pub fn start_install_mode(&mut self) {
         self.input.clear();
         self.mode = Mode::PluginManager {
@@ -633,17 +586,11 @@ impl App {
     /// `c` on a selected plugin: load its [ui] spec + stored settings and
     /// open the configure form. Plugins without a [ui] section just report
     /// that there's nothing to configure.
-    /// Give `cord.config` its database handle. Call once after
-    /// construction (the App's own handle is moved, not shareable).
     pub fn attach_plugin_config_db(&mut self, db: Database) {
         self.plugin_ui
             .attach_config_db(std::sync::Arc::new(std::sync::Mutex::new(db)));
     }
 
-    /// Configure the selected plugin. A Lua plugin that defines
-    /// `plugin.configure` owns the whole page — we only invoke it (it may
-    /// open panels/dialogs and persists via `cord.config`). Everything
-    /// else falls back to the declarative `[[field]]` form.
     pub fn open_configure(&mut self) -> anyhow::Result<()> {
         let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
             return Ok(());
@@ -698,9 +645,6 @@ impl App {
         Ok(())
     }
 
-    /// Commit the in-progress edit for the selected field.
-    /// Open the global settings page: host Sync section (Turso) plus one
-    /// entry per active plugin that owns a configurator.
     pub fn open_global_config(&mut self) {
         use cordanui_plugin_runtime::{UiField, UiSpec};
         let (url, token) = cordanui_sync::read_turso_credentials();
@@ -754,8 +698,6 @@ impl App {
         self.mode = Mode::GlobalConfig;
     }
 
-    /// Total selectable rows on the global page: fields + plugin entries
-    /// + the danger-zone purge row.
     pub fn global_row_count(&self) -> usize {
         self.global_spec
             .as_ref()
@@ -765,8 +707,6 @@ impl App {
             + 1
     }
 
-    /// Persist the Sync section back to config.toml. Other sections
-    /// (keybinds, ...) survive. Sync itself reconnects on next start.
     pub fn commit_global_field(&mut self) -> anyhow::Result<()> {
         let (Some(spec), Some(buf)) = (&self.global_spec, &self.config_editing) else {
             return Ok(());
@@ -801,8 +741,6 @@ impl App {
         Ok(())
     }
 
-    /// Cycle a `select` field through its options (Tab / Shift+Tab).
-    /// Saves immediately — selects have no free-text edit step.
     pub fn cycle_config_field(&mut self, plugin: &str, delta: i32) -> anyhow::Result<()> {
         let Some(spec) = &self.config_spec else {
             return Ok(());
@@ -836,7 +774,6 @@ impl App {
         Ok(())
     }
 
-    /// True if the field under the cursor is a cycleable select.
     pub fn config_selected_is_select(&self) -> bool {
         self.config_spec
             .as_ref()
@@ -890,8 +827,6 @@ impl App {
     /// and open the picker for the selected goal. Any plugin with
     /// `capabilities.provider` or `capabilities.agent` that can handle
     /// `agent-run` is eligible. Provider plugins expand to one entry per
-    /// model; pure agent plugins produce a single entry. Lua plugins require
-    /// no built binary; binary plugins do.
     pub fn open_agent_picker(&mut self, goal_id: String) -> anyhow::Result<()> {
         self.reload_installed_plugins()?;
         let mut choices = Vec::new();
@@ -961,8 +896,6 @@ impl App {
         Ok(())
     }
 
-    /// Spawn the chosen provider in a background thread and mark the goal
-    /// as running.
     pub fn start_agent_run(&mut self, goal_id: String) -> anyhow::Result<()> {
         let Some(choice) = self.agent_choices.get(self.agent_selected).cloned() else {
             return Ok(());
@@ -1094,9 +1027,6 @@ impl App {
         Ok(())
     }
 
-    /// Drain in-flight agent events (non-blocking), called every loop
-    /// iteration regardless of mode so completion lands even if the user
-    /// navigated away.
     pub fn poll_agent_events(&mut self) -> anyhow::Result<()> {
         if self.agent_rx.is_none() {
             return Ok(());
@@ -1212,7 +1142,6 @@ impl App {
 
     // ---------- move (reparent) ----------
 
-    /// Collect all descendant ids of `root` (excluding root itself) via parent_id.
     fn descendant_ids(&self, root: &str) -> HashSet<String> {
         let mut out = HashSet::new();
         let mut stack = vec![root.to_string()];
@@ -1233,8 +1162,6 @@ impl App {
         out
     }
 
-    /// Open the move picker for the selected goal. Lists root + every goal
-    /// that is not the goal itself nor its descendant (to avoid cycles).
     pub fn open_move_picker(&mut self, goal_id: String) -> anyhow::Result<()> {
         let Some(goal) = self.goals.iter().find(|g| g.id == goal_id).cloned() else {
             return Ok(());
@@ -1271,7 +1198,6 @@ impl App {
         Ok(())
     }
 
-    /// Confirm the move to the selected parent.
     pub fn confirm_move(&mut self) -> anyhow::Result<()> {
         let goal_id = match &self.mode {
             Mode::MovePicker { goal_id } => goal_id.clone(),
@@ -1470,7 +1396,6 @@ impl App {
         }
     }
 
-    /// Start/stop the selected plugin's `[service]` (`s` in the manager).
     pub fn toggle_selected_service(&mut self) -> anyhow::Result<()> {
         let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
             return Ok(());
@@ -1492,8 +1417,6 @@ impl App {
         Ok(())
     }
 
-    /// Pull + rebuild every installed plugin on a worker thread
-    /// (`u` in the plugin manager). Lua plugins are pull-only — no build.
     pub fn update_all_plugins(&mut self) {
         if self.plugin_rx.is_some() {
             self.set_message("a plugin task is already running");
@@ -1516,7 +1439,6 @@ impl App {
         self.plugin_rx = Some(crate::plugins::spawn_update_all_task(installed));
     }
 
-    /// Re-read the plugins registry from the DB.
     pub fn reload_installed_plugins(&mut self) -> anyhow::Result<()> {
         self.installed_plugins = db::list_plugins(&self.db)?;
         let max = self.installed_plugins.len().saturating_sub(1);
@@ -1533,8 +1455,6 @@ impl App {
     /// it writes an empty string to hide the UI on other clients.
     ///
     /// The URL itself is the agent backend's wake endpoint — read from the
-    /// `agent.url` config key if set, else a sensible default. Mobile reads
-    /// this synced setting to decide whether to show agent triggers.
     pub fn announce_agent_capability(&mut self) -> anyhow::Result<()> {
         let has_provider = self.installed_plugins.iter().any(|p| {
             if !p.active {
@@ -1572,8 +1492,6 @@ impl App {
     }
 
     /// Activate/deactivate the selected plugin. Activating a theme-capable
-    /// plugin applies its first theme pack live; deactivating reverts to
-    /// builtin dark.
     pub fn toggle_plugin_active(&mut self) -> anyhow::Result<()> {
         let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
             return Ok(());
@@ -1628,7 +1546,6 @@ impl App {
         self.announce_agent_capability()
     }
 
-    /// Uninstall the selected plugin: delete files + registry row.
     pub fn uninstall_selected_plugin(&mut self) -> anyhow::Result<()> {
         let Some(p) = self.installed_plugins.get(self.plugin_selected) else {
             return Ok(());
@@ -1643,8 +1560,6 @@ impl App {
         self.announce_agent_capability()
     }
 
-    /// Dispatch a plugin task for whatever is in the input buffer:
-    /// verify + install a GitHub repo, or run a free-text search.
     pub fn start_plugin_search(&mut self) {
         let query = self.input.text.trim().to_string();
         if query.is_empty() {
@@ -1654,10 +1569,6 @@ impl App {
         self.plugin_state = crate::plugins::TaskState::Working(Vec::new());
     }
 
-    /// Drain queued `cord.ui.*` requests and open the first as a modal.
-    /// Called every loop iteration. A request arriving while anything else
-    /// is on screen is refused — plugins get a clean error instead of a
-    /// surprise dialog.
     pub fn poll_plugin_ui_requests(&mut self) {
         let Some(event) = self.plugin_ui.try_take_event() else {
             return;
@@ -1717,7 +1628,6 @@ impl App {
         self.mode = Mode::PluginModal;
     }
 
-    /// Answer the open plugin modal and close it.
     pub fn answer_plugin_modal(&mut self, response: UiResponse) {
         if let Some(modal) = self.plugin_modal.take() {
             let _ = modal.respond.send(response);
@@ -1727,7 +1637,6 @@ impl App {
         }
     }
 
-    /// The text currently typed into an open input modal.
     pub fn plugin_modal_text(&self) -> Option<&str> {
         match &self.plugin_modal {
             Some(ActivePluginModal {
@@ -1739,7 +1648,6 @@ impl App {
         }
     }
 
-    /// Feed a character into an open input modal.
     pub fn plugin_modal_push_char(&mut self, c: char) {
         if let Some(ActivePluginModal { kind, .. }) = &mut self.plugin_modal {
             match kind {
@@ -1750,7 +1658,6 @@ impl App {
         }
     }
 
-    /// Remove the last character from an open input modal.
     pub fn plugin_modal_backspace(&mut self) {
         if let Some(ActivePluginModal { kind, .. }) = &mut self.plugin_modal {
             match kind {
@@ -1763,7 +1670,6 @@ impl App {
         }
     }
 
-    /// Move the cursor in an open pick/multiselect modal.
     pub fn plugin_modal_move_selection(&mut self, delta: i32) {
         let len = match &self.plugin_modal {
             Some(m) => match &m.request {
@@ -1784,7 +1690,6 @@ impl App {
         }
     }
 
-    /// Toggle the highlighted item in an open multiselect modal (space).
     pub fn plugin_modal_toggle_current(&mut self) {
         if let Some(ActivePluginModal {
             kind: PluginModalKind::MultiSelect { selected, cursor },
@@ -1797,7 +1702,6 @@ impl App {
         }
     }
 
-    /// Insert a newline in an open text-editor modal (plain Enter).
     pub fn plugin_modal_newline(&mut self) {
         if let Some(ActivePluginModal {
             kind: PluginModalKind::TextEditor { buffer, .. },
@@ -1808,7 +1712,6 @@ impl App {
         }
     }
 
-    /// Submit the open modal with its current state (Enter).
     pub fn submit_plugin_modal(&mut self) {
         let Some(modal) = &self.plugin_modal else {
             return;
@@ -1835,7 +1738,6 @@ impl App {
         self.answer_plugin_modal(response);
     }
 
-    /// Cancel the open modal (Esc / 'n').
     pub fn cancel_plugin_modal(&mut self) {
         let is_confirm = matches!(
             self.plugin_modal.as_ref().map(|m| &m.kind),
@@ -1849,8 +1751,6 @@ impl App {
         self.answer_plugin_modal(response);
     }
 
-    /// Take the next queued `show_panel` / `close_panel` command.
-    /// Called every loop iteration after [`Self::poll_plugin_ui_requests`].
     pub fn poll_plugin_panel(&mut self) {
         match self.plugin_ui.try_take_panel_command() {
             Some(PanelCommand::Open(spec)) => {
@@ -1864,7 +1764,6 @@ impl App {
         }
     }
 
-    /// Close the plugin panel (Esc pass-through or `cord.ui.close_panel`).
     pub fn close_plugin_panel(&mut self) {
         self.plugin_panel = None;
         if self.mode == Mode::PluginPanel {
@@ -1872,9 +1771,6 @@ impl App {
         }
     }
 
-    /// Load (or reload) every active Lua-runtime plugin's state and
-    /// rebuild the command registry. Called at startup; install/activate
-    /// flows can call it again to pick up new commands.
     pub fn load_plugin_states(&mut self) -> Vec<String> {
         let mut problems = Vec::new();
         let Ok(plugins) = db::list_plugins(&self.db) else {
@@ -1938,10 +1834,6 @@ impl App {
         problems
     }
 
-    /// Open the command line over loaded plugin commands. Refreshes
-    /// plugin states first so freshly installed/activated plugins work
-    /// without a restart; load problems surface on the status line
-    /// (stderr is invisible inside a TUI session).
     pub fn open_command_mode(&mut self) {
         let problems = self.load_plugin_states();
         self.input.clear();
@@ -1956,7 +1848,6 @@ impl App {
         self.mode = Mode::Command;
     }
 
-    /// Commands matching the current input text (substring, case-insensitive).
     pub fn command_matches(&self) -> Vec<PluginCommand> {
         let q = self.input.text.trim().to_lowercase();
         self.plugin_commands
@@ -1970,14 +1861,10 @@ impl App {
             .collect()
     }
 
-    /// Run the named command on a worker thread. Its Lua state is moved
-    /// out of the cache until it finishes — dialogs/panels it opens are
-    /// answered through the normal event loop while we keep drawing.
     pub fn execute_plugin_command(&mut self, cmd: &PluginCommand) {
         self.spawn_plugin_call(&cmd.plugin_name, PluginCall::Command(cmd.name.clone()));
     }
 
-    /// Shared worker spawn for commands and custom configure pages.
     pub fn spawn_plugin_call(&mut self, plugin_name: &str, call: PluginCall) {
         if self.command_running {
             self.set_message("a command is already running");
@@ -2014,7 +1901,6 @@ impl App {
         });
     }
 
-    /// Drain finished command outcomes. Non-blocking.
     pub fn poll_command_results(&mut self) {
         let Some(rx) = &self.command_rx else {
             return;
@@ -2049,16 +1935,12 @@ impl App {
         }
     }
 
-    /// Give the sync worker its own DB handle (same local file, separate
-    /// connection). Call at startup when credentials are configured; the
-    /// first sync fires on the next loop iteration (startup pull).
     pub fn attach_sync_db(&mut self, db: Database) {
         self.sync_db = Some(std::sync::Arc::new(std::sync::Mutex::new(db)));
         self.sync_status = SyncStatus::Syncing;
         self.last_sync_attempt = None;
     }
 
-    /// Manual sync (`<leader>s`): due immediately on the next frame.
     pub fn request_sync(&mut self) {
         if self.sync_db.is_none() {
             // No credentials configured — sync is not active. Surface it in
@@ -2082,9 +1964,6 @@ impl App {
         self.set_message("syncing…");
     }
 
-    /// Fire the periodic push/pull sync when due and drain finished syncs.
-    /// Called every loop iteration. The worker runs on its own thread —
-    /// sync is network I/O and must never block the UI.
     pub fn poll_sync(&mut self) {
         if let Some(rx) = &self.sync_rx {
             match rx.try_recv() {
@@ -2135,15 +2014,10 @@ impl App {
         });
     }
 
-    /// Record a failure in the `errors` table from anywhere in the app.
-    /// Best-effort — never panics or fails.
     pub fn record_error(&mut self, context: &str, message: &str, detail: Option<&str>) {
         db::log_error(&self.db, context, message, detail);
     }
 
-    /// Open the help page: rebuild the tab list (built-in keybinds first,
-    /// then one tab per active plugin with `[[help]]` manifest sections)
-    /// and select the built-in tab.
     pub fn open_help(&mut self) {
         let _ = self.reload_installed_plugins();
 
@@ -2187,7 +2061,6 @@ impl App {
         self.mode = Mode::Help;
     }
 
-    /// Cycle the selected help tab (wraps around).
     pub fn cycle_help_tab(&mut self, delta: i32) {
         if self.help_tabs.is_empty() {
             return;
@@ -2198,9 +2071,6 @@ impl App {
         self.help_scroll = 0;
     }
 
-    /// Commit any pending style changes and re-resolve the palette if
-    /// something changed. Called every loop iteration so `cord.g` /
-    /// `cord["local"]` restyles land within a frame or two.
     pub fn apply_style_updates(&mut self) -> anyhow::Result<()> {
         if !self.styles.dirty() {
             return Ok(());
@@ -2223,9 +2093,6 @@ impl App {
         Ok(())
     }
 
-    /// Drain the in-flight plugin task (non-blocking). Called every loop
-    /// iteration; `Log` events accumulate in the activity log so the popup
-    /// can show live progress (resolving → cloning % → manifest check).
     pub fn poll_plugin_search(&mut self) -> anyhow::Result<()> {
         if self.plugin_rx.is_none() {
             return Ok(());
@@ -2374,7 +2241,6 @@ impl App {
         self.message = None;
     }
 
-    /// Move the selected goal up within its sibling group (swap sort_order).
     pub fn reorder_up(&mut self) -> anyhow::Result<()> {
         let row = match self.selected_row() {
             Some(r) => r,
@@ -2417,7 +2283,6 @@ impl App {
         Ok(())
     }
 
-    /// Move the selected goal down within its sibling group (swap sort_order).
     pub fn reorder_down(&mut self) -> anyhow::Result<()> {
         let row = match self.selected_row() {
             Some(r) => r,
