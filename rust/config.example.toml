@@ -30,6 +30,33 @@ help = "h"
 # <leader> + plugins: open the plugin manager popup.
 plugins = "p"
 
+# Bare key: delete selected goal + subgoals (with confirmation).
+delete = "d"
+
+# Bare key: edit selected goal title.
+edit_title = "e"
+
+# Bare key: edit selected goal description.
+edit_description = "E"
+
+# Bare key: toggle complete on selected goal.
+toggle_complete = "space"
+
+# Bare key: move selected goal under another parent / to root.
+move_goal = "m"
+
+# <leader> + sheets: open sheet (buffer) picker.
+# sheets = "b"
+
+# <leader> + commands: open the plugin-command line.
+# commands = ";"
+
+# <leader> + global_config: open the global settings page.
+# global_config = ","
+
+# <leader> + sync: sync with Turso now.
+# sync = "s"
+
 [turso]
 # Your Turso database URL (libsql://...).
 # Create a database at https://turso.tech/app

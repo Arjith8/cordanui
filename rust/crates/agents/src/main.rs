@@ -58,7 +58,7 @@ async fn main() -> Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_POLL_INTERVAL_SECS);
             tracing::info!(interval_secs = interval, "starting poll mode");
-            runner::poll_loop(&runner, interval).await;
+            runner.poll_loop(interval).await;
             Ok(())
         }
         Some("--serve") => {
@@ -66,13 +66,13 @@ async fn main() -> Result<()> {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(DEFAULT_PORT);
             tracing::info!(port, "starting wake mode (HTTP server)");
-            runner::serve(&runner, port).await
+            runner.serve(port).await
         }
         Some("--run-once") => {
             let task_id = args
                 .get(1)
                 .ok_or_else(|| anyhow::anyhow!("usage: cordanui-agents --run-once <task_id>"))?;
-            runner::process_task(&runner, task_id).await;
+            runner.process_task(task_id.clone()).await;
             Ok(())
         }
         Some(other) => {
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
 }
 
 /// Extract the value after a --flag from args, if present.
-fn parse_flag(args: &[String], flag: &str) -> Option<&str> {
+fn parse_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     let idx = args.iter().position(|a| a == flag)?;
     args.get(idx + 1).map(String::as_str)
 }

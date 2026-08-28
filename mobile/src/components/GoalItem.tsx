@@ -11,6 +11,8 @@ import AgentStatusBadge from '@/components/AgentStatusBadge';
 import EditableText from '@/components/EditableText';
 import InlineAddInput from '@/components/InlineAddInput';
 import StatusCircle from '@/components/StatusCircle';
+import PluginCard from '@/components/PluginCard';
+import { parseMobileWidgets } from '@/plugin/metadata';
 
 /**
  * A goal rendered as an accordion node in a border-drawn tree. Children live
@@ -32,6 +34,7 @@ export interface GoalItemProps {
   onRename: (id: string, title: string) => void;
   onSaveDescription: (id: string, description: string) => void;
   onDeleteDirect: (id: string) => void;
+  onMove?: (id: string) => void;
   /** Persist a sibling group's new order. */
   onReorderGroup: (group: Goal[]) => void;
   /**
@@ -103,6 +106,7 @@ export default function GoalItem({
   onRename,
   onSaveDescription,
   onDeleteDirect,
+  onMove,
   onReorderGroup,
   draftText,
   onDraftFocus,
@@ -210,15 +214,30 @@ export default function GoalItem({
                     );
                   })}
                 </View>
-                <Pressable onPress={() => onDeleteDirect(goal.id)} hitSlop={8}>
-                  <Text style={{ color: colors.error, fontSize: 15 }}>🗑</Text>
-                </Pressable>
+                <View style={{ flexDirection: 'row', gap: 12, alignItems: 'center' }}>
+                  {onMove ? (
+                    <Pressable onPress={() => onMove(goal.id)} hitSlop={8}>
+                      <Text style={{ color: colors.primary, fontSize: 13 }}>↳ Move</Text>
+                    </Pressable>
+                  ) : null}
+                  <Pressable onPress={() => onDeleteDirect(goal.id)} hitSlop={8}>
+                    <Text style={{ color: colors.error, fontSize: 15 }}>🗑</Text>
+                  </Pressable>
+                </View>
               </View>
 
               {/* Agent status badge — only for goals in agent_mode. */}
               {goal.status === 'agent_mode' ? (
                 <AgentStatusBadge goal={goal} />
               ) : null}
+
+              {/* Plugin-driven card — any plugin can inject declarative widgets
+                  via goals.metadata JSON (mobile.card / mobile.widgets). Host
+                  owns rendering; plugins never run code on device. */}
+              {(() => {
+                const widgets = parseMobileWidgets(goal);
+                return widgets ? <PluginCard widgets={widgets} /> : null;
+              })()}
             </View>
           </View>
 
@@ -244,6 +263,7 @@ export default function GoalItem({
                   onRename={onRename}
                   onSaveDescription={onSaveDescription}
                   onDeleteDirect={onDeleteDirect}
+                  onMove={onMove}
                   onReorderGroup={onReorderGroup}
                   draftText={draftFor(item.id)}
                   draftFor={draftFor}

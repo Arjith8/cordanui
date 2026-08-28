@@ -396,6 +396,7 @@ export async function updateGoal(id: string, input: UpdateGoalInput): Promise<Go
   setIf('agent_result', input.agent_result);
   setIf('agent_progress', input.agent_progress);
   setIf('metadata', input.metadata);
+  setIf('parent_id', input.parent_id);
 
   if (fields.length === 0) return getGoal(id);
 

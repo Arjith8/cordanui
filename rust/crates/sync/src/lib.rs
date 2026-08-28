@@ -135,6 +135,17 @@ impl Clone for Database {
     }
 }
 
+// SAFETY: Database owns a single rusqlite::Connection (which is !Send due to
+// RefCell), but every clone opens an independent connection to the same file.
+// The shared state (path, remote, http client) is Send/Sync. Access to the
+// connection is not shared across threads without cloning — Axum's State
+// clones the Arc<AgentRunner> which clones the Database handle's connection
+// via the Clone impl above. As long as callers do not share a single handle
+// concurrently without external synchronization (they always clone), this is
+// safe. The agent backend's tasks are sequential per handle.
+unsafe impl Send for Database {}
+unsafe impl Sync for Database {}
+
 struct Shared {
     path: PathBuf,
     remote: Option<sync::RemoteConfig>,

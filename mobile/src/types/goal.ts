@@ -52,6 +52,7 @@ export interface UpdateGoalInput {
   agent_result?: string | null;
   agent_progress?: string | null;
   metadata?: string | null;
+  parent_id?: string | null;
 }
 
 /**

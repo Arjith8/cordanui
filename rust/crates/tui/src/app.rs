@@ -6,6 +6,7 @@
 //! input field at the bottom of the screen.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use cordanui_schema::{CreateGoalInput, Goal, GoalStatus, UpdateGoalInput};
@@ -46,6 +47,14 @@ pub enum Mode {
     AgentPicker { goal_id: String },
     /// An agent run is streaming for this goal.
     AgentRunning { goal_id: String },
+    /// Pick a new parent for the selected goal (None = move to root).
+    MovePicker { goal_id: String },
+    /// Pick a sheet (buffer) to switch to, or create/delete.
+    SheetPicker,
+    /// Adding a new sheet (buffer).
+    AddSheet,
+    /// Confirm deleting a sheet.
+    ConfirmDeleteSheet { sheet_id: String },
     /// A plugin requested a modal dialog via `cord.ui.*`. The payload
     /// lives in [`App::plugin_modal`] because it carries a non-comparable
     /// responder channel.
@@ -165,12 +174,15 @@ pub struct PluginCommandOutcome {
     pub result: anyhow::Result<Option<String>>,
 }
 
-/// One selectable (provider plugin, model) pair in the agent picker.
+/// One selectable agent/provider choice in the agent picker.
+/// For `provider` plugins this expands to one entry per model; for pure
+/// `agent` plugins there is a single entry with `model = None`.
 #[derive(Debug, Clone)]
 pub struct AgentChoice {
     pub plugin: String,
-    pub model: String,
+    pub model: Option<String>,
     pub binary: std::path::PathBuf,
+    pub is_lua: bool,
     pub config: Option<serde_json::Value>,
 }
 
@@ -356,19 +368,42 @@ pub struct App {
     pub agent_log: Vec<String>,
     /// Goal the in-flight agent run belongs to (survives navigation).
     pub agent_goal: Option<String>,
+    /// Move picker: candidate parents (None = root) for the goal being moved.
+    pub move_choices: Vec<(Option<String>, String)>,
+    /// Move picker selection index.
+    pub move_selected: usize,
+    /// Goal sheets (buffers) for work/project separation.
+    pub sheets: Vec<cordanui_schema::GoalSheet>,
+    pub active_sheet_id: Arc<Mutex<Option<String>>>,
+    pub sheet_picker_selected: usize,
+    /// Plugin-controlled buffers: sheet_id -> PanelSpec (draw/on_key).
+    /// When active_buffer_id is Some, that buffer's content is shown instead of goals.
+    pub plugin_buffers: Arc<Mutex<HashMap<String, cordanui_plugin_runtime::PanelSpec>>>,
+    pub active_buffer_id: Arc<Mutex<Option<String>>>,
+    pub sheet_manager: Arc<crate::sheets::SheetManager>,
+    pub buffer_manager: Arc<crate::buffers::BufferManager>,
 }
 
 impl App {
     pub fn new(db: Database) -> anyhow::Result<Self> {
         let goals = db::get_all(&db)?;
+        let sheets = db::list_sheets(&db).unwrap_or_default();
+        let active_sheet: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let active_buffer: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let buffers: Arc<Mutex<HashMap<String, cordanui_plugin_runtime::PanelSpec>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let sheet_manager = Arc::new(crate::sheets::SheetManager::new(active_sheet.clone()));
+        sheet_manager.attach_db(db.clone());
+        let buffer_manager = Arc::new(crate::buffers::BufferManager::new(
+            buffers.clone(),
+            active_buffer.clone(),
+        ));
         let styles = std::sync::Arc::new(crate::style::StyleBridge::new());
         let services = std::sync::Arc::new(crate::services::ServiceManager::new());
         let theme = crate::theme::Theme::resolve(&db, &styles.session_snapshot());
         let plugin_ui = std::sync::Arc::new(crate::plugin_ui::PluginUiBridge::new());
         let mut list_state = ListState::default();
-        if !goals.is_empty() {
-            list_state.select(Some(0));
-        }
+        list_state.select(Some(0));
         let mut app = Self {
             db,
             keybinds: crate::config::Keybinds::default(),
@@ -414,6 +449,15 @@ impl App {
             agent_rx: None,
             agent_log: Vec::new(),
             agent_goal: None,
+            move_choices: Vec::new(),
+            move_selected: 0,
+            sheets,
+            active_sheet_id: active_sheet,
+            sheet_picker_selected: 0,
+            plugin_buffers: buffers,
+            active_buffer_id: active_buffer,
+            sheet_manager,
+            buffer_manager,
         };
         Ok(app)
     }
@@ -423,25 +467,36 @@ impl App {
         self.list_state.selected().unwrap_or(0)
     }
 
-    /// Reload goals from the DB.
+    /// Reload goals from the DB. The trailing dummy row (for root creation)
+    /// is always present, so selection is clamped to `flat_len_with_dummy()`.
     pub fn reload(&mut self) -> anyhow::Result<()> {
         self.goals = db::get_all(&self.db)?;
-        let max = self.flat_rows().len().saturating_sub(1);
+        let max = self.flat_len_with_dummy().saturating_sub(1);
         let sel = self.selected_index().min(max);
-        if self.goals.is_empty() {
-            self.list_state.select(None);
-        } else {
-            self.list_state.select(Some(sel));
-        }
-
+        // When there are no real goals, the dummy at 0 is the only row.
+        self.list_state.select(Some(sel));
         Ok(())
     }
 
     /// Build the flattened tree for rendering. Returns owned `FlatRow`s so
     /// callers can hold them across `&mut self` calls.
+    /// When a sheet (buffer) is active, only goals in that sheet are shown.
+    /// When a plugin buffer is active, goals are hidden (buffer owns the view).
     pub fn flat_rows(&self) -> Vec<FlatRow> {
+        if self.active_buffer_id.lock().unwrap().is_some() {
+            return Vec::new();
+        }
+        let active_sheet = self.active_sheet_id.lock().unwrap().clone();
+        let filtered: Vec<&Goal> = if let Some(active) = active_sheet.as_deref() {
+            self.goals
+                .iter()
+                .filter(|g| g.sheet_id.as_deref() == Some(active))
+                .collect()
+        } else {
+            self.goals.iter().collect()
+        };
         let mut by_parent: HashMap<Option<String>, Vec<&Goal>> = HashMap::new();
-        for g in &self.goals {
+        for g in filtered {
             by_parent.entry(g.parent_id.clone()).or_default().push(g);
         }
         for list in by_parent.values_mut() {
@@ -485,8 +540,19 @@ impl App {
     }
 
     /// The currently selected row, if any (owned, so no borrow conflicts).
+    /// Returns `None` when the dummy "add root" row is selected.
     pub fn selected_row(&self) -> Option<FlatRow> {
         self.flat_rows().get(self.selected_index()).cloned()
+    }
+
+    /// Whether the dummy "add root goal" row at the end is selected.
+    pub fn is_dummy_selected(&self) -> bool {
+        self.selected_index() == self.flat_rows().len()
+    }
+
+    /// Total rows including the trailing dummy for root creation.
+    pub fn flat_len_with_dummy(&self) -> usize {
+        self.flat_rows().len() + 1
     }
 
     /// IDs of goals marked completed whose subtree is not fully completed —
@@ -533,20 +599,20 @@ impl App {
     }
 
     pub fn move_down(&mut self) {
-        let max = self.flat_rows().len().saturating_sub(1);
+        let max = self.flat_len_with_dummy().saturating_sub(1);
         let cur = self.selected_index();
         if cur < max {
             self.list_state.select(Some(cur + 1));
         }
     }
 
-    /// Jump to the first / last visible row.
+    /// Jump to the first / last visible row (including dummy).
     pub fn select_first(&mut self) {
         self.list_state.select(Some(0));
     }
 
     pub fn select_last(&mut self) {
-        let max = self.flat_rows().len().saturating_sub(1);
+        let max = self.flat_len_with_dummy().saturating_sub(1);
         self.list_state.select(Some(max));
     }
 
@@ -645,11 +711,17 @@ impl App {
             Mode::AddGoal { parent_id } => parent_id.clone(),
             _ => None,
         };
-        let sort_order = db::next_sort_order(&self.db, parent_id.as_deref())?;
+        let sheet_id = self.active_sheet_id.lock().unwrap().clone();
+        let sort_order = db::next_sort_order_in_sheet(
+            &self.db,
+            parent_id.as_deref(),
+            sheet_id.as_deref(),
+        )?;
         let input = CreateGoalInput {
             title,
             description: None,
             parent_id: parent_id.clone(),
+            sheet_id,
             sort_order: Some(sort_order),
         };
         let created = db::create(&self.db, input)?;
@@ -1059,8 +1131,12 @@ impl App {
 
     // ---------- agent runs ----------
 
-    /// Leader + run_agent: collect (active provider × model) choices and
-    /// open the picker for the selected goal.
+    /// Leader + run_agent: collect (active agent/provider × model) choices
+    /// and open the picker for the selected goal. Any plugin with
+    /// `capabilities.provider` or `capabilities.agent` that can handle
+    /// `agent-run` is eligible. Provider plugins expand to one entry per
+    /// model; pure agent plugins produce a single entry. Lua plugins require
+    /// no built binary; binary plugins do.
     pub fn open_agent_picker(&mut self, goal_id: String) -> anyhow::Result<()> {
         self.reload_installed_plugins()?;
         let mut choices = Vec::new();
@@ -1070,16 +1146,14 @@ impl App {
             let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
                 continue;
             };
-            if !manifest.capabilities.provider {
+            if !manifest.capabilities.provider && !manifest.capabilities.agent {
                 continue;
             }
+            let is_lua = manifest.is_lua();
             let binary = manifest.binary_path(&dir);
-            if !binary.exists() {
+            if !is_lua && !binary.exists() {
                 continue;
             }
-            let Some(provider) = &manifest.provider else {
-                continue;
-            };
             let mut values = db::get_plugin_settings(&self.db, &manifest.plugin.name)?;
             // Unsaved fields fall back to their manifest defaults so
             // plugins see the authored behavior out of the box (e.g.
@@ -1093,18 +1167,36 @@ impl App {
             }
             let config = db::settings_to_config(&values);
 
-            for model in &provider.models {
-                choices.push(AgentChoice {
-                    plugin: manifest.plugin.name.clone(),
-                    model: model.clone(),
-                    binary: binary.clone(),
-                    config: config.clone(),
-                });
+            // Provider plugins with models expand per-model; everything else
+            // (pure agent, provider without models) is a single choice.
+            if manifest.capabilities.provider {
+                if let Some(provider) = &manifest.provider {
+                    if !provider.models.is_empty() {
+                        for model in &provider.models {
+                            choices.push(AgentChoice {
+                                plugin: manifest.plugin.name.clone(),
+                                model: Some(model.clone()),
+                                binary: binary.clone(),
+                                is_lua,
+                                config: config.clone(),
+                            });
+                        }
+                        continue;
+                    }
+                }
             }
+            // Pure agent or model-less provider: single entry.
+            choices.push(AgentChoice {
+                plugin: manifest.plugin.name.clone(),
+                model: None,
+                binary: binary.clone(),
+                is_lua,
+                config: config.clone(),
+            });
         }
 
         if choices.is_empty() {
-            self.set_message("no active provider plugins with a built binary");
+            self.set_message("no active agent/provider plugins (build the binary or install a Lua plugin)");
             return Ok(());
         }
 
@@ -1120,11 +1212,12 @@ impl App {
         let Some(choice) = self.agent_choices.get(self.agent_selected).cloned() else {
             return Ok(());
         };
-        let Some(goal) = self.goals.iter().find(|g| g.id == goal_id) else {
+        let Some(goal) = self.goals.iter().find(|g| g.id == goal_id).cloned() else {
             return Ok(());
         };
         let title = goal.title.clone();
         let description = goal.description.clone();
+        let existing_metadata = goal.metadata.clone();
 
         db::update(
             &self.db,
@@ -1136,18 +1229,53 @@ impl App {
         )?;
         self.reload()?;
 
+        // Persist which agent was chosen in the goal's metadata so the
+        // backend (and mobile) can see it after sync, and so a future
+        // restart can recover the choice. Keep any existing metadata keys.
+        {
+            let existing: serde_json::Value = existing_metadata
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let mut obj = existing
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            obj.insert("agent".into(), serde_json::Value::String(choice.plugin.clone()));
+            if let Some(m) = &choice.model {
+                obj.insert("model".into(), serde_json::Value::String(m.clone()));
+            }
+            let _ = db::update(
+                &self.db,
+                &goal_id,
+                UpdateGoalInput {
+                    metadata: Some(Some(serde_json::Value::Object(obj).to_string())),
+                    ..Default::default()
+                },
+            );
+            self.reload()?;
+        }
+
         let (tx, rx) = std::sync::mpsc::channel();
         let cfg = cordanui_plugin_runtime::AgentRunConfig {
             task_id: goal_id.clone(),
             title,
             description,
-            model: Some(choice.model.clone()),
+            model: choice.model.clone(),
             config: choice.config.clone(),
         };
         let binary = choice.binary.clone();
+        let plugin_name = choice.plugin.clone();
+        let plugin_config = choice.config.clone();
+        let is_lua = choice.is_lua;
+        // Resolve plugin dir for Lua runs (needed to load main.lua).
+        let plugin_dir = self
+            .installed_plugins
+            .iter()
+            .find(|p| p.id == plugin_name)
+            .map(|p| std::path::PathBuf::from(&p.dir));
 
         std::thread::spawn(move || {
-            use cordanui_plugin_runtime::spawn::run_streaming;
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
@@ -1158,11 +1286,37 @@ impl App {
                 });
                 return;
             };
-            let result = rt.block_on(async {
-                run_streaming(&binary, &cfg, |ev| {
-                    let _ = tx.send(ev.clone());
-                })
-                .await
+            let result: anyhow::Result<()> = rt.block_on(async {
+                if is_lua {
+                    let dir = plugin_dir.ok_or_else(|| anyhow::anyhow!("plugin dir not found for {plugin_name}"))?;
+                    let plugin = cordanui_plugin_runtime::LuaPlugin::load(
+                        &dir,
+                        &plugin_name,
+                        plugin_config.clone(),
+                        cordanui_plugin_runtime::HostHooks::new(),
+                    )?;
+                    let tx_lua = tx.clone();
+                    let ev = plugin
+                        .agent_run(&cfg, move |ev| {
+                            let _ = tx_lua.send(ev.clone());
+                        })
+                        .await?;
+                    // Lua agent_run returns the terminal event; if it is an error
+                    // that wasn't already sent via the callback (callback already
+                    // forwards all events), forward it. Success case already sent.
+                    if let cordanui_plugin_runtime::AgentEvent::Error { message, detail } = ev {
+                        let _ = tx.send(cordanui_plugin_runtime::AgentEvent::Error { message, detail });
+                    }
+                    Ok(())
+                } else {
+                    use cordanui_plugin_runtime::spawn::run_streaming;
+                    let tx_bin = tx.clone();
+                    run_streaming(&binary, &cfg, move |ev| {
+                        let _ = tx_bin.send(ev.clone());
+                    })
+                    .await?;
+                    Ok(())
+                }
             });
             if let Err(e) = result {
                 let _ = tx.send(cordanui_plugin_runtime::AgentEvent::Error {
@@ -1175,8 +1329,11 @@ impl App {
         self.agent_rx = Some(rx);
         self.agent_goal = Some(goal_id.clone());
         self.agent_log.clear();
-        self.agent_log
-            .push(format!("{} — {}", choice.plugin, choice.model));
+        let label = match &choice.model {
+            Some(m) => format!("{} — {}", choice.plugin, m),
+            None => choice.plugin.clone(),
+        };
+        self.agent_log.push(label);
         self.set_message("agent running");
         self.mode = Mode::AgentRunning { goal_id };
         Ok(())
@@ -1214,7 +1371,36 @@ impl App {
                     }
                 }
                 Ok(cordanui_plugin_runtime::AgentEvent::Result(r)) => {
-                    self.finish_agent_run("completed", r.content)?;
+                    // Plugin-declared mobile FE changes: files named mobile.json / __metadata__.json
+                    // are merged into metadata so mobile's PluginCard renders them.
+                    for file in &r.files {
+                        if let Some(content) = file.content.as_deref() {
+                            if file.path == "__metadata__.json" || file.path.ends_with("/__metadata__.json") {
+                                if let Ok(patch) = serde_json::from_str::<serde_json::Value>(content) {
+                                    if let Some(goal_id) = self.agent_goal.clone() {
+                                        let _ = db::merge_metadata(&self.db, &goal_id, patch);
+                                    }
+                                }
+                            } else if file.path == "mobile.json" || file.path.ends_with("/mobile.json") {
+                                if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                                    let patch = if val.get("mobile").is_some() {
+                                        serde_json::json!({ "mobile": val.get("mobile").cloned().unwrap_or(val.clone()) })
+                                    } else {
+                                        serde_json::json!({ "mobile": val })
+                                    };
+                                    if let Some(goal_id) = self.agent_goal.clone() {
+                                        let _ = db::merge_metadata(&self.db, &goal_id, patch);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let result_json = serde_json::to_string(&serde_json::json!({
+                        "content": r.content,
+                        "files": r.files
+                    }))
+                    .unwrap_or(r.content.clone());
+                    self.finish_agent_run("completed", result_json)?;
                     break;
                 }
                 Ok(cordanui_plugin_runtime::AgentEvent::Error { message, detail }) => {
@@ -1267,6 +1453,266 @@ impl App {
             self.mode = Mode::Normal;
         }
         Ok(())
+    }
+
+    // ---------- move (reparent) ----------
+
+    /// Collect all descendant ids of `root` (excluding root itself) via parent_id.
+    fn descendant_ids(&self, root: &str) -> HashSet<String> {
+        let mut out = HashSet::new();
+        let mut stack = vec![root.to_string()];
+        let mut by_parent: HashMap<Option<String>, Vec<String>> = HashMap::new();
+        for g in &self.goals {
+            by_parent.entry(g.parent_id.clone()).or_default().push(g.id.clone());
+        }
+        while let Some(cur) = stack.pop() {
+            if let Some(children) = by_parent.get(&Some(cur.clone())) {
+                for child in children {
+                    if out.insert(child.clone()) {
+                        stack.push(child.clone());
+                    }
+                }
+            }
+        }
+        out.remove(root);
+        out
+    }
+
+    /// Open the move picker for the selected goal. Lists root + every goal
+    /// that is not the goal itself nor its descendant (to avoid cycles).
+    pub fn open_move_picker(&mut self, goal_id: String) -> anyhow::Result<()> {
+        let Some(goal) = self.goals.iter().find(|g| g.id == goal_id).cloned() else {
+            return Ok(());
+        };
+        let descendants = self.descendant_ids(&goal.id);
+        let mut choices: Vec<(Option<String>, String)> = Vec::new();
+        // Root entry first.
+        choices.push((None, "∅  (root)".to_string()));
+        for g in &self.goals {
+            if g.id == goal.id || descendants.contains(&g.id) {
+                continue;
+            }
+            let glyph = match g.status {
+                cordanui_schema::GoalStatus::Pending => "○",
+                cordanui_schema::GoalStatus::InProgress => "◐",
+                cordanui_schema::GoalStatus::Completed => "✓",
+                cordanui_schema::GoalStatus::AgentMode => "⤴",
+            };
+            choices.push((Some(g.id.clone()), format!("{glyph} {}", g.title)));
+        }
+        if choices.is_empty() {
+            self.set_message("nowhere to move");
+            return Ok(());
+        }
+        // Preselect current parent if present.
+        let cur_parent = goal.parent_id.clone();
+        let sel = choices
+            .iter()
+            .position(|(id, _)| *id == cur_parent)
+            .unwrap_or(0);
+        self.move_choices = choices;
+        self.move_selected = sel;
+        self.mode = Mode::MovePicker { goal_id };
+        Ok(())
+    }
+
+    /// Confirm the move to the selected parent.
+    pub fn confirm_move(&mut self) -> anyhow::Result<()> {
+        let goal_id = match &self.mode {
+            Mode::MovePicker { goal_id } => goal_id.clone(),
+            _ => return Ok(()),
+        };
+        let Some((new_parent, label)) = self.move_choices.get(self.move_selected).cloned() else {
+            return Ok(());
+        };
+        // No-op if same parent.
+        let cur = self.goals.iter().find(|g| g.id == goal_id).and_then(|g| g.parent_id.clone());
+        if cur == new_parent {
+            self.set_message("already there");
+            self.mode = Mode::Normal;
+            return Ok(());
+        }
+        let new_sheet_id = if let Some(pid) = &new_parent {
+            self.goals
+                .iter()
+                .find(|g| &g.id == pid)
+                .and_then(|g| g.sheet_id.clone())
+                .or_else(|| self.active_sheet_id.lock().unwrap().clone())
+        } else {
+            self.active_sheet_id.lock().unwrap().clone()
+        };
+        let sort = crate::db::next_sort_order_in_sheet(
+            &self.db,
+            new_parent.as_deref(),
+            new_sheet_id.as_deref(),
+        )?;
+        crate::db::update(
+            &self.db,
+            &goal_id,
+            cordanui_schema::UpdateGoalInput {
+                parent_id: Some(new_parent.clone()),
+                sheet_id: Some(new_sheet_id.clone()),
+                sort_order: Some(sort),
+                ..Default::default()
+            },
+        )?;
+        self.reload()?;
+        if let Some(pid) = &new_parent {
+            self.expanded.insert(pid.clone());
+        }
+        // Select the moved goal.
+        if let Some(idx) = self.flat_rows().iter().position(|r| r.goal.id == goal_id) {
+            self.list_state.select(Some(idx));
+        }
+        self.set_message(&format!("moved to {}", label));
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    // ---------- sheets (buffers) ----------
+
+    pub fn reload_sheets(&mut self) -> anyhow::Result<()> {
+        self.sheets = db::list_sheets(&self.db).unwrap_or_default();
+        // If active sheet was deleted, fall back to None (All).
+        if let Some(active) = self.active_sheet_id.lock().unwrap().clone().as_ref().map(|s| s.clone()) {
+            if !self.sheets.iter().any(|s| s.id == *active) {
+                *self.active_sheet_id.lock().unwrap() = None;
+                *self.active_buffer_id.lock().unwrap() = None;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn open_sheet_picker(&mut self) -> anyhow::Result<()> {
+        self.reload_sheets()?;
+        self.sheet_picker_selected = 0;
+        // Preselect active sheet/buffer.
+        let active_buffer_clone = self.active_buffer_id.lock().unwrap().clone();
+        if let Some(active) = &active_buffer_clone {
+            let mut buf_ids: Vec<String> = self.plugin_buffers.lock().unwrap().keys().cloned().collect();
+            buf_ids.sort();
+            let pos = buf_ids.iter().position(|k| k == active).unwrap_or(0);
+            let idx = self.sheets.len() + 1 + pos;
+            self.sheet_picker_selected = idx;
+        } else if let Some(active) = self.active_sheet_id.lock().unwrap().clone().as_ref() {
+            if let Some(pos) = self.sheets.iter().position(|s| &s.id == active) {
+                self.sheet_picker_selected = pos + 1; // +1 for "All"
+            }
+        }
+        self.mode = Mode::SheetPicker;
+        Ok(())
+    }
+
+    pub fn select_sheet_at_picker(&mut self) -> anyhow::Result<()> {
+        // 0 = All (no sheet), 1..sheets.len() = sheets, rest = plugin buffers (sorted)
+        let idx = self.sheet_picker_selected;
+        if idx == 0 {
+            *self.active_sheet_id.lock().unwrap() = None;
+            *self.active_buffer_id.lock().unwrap() = None;
+            self.set_message("sheet: All");
+        } else if idx <= self.sheets.len() {
+            let sheet = self.sheets[idx - 1].clone();
+            *self.active_sheet_id.lock().unwrap() = Some(sheet.id.clone());
+            *self.active_buffer_id.lock().unwrap() = None;
+            self.set_message(&format!("sheet: {}", sheet.name));
+        } else {
+            let buf_idx = idx - self.sheets.len() - 1;
+            let mut buf_ids: Vec<String> = self.plugin_buffers.lock().unwrap().keys().cloned().collect();
+            buf_ids.sort();
+            if let Some(buf_id) = buf_ids.get(buf_idx).cloned() {
+                *self.active_buffer_id.lock().unwrap() = Some(buf_id.clone());
+                *self.active_sheet_id.lock().unwrap() = None;
+                self.set_message(&format!("buffer: {}", buf_id));
+            }
+        }
+        self.mode = Mode::Normal;
+        self.reload()?;
+        Ok(())
+    }
+
+    pub fn start_add_sheet(&mut self) {
+        self.input.clear();
+        self.mode = Mode::AddSheet;
+    }
+
+    pub fn commit_add_sheet(&mut self) -> anyhow::Result<()> {
+        let name = self.input.text.trim().to_string();
+        if name.is_empty() {
+            self.set_message("empty name — cancelled");
+            self.mode = Mode::Normal;
+            return Ok(());
+        }
+        let sheet = db::create_sheet(&self.db, &name)?;
+        self.sheets.push(sheet.clone());
+        *self.active_sheet_id.lock().unwrap() = Some(sheet.id.clone());
+        *self.active_buffer_id.lock().unwrap() = None;
+        self.mode = Mode::Normal;
+        self.reload()?;
+        self.set_message(&format!("sheet '{}' created", name));
+        Ok(())
+    }
+
+    pub fn start_delete_sheet(&mut self) -> anyhow::Result<()> {
+        let active_sheet = self.active_sheet_id.lock().unwrap().clone();
+        let sheet_id = if let Some(active) = active_sheet.as_ref() {
+            active.clone()
+        } else if self.sheet_picker_selected > 0 && self.sheet_picker_selected <= self.sheets.len() {
+            self.sheets[self.sheet_picker_selected - 1].id.clone()
+        } else {
+            self.set_message("no sheet selected to delete");
+            return Ok(());
+        };
+        self.mode = Mode::ConfirmDeleteSheet { sheet_id };
+        Ok(())
+    }
+
+    pub fn confirm_delete_sheet(&mut self) -> anyhow::Result<()> {
+        let sheet_id = match &self.mode {
+            Mode::ConfirmDeleteSheet { sheet_id } => sheet_id.clone(),
+            _ => return Ok(()),
+        };
+        db::delete_sheet(&self.db, &sheet_id)?;
+        // Move goals in that sheet to None (or delete?) — for now, orphan them to All.
+        // We do not delete goals, just their sheet assignment is now dangling; they will appear in All.
+        // Optionally we could UPDATE goals SET sheet_id = NULL WHERE sheet_id = ?.
+        let _ = self.db.execute(
+            "UPDATE goals SET sheet_id = NULL, updated_at = ? WHERE sheet_id = ?",
+            vec![
+                cordanui_sync::Value::from(cordanui_schema::now_iso()),
+                cordanui_sync::Value::from(sheet_id.clone()),
+            ],
+        );
+        // Mark dirty for sync? The above direct execute doesn't mark. Do it manually.
+        for g in self.goals.iter().filter(|g| g.sheet_id.as_deref() == Some(sheet_id.as_str())) {
+            let _ = self.db.mark_dirty("goals", &g.id);
+        }
+        self.reload_sheets()?;
+        *self.active_sheet_id.lock().unwrap() = None;
+        self.reload()?;
+        self.set_message("sheet deleted");
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    /// Plugin API: create a buffer (sheet-like) that a plugin controls.
+    /// Returns the buffer id. The buffer appears in the sheet picker and when
+    /// selected, its PanelSpec is rendered instead of goals.
+    pub fn create_plugin_buffer(&mut self, name: String, spec: cordanui_plugin_runtime::PanelSpec) -> String {
+        let id = format!("buffer:{}", name);
+        self.plugin_buffers.lock().unwrap().insert(id.clone(), spec);
+        // Optionally also create a sheet entry for persistence? For now, buffer is ephemeral.
+        id
+    }
+
+    pub fn set_plugin_buffer(&mut self, id: &str, spec: cordanui_plugin_runtime::PanelSpec) {
+        self.plugin_buffers.lock().unwrap().insert(id.to_string(), spec);
+    }
+
+    pub fn remove_plugin_buffer(&mut self, id: &str) {
+        self.plugin_buffers.lock().unwrap().remove(id);
+        if self.active_buffer_id.lock().unwrap().as_deref() == Some(id) {
+            *self.active_buffer_id.lock().unwrap() = None;
+        }
     }
 
     /// Start/stop the selected plugin's `[service]` (`s` in the manager).
@@ -1343,7 +1789,7 @@ impl App {
             let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
                 return false;
             };
-            if !manifest.capabilities.provider {
+            if !manifest.capabilities.provider && !manifest.capabilities.agent {
                 return false;
             }
             // Lua plugins are always "built" (no build step). Binary plugins
@@ -2107,6 +2553,7 @@ impl App {
                     self.set_message(&msg);
                     self.plugin_state = crate::plugins::TaskState::Idle;
                     self.reload_installed_plugins()?;
+                    break;
                 }
                 Ok(crate::plugins::TaskEvent::Installed { name, dir, themes }) => {
                     // Register it (most-recent-first) and refresh the list

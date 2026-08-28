@@ -93,6 +93,37 @@ pub fn set_result(
     Ok(())
 }
 
+/// Merge a JSON object patch into a goal's `metadata` column (read-modify-write).
+/// Null metadata is created; invalid JSON is replaced. `patch` keys equal to
+/// `Value::Null` delete the key. Used so agent plugins can declare mobile widgets
+/// via files like `mobile.json` or `__metadata__.json` in their result.
+pub fn merge_metadata(db: &Database, id: &str, patch: serde_json::Value) -> Result<()> {
+    let goal = get_goal(db, id)?.ok_or_else(|| anyhow::anyhow!("goal not found: {id}"))?;
+    let mut meta: serde_json::Map<String, serde_json::Value> = goal
+        .metadata
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(obj) = patch.as_object() {
+        for (k, v) in obj {
+            if v.is_null() {
+                meta.remove(k);
+            } else {
+                meta.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let merged = serde_json::Value::Object(meta).to_string();
+    let now = cordanui_schema::now_iso();
+    db.execute(
+        "UPDATE goals SET metadata = ?, updated_at = ? WHERE id = ?",
+        vec![Value::from(merged), Value::from(now), Value::from(id)],
+    )?;
+    db.mark_dirty("goals", id)?;
+    Ok(())
+}
+
 // ---------- plugin resolution ----------
 
 /// A row of the `plugins` table.

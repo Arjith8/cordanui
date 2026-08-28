@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
 use crate::ui::{
-    PanelSpec, SharedConfigHost, SharedErrorLogHost, SharedPanelHost, SharedServiceHost,
-    SharedUiHost, UiLevel, UiRequest, UiResponse, Widget,
+    PanelSpec, SharedBuffersHost, SharedConfigHost, SharedErrorLogHost, SharedPanelHost,
+    SharedServiceHost, SharedSheetsHost, SharedUiHost, UiLevel, UiRequest, UiResponse, Widget,
 };
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
@@ -79,6 +79,8 @@ pub struct HostHooks {
     pub config: Option<SharedConfigHost>,
     pub services: Option<SharedServiceHost>,
     pub errors: Option<SharedErrorLogHost>,
+    pub sheets: Option<SharedSheetsHost>,
+    pub buffers: Option<SharedBuffersHost>,
 }
 
 impl HostHooks {
@@ -114,6 +116,16 @@ impl HostHooks {
 
     pub fn with_errors(mut self, errors: SharedErrorLogHost) -> Self {
         self.errors = Some(errors);
+        self
+    }
+
+    pub fn with_sheets(mut self, sheets: SharedSheetsHost) -> Self {
+        self.sheets = Some(sheets);
+        self
+    }
+
+    pub fn with_buffers(mut self, buffers: SharedBuffersHost) -> Self {
+        self.buffers = Some(buffers);
         self
     }
 }
@@ -157,6 +169,8 @@ impl LuaPlugin {
             hooks.config,
             hooks.services,
             hooks.errors,
+            hooks.sheets,
+            hooks.buffers,
             name,
         )
         .context("registering cord styling API")?;
@@ -482,6 +496,8 @@ fn register_cord(
     config: Option<SharedConfigHost>,
     services: Option<SharedServiceHost>,
     errors: Option<SharedErrorLogHost>,
+    sheets: Option<SharedSheetsHost>,
+    buffers: Option<SharedBuffersHost>,
     plugin_name: &str,
 ) -> mlua::Result<()> {
     let cord = lua.create_table()?;
@@ -489,6 +505,8 @@ fn register_cord(
     register_cord_services(lua, &cord, services)?;
     register_cord_ui(lua, &cord, ui, panels)?;
     register_cord_errors(lua, &cord, errors)?;
+    register_cord_sheets(lua, &cord, sheets)?;
+    register_cord_buffers(lua, &cord, buffers)?;
 
     for scope in ["g", "local"] {
         let persistent = scope == "g";
@@ -770,6 +788,236 @@ fn register_cord_errors(
     )?;
 
     cord.set("errors", api)?;
+    Ok(())
+}
+
+fn register_cord_sheets(
+    lua: &Lua,
+    cord: &Table,
+    sheets: Option<SharedSheetsHost>,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    // cord.sheets.list() -> [{id, name}]
+    let sheets_list = sheets.clone();
+    api.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let Some(host) = sheets_list.as_ref() else {
+                return Err(mlua::Error::runtime("cord.sheets is not available in this host"));
+            };
+            let list = host.list_sheets();
+            let out = lua.create_table()?;
+            for (i, s) in list.iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", s.id.clone())?;
+                row.set("name", s.name.clone())?;
+                out.set(i + 1, row)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    // cord.sheets.create(name) -> id
+    let sheets_create = sheets.clone();
+    api.set(
+        "create",
+        lua.create_function(move |_, name: String| {
+            let Some(host) = sheets_create.as_ref() else {
+                return Err(mlua::Error::runtime("cord.sheets is not available in this host"));
+            };
+            let id = host.create_sheet(&name).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            Ok(id)
+        })?,
+    )?;
+
+    // cord.sheets.delete(id) -> true
+    let sheets_delete = sheets.clone();
+    api.set(
+        "delete",
+        lua.create_function(move |_, id: String| {
+            let Some(host) = sheets_delete.as_ref() else {
+                return Err(mlua::Error::runtime("cord.sheets is not available in this host"));
+            };
+            host.delete_sheet(&id).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            Ok(true)
+        })?,
+    )?;
+
+    // cord.sheets.select(id|nil) -> true
+    let sheets_select = sheets.clone();
+    api.set(
+        "select",
+        lua.create_function(move |_, id: Option<String>| {
+            let Some(host) = sheets_select.as_ref() else {
+                return Err(mlua::Error::runtime("cord.sheets is not available in this host"));
+            };
+            host.select_sheet(id).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            Ok(true)
+        })?,
+    )?;
+
+    // cord.sheets.current() -> id|nil
+    let sheets_current = sheets.clone();
+    api.set(
+        "current",
+        lua.create_function(move |_, ()| {
+            let Some(host) = sheets_current.as_ref() else {
+                return Err(mlua::Error::runtime("cord.sheets is not available in this host"));
+            };
+            Ok(host.current_sheet())
+        })?,
+    )?;
+
+    cord.set("sheets", api)?;
+    Ok(())
+}
+
+fn register_cord_buffers(
+    lua: &Lua,
+    cord: &Table,
+    buffers: Option<SharedBuffersHost>,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+
+    // cord.buffers.create{ name, draw, on_key } -> id
+    // draw: function()-> widget, on_key: function(key)->bool (optional)
+    let buffers_create = buffers.clone();
+    api.set(
+        "create",
+        lua.create_function(move |_, params: Table| {
+            let Some(host) = buffers_create.as_ref() else {
+                return Err(mlua::Error::runtime("cord.buffers is not available in this host"));
+            };
+            let name: String = params.get("name").map_err(|_| mlua::Error::runtime("buffers.create needs name"))?;
+            let draw_fn: Function = params.get("draw").map_err(|_| mlua::Error::runtime("buffers.create needs draw function"))?;
+            let on_key_fn: Option<Function> = params.get("on_key").ok();
+            let draw_fn_for_draw = draw_fn.clone();
+            let draw_fn_arc = std::sync::Arc::new(std::sync::Mutex::new(draw_fn_for_draw));
+            let draw: std::sync::Arc<dyn Fn() -> Widget + Send + Sync> = std::sync::Arc::new(move || -> Widget {
+                let f = draw_fn_arc.lock().unwrap().clone();
+                match f.call::<LuaValue>(()) {
+                    Ok(v) => Widget::from_lua(&v).ok().flatten().unwrap_or_else(Widget::empty),
+                    Err(e) => {
+                        tracing::error!(target: "plugin", "buffer draw failed: {e}");
+                        Widget::empty()
+                    }
+                }
+            });
+            let on_key_fn_arc = on_key_fn.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+            let on_key: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> = std::sync::Arc::new(move |key: &str| -> bool {
+                on_key_fn_arc
+                    .as_ref()
+                    .and_then(|arc| arc.lock().unwrap().call::<bool>(key).ok())
+                    .unwrap_or(false)
+            });
+            let spec = crate::ui::PanelSpec {
+                title: name.clone(),
+                draw,
+                on_key,
+            };
+            let id = host.create_buffer(name, spec);
+            Ok(id)
+        })?,
+    )?;
+
+    // cord.buffers.list() -> [id]
+    let buffers_list = buffers.clone();
+    api.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let Some(host) = buffers_list.as_ref() else {
+                return Err(mlua::Error::runtime("cord.buffers is not available in this host"));
+            };
+            let list = host.list_buffers();
+            let out = lua.create_table()?;
+            for (i, id) in list.iter().enumerate() {
+                out.set(i + 1, id.clone())?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    // cord.buffers.select(id|nil) -> true
+    let buffers_select = buffers.clone();
+    api.set(
+        "select",
+        lua.create_function(move |_, id: Option<String>| {
+            let Some(host) = buffers_select.as_ref() else {
+                return Err(mlua::Error::runtime("cord.buffers is not available in this host"));
+            };
+            host.select_buffer(id);
+            Ok(true)
+        })?,
+    )?;
+
+    // cord.buffers.remove(id) -> true
+    let buffers_remove = buffers.clone();
+    api.set(
+        "remove",
+        lua.create_function(move |_, id: String| {
+            let Some(host) = buffers_remove.as_ref() else {
+                return Err(mlua::Error::runtime("cord.buffers is not available in this host"));
+            };
+            host.remove_buffer(&id);
+            Ok(true)
+        })?,
+    )?;
+
+    // cord.buffers.current() -> id|nil
+    let buffers_current = buffers.clone();
+    api.set(
+        "current",
+        lua.create_function(move |_, ()| {
+            let Some(host) = buffers_current.as_ref() else {
+                return Err(mlua::Error::runtime("cord.buffers is not available in this host"));
+            };
+            Ok(host.current_buffer())
+        })?,
+    )?;
+
+    // cord.buffers.update(id, {draw, on_key}) -> true
+    let buffers_update = buffers.clone();
+    api.set(
+        "update",
+        lua.create_function(move |_, (id, params): (String, Table)| {
+            let Some(host) = buffers_update.as_ref() else {
+                return Err(mlua::Error::runtime("cord.buffers is not available in this host"));
+            };
+            let draw_fn: Option<Function> = params.get("draw").ok();
+            let on_key_fn: Option<Function> = params.get("on_key").ok();
+            // If no draw, keep existing; but for simplicity require draw
+            let draw_fn = draw_fn.ok_or_else(|| mlua::Error::runtime("buffers.update needs draw"))?;
+            let draw_fn_for_draw = draw_fn.clone();
+            let draw_fn_arc = std::sync::Arc::new(std::sync::Mutex::new(draw_fn_for_draw));
+            let draw: std::sync::Arc<dyn Fn() -> Widget + Send + Sync> = std::sync::Arc::new(move || -> Widget {
+                let f = draw_fn_arc.lock().unwrap().clone();
+                match f.call::<LuaValue>(()) {
+                    Ok(v) => Widget::from_lua(&v).ok().flatten().unwrap_or_else(Widget::empty),
+                    Err(e) => {
+                        tracing::error!(target: "plugin", "buffer draw failed: {e}");
+                        Widget::empty()
+                    }
+                }
+            });
+            let on_key_fn_arc = on_key_fn.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+            let on_key: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> = std::sync::Arc::new(move |key: &str| -> bool {
+                on_key_fn_arc
+                    .as_ref()
+                    .and_then(|arc| arc.lock().unwrap().call::<bool>(key).ok())
+                    .unwrap_or(false)
+            });
+            let spec = crate::ui::PanelSpec {
+                title: id.clone(),
+                draw,
+                on_key,
+            };
+            host.update_buffer(&id, spec).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+            Ok(true)
+        })?,
+    )?;
+
+    cord.set("buffers", api)?;
     Ok(())
 }
 
@@ -1070,8 +1318,10 @@ fn register_cord_ui(
                 let on_key_fn: Option<Function> = params.get("on_key").ok();
 
                 let draw_fn_for_draw = draw_fn.clone();
-                let draw = Box::new(move || -> Widget {
-                    match draw_fn_for_draw.call::<LuaValue>(()) {
+                let draw_fn_arc = std::sync::Arc::new(std::sync::Mutex::new(draw_fn_for_draw));
+                let draw: std::sync::Arc<dyn Fn() -> Widget + Send + Sync> = std::sync::Arc::new(move || -> Widget {
+                    let f = draw_fn_arc.lock().unwrap().clone();
+                    match f.call::<LuaValue>(()) {
                         Ok(v) => Widget::from_lua(&v)
                             .ok()
                             .flatten()
@@ -1083,10 +1333,11 @@ fn register_cord_ui(
                     }
                 });
 
-                let on_key = Box::new(move |key: &str| -> bool {
-                    on_key_fn
+                let on_key_fn_arc = on_key_fn.map(|f| std::sync::Arc::new(std::sync::Mutex::new(f)));
+                let on_key: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync> = std::sync::Arc::new(move |key: &str| -> bool {
+                    on_key_fn_arc
                         .as_ref()
-                        .and_then(|f| f.call::<bool>(key).ok())
+                        .and_then(|arc| arc.lock().unwrap().call::<bool>(key).ok())
                         .unwrap_or(false)
                 });
 

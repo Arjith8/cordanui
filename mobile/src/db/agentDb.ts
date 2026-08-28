@@ -65,15 +65,52 @@ export async function isAgentAvailable(): Promise<boolean> {
  * Assign a goal to the agent backend.
  *
  * Writes `status = 'agent_mode'`, `agent_status = 'queued'` to the local
- * DB (syncs to Turso), then POSTs a wake-and-point to the backend. The
- * backend reads the task from Turso and runs the provider plugin.
+ * DB (syncs to Turso), optionally stamping `metadata` with the chosen
+ * agent/provider so the backend can resolve it without guessing, then
+ * POSTs a wake-and-point to the backend. The backend reads the task from
+ * Turso and runs the resolved plugin.
+ *
+ * `opts` is optional — when omitted the backend falls back to the first
+ * active agent/provider plugin. Plugins that want to target a specific
+ * mobile card can also pre-stamp metadata themselves before calling this.
  *
  * Returns true if the wake call succeeded, false otherwise (the goal is
  * still queued locally — the backend's poll loop will pick it up).
  */
-export async function assignToAgent(goalId: string): Promise<boolean> {
+export async function assignToAgent(
+  goalId: string,
+  opts?: { agent?: string; model?: string },
+): Promise<boolean> {
   const db = await getDb();
   const now = new Date().toISOString();
+
+  // Optionally stamp metadata with the chosen agent/model so the backend's
+  // resolve_provider sees it immediately (and so mobile's PluginCard can
+  // reflect the choice). Merge with any existing metadata, never clobber.
+  if (opts?.agent || opts?.model) {
+    const row = await db.getFirstAsync<{ metadata: string | null }>(
+      'SELECT metadata FROM goals WHERE id = ?',
+      [goalId],
+    );
+    let meta: Record<string, unknown> = {};
+    if (row?.metadata) {
+      try {
+        const parsed = JSON.parse(row.metadata);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          meta = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // corrupt metadata — overwrite
+      }
+    }
+    if (opts.agent) meta.agent = opts.agent;
+    if (opts.model) meta.model = opts.model;
+    await db.runAsync('UPDATE goals SET metadata = ?, updated_at = ? WHERE id = ?', [
+      JSON.stringify(meta),
+      now,
+      goalId,
+    ]);
+  }
 
   // Write agent_mode + queued to the local DB.
   await db.runAsync(
@@ -120,6 +157,43 @@ export async function unassignFromAgent(goalId: string): Promise<void> {
      WHERE id = ?`,
     [now, goalId],
   );
+}
+
+/**
+ * Merge a patch into a goal's `metadata` JSON (creates the object if absent).
+ * Used by plugins or the backend to inject declarative mobile widgets without
+ * clobbering other keys. Values that are `undefined` are deleted.
+ *
+ * Example: `await mergeGoalMetadata(id, { mobile: { card: { content: "hi" } } })`
+ */
+export async function mergeGoalMetadata(
+  goalId: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  const db = await getDb();
+  const now = new Date().toISOString();
+  const row = await db.getFirstAsync<{ metadata: string | null }>(
+    'SELECT metadata FROM goals WHERE id = ?',
+    [goalId],
+  );
+  let meta: Record<string, unknown> = {};
+  if (row?.metadata) {
+    try {
+      const p = JSON.parse(row.metadata);
+      if (p && typeof p === 'object' && !Array.isArray(p)) meta = p as Record<string, unknown>;
+    } catch {
+      // overwrite corrupt
+    }
+  }
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) delete meta[k];
+    else meta[k] = v;
+  }
+  await db.runAsync('UPDATE goals SET metadata = ?, updated_at = ? WHERE id = ?', [
+    JSON.stringify(meta),
+    now,
+    goalId,
+  ]);
 }
 
 /**

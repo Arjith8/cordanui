@@ -43,16 +43,28 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // header
-            Constraint::Min(1),    // goal list
+            Constraint::Length(1), // sheets bar
+            Constraint::Min(1),    // goal list / plugin buffer
             Constraint::Length(3), // input/status bar
             Constraint::Length(1), // keybinding hint
         ])
         .split(size);
 
     render_header(app, frame, chunks[0]);
-    render_goal_list(app, frame, chunks[1]);
-    render_input_bar(app, frame, chunks[2]);
-    render_hint_bar(app, frame, chunks[3]);
+    render_sheets_bar(app, frame, chunks[1]);
+    let active_buffer = app.active_buffer_id.lock().unwrap().clone();
+    if let Some(buf_id) = active_buffer {
+        let maybe_spec = app.plugin_buffers.lock().unwrap().get(&buf_id).cloned();
+        if let Some(spec) = maybe_spec {
+            render_plugin_buffer(&spec, app, frame, chunks[2]);
+        } else {
+            render_goal_list(app, frame, chunks[2]);
+        }
+    } else {
+        render_goal_list(app, frame, chunks[2]);
+    }
+    render_input_bar(app, frame, chunks[3]);
+    render_hint_bar(app, frame, chunks[4]);
 
     // Overlays
     if app.mode == Mode::Help {
@@ -76,6 +88,18 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     }
     if let Mode::AgentPicker { .. } = &app.mode {
         render_agent_picker(app, frame);
+    }
+    if let Mode::MovePicker { .. } = &app.mode {
+        render_move_picker(app, frame);
+    }
+    if let Mode::SheetPicker = &app.mode {
+        render_sheet_picker(app, frame);
+    }
+    if let Mode::AddSheet = &app.mode {
+        render_add_sheet(app, frame);
+    }
+    if let Mode::ConfirmDeleteSheet { sheet_id } = &app.mode {
+        render_confirm_delete_sheet(frame, sheet_id, &app.theme.colors);
     }
     if let Mode::AgentRunning { goal_id } = &app.mode {
         render_agent_running(app, goal_id, frame);
@@ -368,7 +392,7 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
     let rows = app.flat_rows();
     let partial = app.partially_complete_ids();
 
-    let items: Vec<ListItem> = rows
+    let mut items: Vec<ListItem> = rows
         .iter()
         .map(|row| {
             let indent = "  ".repeat(row.depth);
@@ -428,6 +452,21 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
+    // Dummy row at the end for root creation: pointer-based creation requires
+    // an explicit place to select for "create at root". When this row is
+    // selected, leader+n creates a root goal (parent_id = None).
+    {
+        let dummy_line = Line::from(vec![
+            Span::raw("  "),
+            Span::styled("⊕  New root goal", Style::default().fg(c.outline_variant).add_modifier(Modifier::ITALIC)),
+            Span::styled(
+                "  (select here → leader+n)",
+                Style::default().fg(c.outline_variant),
+            ),
+        ]);
+        items.push(ListItem::new(Text::from(dummy_line)));
+    }
+
     let block = Block::default().borders(Borders::NONE);
 
     let list = List::new(items)
@@ -438,23 +477,6 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
     // Reuse the App's ListState so selection + scroll offset persist across
     // frames and are tracked by the widget itself.
     frame.render_stateful_widget(list, area, &mut app.list_state);
-
-    // Empty state
-    if rows.is_empty() {
-        let msg = Paragraph::new(Text::from(vec![
-            Line::from(""),
-            Line::from(""),
-            Line::styled(
-                format!(
-                    "  No goals yet. Press {}+{} to add one.",
-                    app.keybinds.leader.label(),
-                    app.keybinds.new_goal.label()
-                ),
-                Style::default().fg(c.outline_variant),
-            ),
-        ]));
-        frame.render_widget(&msg, area);
-    }
 }
 
 fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
@@ -500,6 +522,10 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::AgentPicker { .. } | Mode::AgentRunning { .. } => {
             (" AGENT ".to_string(), String::new())
         }
+        Mode::MovePicker { .. } => (" MOVE ".to_string(), String::new()),
+        Mode::SheetPicker => (" SHEET ".to_string(), String::new()),
+        Mode::AddSheet => (" New sheet: ".to_string(), app.input.text.clone()),
+        Mode::ConfirmDeleteSheet { .. } => (" DELETE SHEET ".to_string(), String::new()),
         Mode::PluginModal => {
             let text = app.plugin_modal_text().unwrap_or_default();
             (" PLUGIN DIALOG ".to_string(), text.to_string())
@@ -525,11 +551,14 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::PluginHelp
         | Mode::PluginConfigure { .. }
         | Mode::AgentPicker { .. }
+        | Mode::MovePicker { .. }
+        | Mode::SheetPicker
+        | Mode::AddSheet
         | Mode::AgentRunning { .. }
         | Mode::PluginModal
         | Mode::PluginPanel => Style::default().fg(c.primary),
         Mode::Command | Mode::GlobalConfig => Style::default().fg(c.secondary),
-        Mode::ConfirmDelete { .. } => Style::default().fg(c.error),
+        Mode::ConfirmDelete { .. } | Mode::ConfirmDeleteSheet { .. } => Style::default().fg(c.error),
         Mode::ConfirmPurge => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
     };
@@ -548,6 +577,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
                 | Mode::EditTitle { .. }
                 | Mode::EditDescription { .. }
                 | Mode::PluginManager { .. }
+                | Mode::AddSheet
         ) {
             Span::styled("│", Style::default().fg(c.on_surface_variant))
         } else {
@@ -596,6 +626,10 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::PluginHelp => "Esc/q to close".into(),
         Mode::PluginConfigure { .. } => "↑↓ field · Enter edit · Enter save · Esc back".into(),
         Mode::AgentPicker { .. } => "↑↓ model · Enter run · Esc close".into(),
+        Mode::MovePicker { .. } => "↑↓ parent · Enter move · Esc cancel".into(),
+        Mode::SheetPicker => "↑↓ sheet · Enter select · n new · d delete · Esc close".into(),
+        Mode::AddSheet => "Enter create · Esc cancel".into(),
+        Mode::ConfirmDeleteSheet { .. } => "y to confirm · n/Esc to cancel".into(),
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
         Mode::PluginPanel => "plugin panel — keys go to the plugin".into(),
         Mode::Command => "type to filter · Enter run · Esc close".into(),
@@ -1290,14 +1324,246 @@ fn render_agent_picker(app: &App, frame: &mut Frame) {
         } else {
             Style::default().fg(c.on_background)
         };
+        let model_label = ch.model.as_deref().unwrap_or("—");
         lines.push(Line::from(vec![
             Span::styled(format!(" {cursor}"), Style::default().fg(c.primary)),
-            Span::styled(format!("{:<24}", truncate_str(&ch.model, 23)), style),
+            Span::styled(format!("{:<24}", truncate_str(model_label, 23)), style),
             Span::styled(ch.plugin.clone(), Style::default().fg(c.outline_variant)),
         ]));
     }
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_move_picker(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+    let outer = Block::default()
+        .title(" Move to… ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+    let inner = outer.inner(area);
+    frame.render_widget(&outer, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  Choose new parent (∅ = root)",
+        Style::default().fg(c.outline_variant),
+    )));
+    lines.push(Line::from(""));
+
+    for (i, (_, label)) in app.move_choices.iter().enumerate() {
+        let selected = i == app.move_selected;
+        let cursor = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(c.on_background)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(c.on_background)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {cursor}"), Style::default().fg(c.primary)),
+            Span::styled(truncate_str(label, 50), style),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_sheets_bar(app: &App, frame: &mut Frame, area: Rect) {
+    let c = &app.theme.colors;
+    let mut spans = Vec::new();
+    // "All" tab
+    let all_active = app.active_sheet_id.lock().unwrap().is_none() && app.active_buffer_id.lock().unwrap().is_none();
+    spans.push(Span::styled(
+        " All ",
+        if all_active {
+            Style::default().fg(c.on_primary).bg(c.primary).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(c.outline_variant)
+        },
+    ));
+    spans.push(Span::raw(" "));
+    for sheet in &app.sheets {
+        let active_sheet = app.active_sheet_id.lock().unwrap().clone();
+        let active = active_sheet.as_deref() == Some(sheet.id.as_str());
+        spans.push(Span::styled(
+            format!(" {} ", sheet.name),
+            if active {
+                Style::default().fg(c.on_primary).bg(c.primary).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(c.on_background)
+            },
+        ));
+        spans.push(Span::raw(" "));
+    }
+    // Plugin buffers as sheets
+    let mut buf_ids: Vec<String> = app.plugin_buffers.lock().unwrap().keys().cloned().collect();
+    buf_ids.sort();
+    for buf_id in buf_ids {
+        let active_buf = app.active_buffer_id.lock().unwrap().clone();
+        let active = active_buf.as_deref() == Some(buf_id.as_str());
+        let label = buf_id.strip_prefix("buffer:").unwrap_or(&buf_id);
+        spans.push(Span::styled(
+            format!(" {} ", label),
+            if active {
+                Style::default().fg(c.on_primary).bg(c.tertiary).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(c.tertiary)
+            },
+        ));
+        spans.push(Span::raw(" "));
+    }
+    let line = Line::from(spans);
+    let block = Block::default().borders(Borders::BOTTOM).border_style(Style::default().fg(c.outline));
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+fn render_sheet_picker(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(60, 60, frame.area());
+    frame.render_widget(Clear, area);
+    let outer = Block::default()
+        .title(" Sheets — buffers ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+    let inner = outer.inner(area);
+    frame.render_widget(&outer, area);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "  All = show all goals · sheets isolate goals · buffers are plugin UIs",
+        Style::default().fg(c.outline_variant),
+    )));
+    lines.push(Line::from(""));
+    // Build combined list: All + sheets + buffers
+    let mut entries: Vec<(String, String, bool)> = Vec::new(); // (id, label, is_buffer)
+    entries.push(("__all__".to_string(), "∅  All".to_string(), false));
+    for s in &app.sheets {
+        entries.push((s.id.clone(), format!("▭  {}", s.name), false));
+    }
+    let mut buf_ids: Vec<String> = app.plugin_buffers.lock().unwrap().keys().cloned().collect();
+    buf_ids.sort();
+    for bid in buf_ids {
+        let label = bid.strip_prefix("buffer:").unwrap_or(&bid);
+        entries.push((bid.clone(), format!("◈  {} (plugin)", label), true));
+    }
+    for (i, (_, label, is_buf)) in entries.iter().enumerate() {
+        let selected = i == app.sheet_picker_selected;
+        let cursor = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default().fg(c.on_background).add_modifier(Modifier::BOLD)
+        } else if *is_buf {
+            Style::default().fg(c.tertiary)
+        } else {
+            Style::default().fg(c.on_background)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {cursor}"), Style::default().fg(c.primary)),
+            Span::styled(truncate_str(label, 40), style),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  n new sheet · d delete sheet · Enter select · Esc close",
+        Style::default().fg(c.outline_variant),
+    )));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_add_sheet(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(50, 22, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" New sheet ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+    let line = Line::from(vec![
+        Span::styled("> ", Style::default().fg(c.primary)),
+        Span::styled(app.input.text.clone(), Style::default().fg(c.on_background)),
+        Span::styled("│", Style::default().fg(c.primary)),
+    ]);
+    frame.render_widget(Paragraph::new(vec![Line::from(""), line]), inner);
+}
+
+fn render_confirm_delete_sheet(frame: &mut Frame, sheet_id: &str, c: &Palette) {
+    let area = centered_rect(50, 25, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Confirm Delete Sheet ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.error));
+    let lines = vec![
+        Line::from(""),
+        Line::from("  Delete this sheet? Goals become orphaned to All."),
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            format!("  id: {sheet_id}"),
+            Style::default().fg(c.outline_variant),
+        )]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  y", Style::default().fg(c.error).add_modifier(Modifier::BOLD)),
+            Span::raw(" to confirm · "),
+            Span::styled("n", Style::default().fg(c.outline_variant)),
+            Span::raw(" to cancel"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(block).style(Style::default().fg(c.on_background)), area);
+}
+
+fn render_plugin_buffer(spec: &cordanui_plugin_runtime::PanelSpec, app: &App, frame: &mut Frame, area: Rect) {
+    let c = &app.theme.colors;
+    let block = Block::default()
+        .title(format!(" {} ", spec.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.tertiary));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+    // Reuse PanelSpec draw logic similar to plugin_panel
+    use cordanui_plugin_runtime::Widget;
+    let mut lines: Vec<Line> = Vec::new();
+    fn flatten(w: &Widget, c: &Palette, out: &mut Vec<Line>) {
+        match w {
+            Widget::Text { content, fg, bold } => {
+                let mut style = Style::default().fg(fg
+                    .as_deref()
+                    .and_then(|role| c.get(role))
+                    .unwrap_or(c.on_background));
+                if *bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                out.push(Line::from(Span::styled(content.clone(), style)));
+            }
+            Widget::List { items, highlight } => {
+                for (i, item) in items.iter().enumerate() {
+                    let style = if Some(i) == *highlight {
+                        Style::default().fg(c.on_primary).bg(c.primary)
+                    } else {
+                        Style::default().fg(c.on_background)
+                    };
+                    out.push(Line::from(Span::styled(format!("  {item}"), style)));
+                }
+            }
+            Widget::Column { children } => {
+                for child in children {
+                    flatten(child, c, out);
+                }
+            }
+        }
+    }
+    flatten(&(spec.draw)(), c, &mut lines);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (plugin buffer — no content)",
+            Style::default().fg(c.outline_variant),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines).block(Block::default()), inner);
 }
 
 /// Live agent run view: spinner + progress log for the running goal.

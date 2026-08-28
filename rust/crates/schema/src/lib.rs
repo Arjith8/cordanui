@@ -203,6 +203,7 @@ pub struct Goal {
     pub description: Option<String>,
     pub status: GoalStatus,
     pub parent_id: Option<String>,
+    pub sheet_id: Option<String>,
     pub sort_order: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -219,7 +220,17 @@ pub struct CreateGoalInput {
     pub title: String,
     pub description: Option<String>,
     pub parent_id: Option<String>,
+    pub sheet_id: Option<String>,
     pub sort_order: Option<i64>,
+}
+
+/// A goal sheet (buffer) — organizational grouping for goals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalSheet {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    pub deleted_at: Option<String>,
 }
 
 /// Input for updating an existing goal. `None` means "don't change".
@@ -238,6 +249,8 @@ pub struct UpdateGoalInput {
     pub agent_result: Option<Option<String>>,
     pub agent_progress: Option<Option<String>>,
     pub metadata: Option<Option<String>>,
+    pub parent_id: Option<Option<String>>,
+    pub sheet_id: Option<Option<String>>,
 }
 
 impl UpdateGoalInput {
@@ -251,6 +264,8 @@ impl UpdateGoalInput {
             && self.agent_result.is_none()
             && self.agent_progress.is_none()
             && self.metadata.is_none()
+            && self.parent_id.is_none()
+            && self.sheet_id.is_none()
     }
 }
 

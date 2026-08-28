@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cordanui_plugin_runtime::{
-    AgentEvent, AgentRunConfig, AgentStatus, HostHooks, LuaPlugin, PluginManifest,
+    AgentEvent, AgentRunConfig, HostHooks, LuaPlugin, PluginManifest,
 };
 use cordanui_schema::AgentStatus as SchemaAgentStatus;
 use cordanui_sync::Database;
@@ -34,9 +34,13 @@ pub struct AgentRunner {
 }
 
 /// Parsed `metadata` JSON on a goal — tells the backend which
-/// provider/model to use.
+/// agent/provider and model to use. `agent` is the generic field written by
+/// the TUI picker (works for both `provider` and `agent` plugins);
+/// `provider` is kept for backward compat.
 #[derive(Debug, Default, Deserialize)]
 struct GoalMetadata {
+    #[serde(default)]
+    agent: Option<String>,
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
@@ -101,9 +105,10 @@ impl AgentRunner {
             .route("/wake", post(move |State(runner): State<Arc<Self>>, req: axum::Json<WakeRequest>| {
                 let task_id = req.0.task_id.clone();
                 async move {
+                    let response_id = task_id.clone();
                     info!(task_id = %task_id, "wake received");
                     runner.process_task(task_id).await;
-                    axum::Json(serde_json::json!({"ok": true, "task_id": task_id}))
+                    axum::Json(serde_json::json!({"ok": true, "task_id": response_id}))
                 }
             }))
             .route(
@@ -173,7 +178,11 @@ impl AgentRunner {
             task_id: task_id.clone(),
             title: goal.title.clone(),
             description: goal.description.clone(),
-            model: Some(provider.model.clone()),
+            model: if provider.model.is_empty() {
+                None
+            } else {
+                Some(provider.model.clone())
+            },
             config: provider.config.clone(),
         };
 
@@ -192,6 +201,31 @@ impl AgentRunner {
         // Write the final result.
         match result {
             Ok(AgentEvent::Result(r)) => {
+                // Allow plugins to declare mobile FE changes declaratively:
+                // - `mobile.json` → merged as `{ "mobile": <parsed> }` (widget tree for mobile's PluginCard)
+                // - `__metadata__.json` → raw patch merged into metadata
+                // This is how a plugin "on its own" creates changes to mobile FE.
+                for file in &r.files {
+                    let path = file.path.trim();
+                    if let Some(content) = file.content.as_deref() {
+                        if path == "__metadata__.json" || path.ends_with("/__metadata__.json") {
+                            if let Ok(patch) = serde_json::from_str::<serde_json::Value>(content) {
+                                let patch = if patch.is_object() { patch } else { serde_json::json!({ "value": patch }) };
+                                let _ = db::merge_metadata(&self.db, &task_id, patch);
+                            }
+                        } else if path == "mobile.json" || path.ends_with("/mobile.json") {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
+                                // Wrap as { "mobile": <val> } if not already wrapped
+                                let patch = if val.get("mobile").is_some() || val.get("card").is_some() || val.get("widgets").is_some() {
+                                    serde_json::json!({ "mobile": val.get("mobile").cloned().unwrap_or(val.clone()) })
+                                } else {
+                                    serde_json::json!({ "mobile": val })
+                                };
+                                let _ = db::merge_metadata(&self.db, &task_id, patch);
+                            }
+                        }
+                    }
+                }
                 let result_json =
                     serde_json::to_string(&serde_json::json!({
                         "content": r.content,
@@ -237,74 +271,107 @@ impl AgentRunner {
         }
     }
 
-    /// Resolve which provider plugin and model to use for a goal.
+    /// Resolve which agent/provider plugin and model to use for a goal.
     /// Priority:
-    /// 1. `metadata.provider` + `metadata.model` on the goal (user choice)
-    /// 2. First active provider plugin's first model (default)
+    /// 1. `metadata.agent` or `metadata.provider` + `metadata.model` on the
+    ///    goal (user choice from the TUI picker or mobile assignment).
+    /// 2. First active `agent` or `provider` plugin (default).
+    /// `agent` plugins may have no models — in that case model is empty.
     fn resolve_provider(&self, goal: &cordanui_schema::Goal) -> Result<ResolvedProvider> {
         let metadata = goal
             .metadata
             .as_deref()
             .and_then(|s| serde_json::from_str::<GoalMetadata>(s).ok())
             .unwrap_or_default();
+        let wanted = metadata
+            .agent
+            .as_deref()
+            .or(metadata.provider.as_deref())
+            .map(|s| s.to_string());
 
         let plugins = db::list_plugins(&self.db).context("listing plugins")?;
 
-        for row in &plugins {
-            if !row.active {
-                continue;
-            }
-            let dir = PathBuf::from(&row.dir);
-            let manifest = PluginManifest::from_dir(&dir)
-                .with_context(|| format!("reading manifest for {}", row.id))?;
-            if !manifest.capabilities.provider {
-                continue;
-            }
-            let provider = match &manifest.provider {
-                Some(p) => p,
-                None => continue,
-            };
-            if provider.models.is_empty() {
-                continue;
-            }
-
-            // If the user specified a provider, match it.
-            if let Some(wanted) = &metadata.provider {
-                if &manifest.plugin.name != wanted {
+        // First pass: try to match the wanted plugin if specified.
+        // Second pass: fallback to first eligible plugin.
+        for pass in 0..2 {
+            for row in &plugins {
+                if !row.active {
                     continue;
                 }
-            }
+                let dir = PathBuf::from(&row.dir);
+                let manifest = PluginManifest::from_dir(&dir)
+                    .with_context(|| format!("reading manifest for {}", row.id))?;
+                if !manifest.capabilities.provider && !manifest.capabilities.agent {
+                    continue;
+                }
 
-            // Pick the model: user's choice if it's in the list, else first.
-            let model = metadata
-                .model
-                .as_deref()
-                .filter(|m| provider.models.contains(m))
-                .cloned()
-                .or_else(|| provider.models.first().cloned())
-                .unwrap_or_default();
-
-            // Collect settings.
-            let mut values = db::get_plugin_settings(&self.db, &manifest.plugin.name)?;
-            if let Some(ui) = &manifest.ui {
-                for f in &ui.fields {
-                    if let Some(d) = &f.default {
-                        values.entry(f.key.clone()).or_insert_with(|| d.clone());
+                // In pass 0, only consider the wanted plugin.
+                if pass == 0 {
+                    if let Some(w) = &wanted {
+                        if &manifest.plugin.name != w {
+                            continue;
+                        }
+                    } else {
+                        continue; // no wanted -> skip pass 0
                     }
                 }
-            }
-            let config = db::settings_to_config(&values);
 
-            return Ok(ResolvedProvider {
-                plugin_name: manifest.plugin.name.clone(),
-                model,
-                dir,
-                manifest,
-                config,
-            });
+                // Validate that we can actually run this plugin.
+                // Provider plugins without models are still runnable as generic agents
+                // (single entry), but pure provider plugins with an empty models list
+                // and no agent capability are skipped.
+                let has_provider_models = manifest
+                    .provider
+                    .as_ref()
+                    .map(|p| !p.models.is_empty())
+                    .unwrap_or(false);
+                if manifest.capabilities.provider && !manifest.capabilities.agent && !has_provider_models {
+                    continue;
+                }
+
+                // Pick the model: user's choice if it's in the list, else first model if any,
+                // else empty string for pure agent plugins.
+                let model = metadata
+                    .model
+                    .as_deref()
+                    .filter(|m| {
+                        manifest
+                            .provider
+                            .as_ref()
+                            .map(|pr| pr.models.iter().any(|x| x == *m))
+                            .unwrap_or(false)
+                    })
+                    .map(|s| s.to_string())
+                    .or_else(|| {
+                        manifest
+                            .provider
+                            .as_ref()
+                            .and_then(|pr| pr.models.first().cloned())
+                    })
+                    .unwrap_or_default();
+
+                // Collect settings.
+                let mut values = db::get_plugin_settings(&self.db, &manifest.plugin.name)?;
+                if let Some(ui) = &manifest.ui {
+                    for f in &ui.fields {
+                        if let Some(d) = &f.default {
+                            values.entry(f.key.clone()).or_insert_with(|| d.clone());
+                        }
+                    }
+                }
+                let config = db::settings_to_config(&values);
+
+                return Ok(ResolvedProvider {
+                    plugin_name: manifest.plugin.name.clone(),
+                    model,
+                    dir,
+                    manifest,
+                    config,
+                });
+            }
         }
 
-        anyhow::bail!("no active provider plugin found");
+        anyhow::bail!("no active agent/provider plugin found");
     }
 
     /// Run a binary (subprocess) provider plugin.

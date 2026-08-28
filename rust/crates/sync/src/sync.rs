@@ -103,8 +103,8 @@ struct HranaResult {
 fn value_to_arg(v: &Value) -> serde_json::Value {
     match v {
         Value::Null => json!({"type": "null"}),
-        Value::Integer(i) => json!({"type": "integer", "value": i}),
-        Value::Real(f) => json!({"type": "float", "value": f}),
+        Value::Integer(i) => json!({"type": "integer", "value": i.to_string()}),
+        Value::Real(f) => json!({"type": "float", "value": f.to_string()}),
         Value::Text(s) => json!({"type": "text", "value": s}),
         Value::Blob(b) => json!({"type": "blob", "value": b}),
     }
@@ -118,8 +118,14 @@ fn json_to_value(v: &serde_json::Value) -> Value {
     let t = obj.get("type").and_then(|t| t.as_str()).unwrap_or("null");
     let val = obj.get("value");
     match t {
-        "integer" => Value::Integer(val.and_then(|v| v.as_i64()).unwrap_or(0)),
-        "float" => Value::Real(val.and_then(|v| v.as_f64()).unwrap_or(0.0)),
+        "integer" => Value::Integer(
+            val.and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_i64()))
+                .unwrap_or(0),
+        ),
+        "float" => Value::Real(
+            val.and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()))
+                .unwrap_or(0.0),
+        ),
         "text" => Value::Text(
             val.and_then(|v| v.as_str())
                 .map(|s| s.to_string())

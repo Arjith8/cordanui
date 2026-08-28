@@ -22,6 +22,8 @@
 //!   which surfaces as a Lua error naming the reason.
 //! - If the host drops its end entirely the wait resolves like a cancel.
 
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
 
 /// A modal a plugin wants shown.
@@ -205,10 +207,11 @@ use mlua::Value as LuaValue;
 /// names ("a", "up", "enter", "esc", ...). Returning `true` from `on_key`
 /// means "handled, redraw"; `false` passes the key through to the host
 /// (Esc pass-through closes the panel).
+#[derive(Clone)]
 pub struct PanelSpec {
     pub title: String,
-    pub draw: Box<dyn Fn() -> Widget + Send>,
-    pub on_key: Box<dyn Fn(&str) -> bool + Send>,
+    pub draw: Arc<dyn Fn() -> Widget + Send + Sync>,
+    pub on_key: Arc<dyn Fn(&str) -> bool + Send + Sync>,
 }
 
 /// Host side of `cord.ui.show_panel` / `cord.ui.close_panel`.
@@ -271,6 +274,30 @@ pub trait ServiceHost: Send + Sync {
 
 /// Convenience alias for hosts sharing one bridge across runtimes.
 pub type SharedServiceHost = std::sync::Arc<dyn ServiceHost>;
+
+/// Host side of `cord.sheets` — sheets (buffers) for work/project separation.
+/// Backed by `goal_sheets` table, synced via Turso.
+pub trait SheetsHost: Send + Sync {
+    fn list_sheets(&self) -> Vec<cordanui_schema::GoalSheet>;
+    fn create_sheet(&self, name: &str) -> anyhow::Result<String>;
+    fn delete_sheet(&self, id: &str) -> anyhow::Result<()>;
+    fn select_sheet(&self, id: Option<String>) -> anyhow::Result<()>;
+    fn current_sheet(&self) -> Option<String>;
+}
+pub type SharedSheetsHost = std::sync::Arc<dyn SheetsHost>;
+
+/// Host side of `cord.buffers` — plugin-controlled buffers that appear as
+/// sheet tabs but render a declarative PanelSpec instead of goals. Used for
+/// chat/model pickers that should feel like Claude Code / Codex.
+pub trait BuffersHost: Send + Sync {
+    fn create_buffer(&self, name: String, spec: PanelSpec) -> String;
+    fn update_buffer(&self, id: &str, spec: PanelSpec) -> anyhow::Result<()>;
+    fn remove_buffer(&self, id: &str);
+    fn select_buffer(&self, id: Option<String>);
+    fn list_buffers(&self) -> Vec<String>;
+    fn current_buffer(&self) -> Option<String>;
+}
+pub type SharedBuffersHost = std::sync::Arc<dyn BuffersHost>;
 
 /// A request plus the channel the host answers on.
 ///

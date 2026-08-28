@@ -22,6 +22,7 @@ import ErrorsPage from '@/components/ErrorsPage';
 import GoalEditModal from '@/components/GoalEditModal';
 import GoalItem from '@/components/GoalItem';
 import InlineAddInput from '@/components/InlineAddInput';
+import MovePickerModal from '@/components/MovePickerModal';
 import { useTheme } from '@/theme/ThemeProvider';
 
 /**
@@ -43,6 +44,8 @@ export default function HomeScreen() {
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
+  const [moveGoal, setMoveGoal] = useState<Goal | null>(null);
+  const [moveVisible, setMoveVisible] = useState(false);
 
   const [rootDraft, setRootDraft] = useState('');
   /** The one active subgoal draft. Focusing another input replaces it. */
@@ -283,6 +286,33 @@ export default function HomeScreen() {
     [refresh],
   );
 
+  const handleMove = useCallback(
+    (id: string) => {
+      const g = goals.find((x) => x.id === id);
+      if (!g) return;
+      setMoveGoal(g);
+      setMoveVisible(true);
+    },
+    [goals],
+  );
+
+  const handleSelectParent = useCallback(
+    async (newParentId: string | null) => {
+      if (!moveGoal) return;
+      try {
+        const siblings = goals.filter((g) => g.parent_id === newParentId);
+        const maxSort = siblings.reduce((m, g) => Math.max(m, g.sort_order), -1);
+        await updateGoal(moveGoal.id, { parent_id: newParentId, sort_order: maxSort + 1 });
+        setMoveVisible(false);
+        setMoveGoal(null);
+        await refresh();
+      } catch (e) {
+        fail('moveGoal', e);
+      }
+    },
+    [moveGoal, goals, refresh, fail],
+  );
+
   if (loading) {
     return (
       <View style={[styles.container, styles.center, { backgroundColor: colors.background }]}>
@@ -411,6 +441,7 @@ export default function HomeScreen() {
             onRename={handleRename}
             onSaveDescription={handleSaveDescription}
             onDeleteDirect={handleDeleteDirect}
+            onMove={handleMove}
             onReorderGroup={handleReorderGroup}
             draftText={draftFor(item.id)}
             draftFor={draftFor}
@@ -438,6 +469,16 @@ export default function HomeScreen() {
         onSave={handleSave}
         onDelete={handleDelete}
         onAgentAssigned={handleAgentAssigned}
+      />
+      <MovePickerModal
+        visible={moveVisible}
+        goal={moveGoal}
+        goals={goals}
+        onSelectParent={handleSelectParent}
+        onClose={() => {
+          setMoveVisible(false);
+          setMoveGoal(null);
+        }}
       />
     </View>
   );

@@ -6,16 +6,22 @@
 //!
 //! ```toml
 //! [keybinds]
-//! leader        = "ctrl+a"   # prefix key that arms command mode
-//! new_goal      = "n"        # <leader> new goal
-//! show_details  = "tab"      # <leader> toggle description + subgoals
-//! cycle_status  = "tab"      # bare key: cycle pending → wip → done
-//! help          = "h"        # <leader> open the help page
-//! plugins       = "p"        # <leader> open the plugin manager
-//! run_agent     = "r"        # <leader> run goal with an agent
-//! commands      = ";"        # <leader> open the plugin-command line
-//! global_config = ","        # <leader> open the global settings page
-//! sync          = "s"        # <leader> sync with Turso now
+//! leader          = "ctrl+a"   # prefix key that arms command mode
+//! new_goal        = "n"        # <leader> new goal
+//! show_details    = "tab"      # <leader> toggle description + subgoals
+//! cycle_status    = "tab"      # bare key: cycle pending → wip → done
+//! help            = "h"        # <leader> open the help page
+//! plugins         = "p"        # <leader> open the plugin manager
+//! run_agent       = "r"        # <leader> run goal with an agent
+//! commands        = ";"        # <leader> open the plugin-command line
+//! global_config   = ","        # <leader> open the global settings page
+//! sync            = "s"        # <leader> sync with Turso now
+//! delete          = "d"        # bare key: delete selected goal (confirm)
+//! edit_title      = "e"        # bare key: edit title
+//! edit_description= "E"        # bare key: edit description
+//! toggle_complete = "space"    # bare key: toggle complete
+//! move_goal       = "m"        # bare key: move goal to new parent
+//! sheets          = "b"        # <leader> + key: open sheet picker
 //! ```
 //!
 //! Key syntax: lowercase key names joined by `+`, modifiers first
@@ -151,6 +157,18 @@ pub struct Keybinds {
     pub global_config: KeyBinding,
     /// `<leader> + this` triggers an immediate replica sync.
     pub sync: KeyBinding,
+    /// Bare key deleting the selected goal (with confirmation).
+    pub delete: KeyBinding,
+    /// Bare key editing the selected goal's title.
+    pub edit_title: KeyBinding,
+    /// Bare key editing the selected goal's description.
+    pub edit_description: KeyBinding,
+    /// Bare key toggling complete on the selected goal.
+    pub toggle_complete: KeyBinding,
+    /// Bare key moving the selected goal under another parent.
+    pub move_goal: KeyBinding,
+    /// <leader> + this opens the sheet (buffer) picker.
+    pub sheets: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -166,6 +184,12 @@ impl Default for Keybinds {
             commands: KeyBinding::parse(";").unwrap(),
             global_config: KeyBinding::parse(",").unwrap(),
             sync: KeyBinding::parse("s").unwrap(),
+            delete: KeyBinding::parse("d").unwrap(),
+            edit_title: KeyBinding::parse("e").unwrap(),
+            edit_description: KeyBinding::parse("E").unwrap(),
+            toggle_complete: KeyBinding::parse("space").unwrap(),
+            move_goal: KeyBinding::parse("m").unwrap(),
+            sheets: KeyBinding::parse("b").unwrap(),
         }
     }
 }
@@ -210,6 +234,12 @@ impl Keybinds {
             commands: get("commands", &defaults.commands),
             global_config: get("global_config", &defaults.global_config),
             sync: get("sync", &defaults.sync),
+            delete: get("delete", &defaults.delete),
+            edit_title: get("edit_title", &defaults.edit_title),
+            edit_description: get("edit_description", &defaults.edit_description),
+            toggle_complete: get("toggle_complete", &defaults.toggle_complete),
+            move_goal: get("move_goal", &defaults.move_goal),
+            sheets: get("sheets", &defaults.sheets),
         }
     }
 
@@ -280,6 +310,42 @@ impl Keybinds {
             &self.sync,
             &d.sync,
             "<leader> + key — sync with Turso now",
+        );
+        push(
+            "delete",
+            &self.delete,
+            &d.delete,
+            "delete selected goal + subgoals (confirm)",
+        );
+        push(
+            "edit_title",
+            &self.edit_title,
+            &d.edit_title,
+            "edit selected goal title",
+        );
+        push(
+            "edit_description",
+            &self.edit_description,
+            &d.edit_description,
+            "edit selected goal description",
+        );
+        push(
+            "toggle_complete",
+            &self.toggle_complete,
+            &d.toggle_complete,
+            "toggle complete on selected goal",
+        );
+        push(
+            "move_goal",
+            &self.move_goal,
+            &d.move_goal,
+            "move selected goal under another parent / to root",
+        );
+        push(
+            "sheets",
+            &self.sheets,
+            &d.sheets,
+            "<leader> + key — open sheet (buffer) picker",
         );
         v
     }

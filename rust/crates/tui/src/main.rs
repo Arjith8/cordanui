@@ -8,11 +8,13 @@
 //! `crates/plugin-runtime`.
 
 mod app;
+mod buffers;
 mod config;
 mod db;
 pub mod plugin_ui;
 mod plugins;
 mod services;
+mod sheets;
 mod style;
 mod theme;
 mod ui;
@@ -129,6 +131,10 @@ fn run(
             Mode::PluginHelp => handle_plugin_help_key(app, key),
             Mode::PluginConfigure { plugin } => handle_configure_key(app, key, &plugin)?,
             Mode::AgentPicker { .. } => handle_agent_picker_key(app, key)?,
+            Mode::MovePicker { .. } => handle_move_picker_key(app, key)?,
+            Mode::SheetPicker => handle_sheet_picker_key(app, key)?,
+            Mode::AddSheet => handle_add_sheet_key(app, key)?,
+            Mode::ConfirmDeleteSheet { .. } => handle_confirm_delete_sheet_key(app, key)?,
             Mode::PluginModal => handle_plugin_modal_key(app, key),
             Mode::PluginPanel => handle_plugin_panel_key(app, key),
             Mode::Command => handle_command_key(app, key),
@@ -182,11 +188,12 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             KeyCode::Esc => {}                     // cancel leader
             KeyCode::Char('q') => return Ok(true), // <leader>q — quit
             _ if binds.new_goal.matches(key) => {
-                // If the selected goal is expanded (leader + show_details),
-                // add a subgoal under it; otherwise a new root goal.
-                let parent_id = match app.selected_row() {
-                    Some(row) if app.expanded.contains(&row.goal.id) => Some(row.goal.id.clone()),
-                    _ => None,
+                // Pointer-based: wherever the cursor is, create a child there.
+                // Dummy row at the end means "create at root".
+                let parent_id = if app.is_dummy_selected() {
+                    None
+                } else {
+                    app.selected_row().map(|r| r.goal.id.clone())
                 };
                 app.start_add_goal(parent_id);
             }
@@ -201,6 +208,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             _ if binds.commands.matches(key) => app.open_command_mode(),
             _ if binds.global_config.matches(key) => app.open_global_config(),
             _ if binds.sync.matches(key) => app.request_sync(),
+            _ if binds.sheets.matches(key) => app.open_sheet_picker()?,
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -208,9 +216,31 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
         return Ok(false);
     }
 
-    // Configured bare key: cycle the selected goal's status.
+    // Configured bare keys.
     if binds.cycle_status.matches(key) {
         app.cycle_status()?;
+        return Ok(false);
+    }
+    if binds.delete.matches(key) {
+        app.start_delete();
+        return Ok(false);
+    }
+    if binds.edit_title.matches(key) {
+        app.start_edit_title();
+        return Ok(false);
+    }
+    if binds.edit_description.matches(key) {
+        app.start_edit_description();
+        return Ok(false);
+    }
+    if binds.toggle_complete.matches(key) {
+        app.toggle_complete()?;
+        return Ok(false);
+    }
+    if binds.move_goal.matches(key) {
+        if let Some(row) = app.selected_row() {
+            app.open_move_picker(row.goal.id.clone())?;
+        }
         return Ok(false);
     }
 
@@ -686,6 +716,71 @@ fn handle_agent_picker_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<
                 app.start_agent_run(goal_id)?;
             }
         }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Keys in the move picker.
+fn handle_move_picker_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.move_selected > 0 {
+                app.move_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.move_selected + 1 < app.move_choices.len() {
+                app.move_selected += 1;
+            }
+        }
+        KeyCode::Enter => app.confirm_move()?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_sheet_picker_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    let total = 1 + app.sheets.len() + app.plugin_buffers.lock().unwrap().len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Normal,
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.sheet_picker_selected > 0 {
+                app.sheet_picker_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.sheet_picker_selected + 1 < total {
+                app.sheet_picker_selected += 1;
+            }
+        }
+        KeyCode::Enter => app.select_sheet_at_picker()?,
+        KeyCode::Char('n') => app.start_add_sheet(),
+        KeyCode::Char('d') => app.start_delete_sheet()?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_add_sheet_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.mode = Mode::SheetPicker,
+        KeyCode::Enter => app.commit_add_sheet()?,
+        KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Left => app.input.move_left(),
+        KeyCode::Right => app.input.move_right(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.input.clear(),
+        KeyCode::Char(c) if !c.is_control() => app.input.push_char(c),
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_confirm_delete_sheet_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => app.confirm_delete_sheet()?,
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::SheetPicker,
         _ => {}
     }
     Ok(())

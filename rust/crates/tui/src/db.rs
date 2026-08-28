@@ -33,7 +33,7 @@ pub fn sync(db: &Database) -> anyhow::Result<()> {
 
 // ---------- public API ----------
 
-const SELECT_COLS: &str = "id, title, description, status, parent_id, sort_order, \
+const SELECT_COLS: &str = "id, title, description, status, parent_id, sheet_id, sort_order, \
      created_at, updated_at, completed_at, agent_status, agent_result, \
      agent_progress, metadata";
 
@@ -74,13 +74,14 @@ pub fn create(db: &Database, input: CreateGoalInput) -> anyhow::Result<Goal> {
     };
     let ts = cordanui_schema::now_iso();
     db.execute(
-        "INSERT INTO goals (id, title, description, status, parent_id, sort_order, created_at, updated_at) \
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+        "INSERT INTO goals (id, title, description, status, parent_id, sheet_id, sort_order, created_at, updated_at) \
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
         vec![
             Value::from(id.clone()),
             Value::from(input.title),
             input.description.map(Value::from).unwrap_or(Value::Null),
             input.parent_id.map(Value::from).unwrap_or(Value::Null),
+            input.sheet_id.map(Value::from).unwrap_or(Value::Null),
             Value::from(input.sort_order.unwrap_or(0)),
             Value::from(ts.clone()),
             Value::from(ts),
@@ -139,6 +140,14 @@ pub fn update(db: &Database, id: &str, input: UpdateGoalInput) -> anyhow::Result
     if let Some(metadata) = input.metadata {
         fields.push("metadata = ?");
         params.push(metadata.map(Value::from).unwrap_or(Value::Null));
+    }
+    if let Some(parent_id) = input.parent_id {
+        fields.push("parent_id = ?");
+        params.push(parent_id.map(Value::from).unwrap_or(Value::Null));
+    }
+    if let Some(sheet_id) = input.sheet_id {
+        fields.push("sheet_id = ?");
+        params.push(sheet_id.map(Value::from).unwrap_or(Value::Null));
     }
 
     // Always bump updated_at
@@ -363,6 +372,96 @@ pub fn next_sort_order(db: &Database, parent_id: Option<&str>) -> anyhow::Result
     }
 }
 
+pub fn next_sort_order_in_sheet(
+    db: &Database,
+    parent_id: Option<&str>,
+    sheet_id: Option<&str>,
+) -> anyhow::Result<i64> {
+    match (parent_id, sheet_id) {
+        (Some(pid), Some(sid)) => db.query_scalar_i64(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id = ? AND sheet_id = ? AND deleted_at IS NULL",
+            vec![Value::from(pid), Value::from(sid)],
+        ),
+        (Some(pid), None) => db.query_scalar_i64(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id = ? AND sheet_id IS NULL AND deleted_at IS NULL",
+            vec![Value::from(pid)],
+        ),
+        (None, Some(sid)) => db.query_scalar_i64(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id IS NULL AND sheet_id = ? AND deleted_at IS NULL",
+            vec![Value::from(sid)],
+        ),
+        (None, None) => db.query_scalar_i64(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM goals WHERE parent_id IS NULL AND sheet_id IS NULL AND deleted_at IS NULL",
+            vec![],
+        ),
+    }
+}
+
+// ---------- sheets (buffers) ----------
+
+pub fn list_sheets(db: &Database) -> anyhow::Result<Vec<cordanui_schema::GoalSheet>> {
+    let result = db.query_simple(
+        "SELECT id, name, created_at, deleted_at FROM goal_sheets WHERE deleted_at IS NULL ORDER BY created_at",
+    )?;
+    Ok(result
+        .rows()
+        .iter()
+        .map(|row| cordanui_schema::GoalSheet {
+            id: match row.get(0) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => String::new(),
+            },
+            name: match row.get(1) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => String::new(),
+            },
+            created_at: match row.get(2) {
+                Some(Value::Text(s)) => s.clone(),
+                _ => String::new(),
+            },
+            deleted_at: match row.get(3) {
+                Some(Value::Text(s)) => Some(s.clone()),
+                _ => None,
+            },
+        })
+        .collect())
+}
+
+pub fn create_sheet(db: &Database, name: &str) -> anyhow::Result<cordanui_schema::GoalSheet> {
+    let id = cordanui_schema::new_id();
+    let ts = cordanui_schema::now_iso();
+    db.execute(
+        "INSERT INTO goal_sheets (id, name, created_at) VALUES (?, ?, ?)",
+        vec![Value::from(id.clone()), Value::from(name), Value::from(ts.clone())],
+    )?;
+    db.mark_dirty("goal_sheets", &id)?;
+    Ok(cordanui_schema::GoalSheet {
+        id,
+        name: name.to_string(),
+        created_at: ts,
+        deleted_at: None,
+    })
+}
+
+pub fn delete_sheet(db: &Database, id: &str) -> anyhow::Result<()> {
+    let ts = cordanui_schema::now_iso();
+    db.execute(
+        "UPDATE goal_sheets SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
+        vec![Value::from(ts.clone()), Value::from(id)],
+    )?;
+    db.mark_dirty("goal_sheets", id)?;
+    Ok(())
+}
+
+pub fn rename_sheet(db: &Database, id: &str, name: &str) -> anyhow::Result<()> {
+    db.execute(
+        "UPDATE goal_sheets SET name = ? WHERE id = ? AND deleted_at IS NULL",
+        vec![Value::from(name), Value::from(id)],
+    )?;
+    db.mark_dirty("goal_sheets", id)?;
+    Ok(())
+}
+
 // ---------- plugins registry ----------
 
 /// A row of the `plugins` table.
@@ -469,6 +568,38 @@ pub fn get_setting(db: &Database, key: &str) -> Option<String> {
         Some(Value::Text(v)) => Some(v.clone()),
         _ => None,
     })
+}
+
+/// Merge a JSON patch into a goal's `metadata` (read-modify-write), same
+/// contract as the agent backend's `merge_metadata` — plugins write
+/// `mobile.json` / `__metadata__.json` files to declaratively update mobile FE.
+pub fn merge_metadata(db: &Database, id: &str, patch: serde_json::Value) -> anyhow::Result<()> {
+    let goal = get(db, id)?.ok_or_else(|| anyhow::anyhow!("goal not found: {id}"))?;
+    let mut meta: serde_json::Map<String, serde_json::Value> = goal
+        .metadata
+        .as_deref()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(obj) = patch.as_object() {
+        for (k, v) in obj {
+            if v.is_null() {
+                meta.remove(k);
+            } else {
+                meta.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    let merged = serde_json::Value::Object(meta).to_string();
+    update(
+        db,
+        id,
+        UpdateGoalInput {
+            metadata: Some(Some(merged)),
+            ..Default::default()
+        },
+    )?;
+    Ok(())
 }
 
 /// Write a setting value (upsert). Used for synced keys like `agent.url`.
@@ -653,7 +784,7 @@ fn values_to_goal(row: &Vec<Value>) -> Goal {
     };
 
     let status_str = get_str(3);
-    let agent_status_str = get_opt_str(9);
+    let agent_status_str = get_opt_str(10);
 
     Goal {
         id: get_str(0),
@@ -661,14 +792,15 @@ fn values_to_goal(row: &Vec<Value>) -> Goal {
         description: get_opt_str(2),
         status: GoalStatus::from_db(&status_str),
         parent_id: get_opt_str(4),
-        sort_order: get_i64(5),
-        created_at: get_str(6),
-        updated_at: get_str(7),
-        completed_at: get_opt_str(8),
+        sheet_id: get_opt_str(5),
+        sort_order: get_i64(6),
+        created_at: get_str(7),
+        updated_at: get_str(8),
+        completed_at: get_opt_str(9),
         agent_status: agent_status_str.map(|s| AgentStatus::from_db(&s)),
-        agent_result: get_opt_str(10),
-        agent_progress: get_opt_str(11),
-        metadata: get_opt_str(12),
+        agent_result: get_opt_str(11),
+        agent_progress: get_opt_str(12),
+        metadata: get_opt_str(13),
     }
 }
 
