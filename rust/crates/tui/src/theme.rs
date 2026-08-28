@@ -9,7 +9,7 @@
 //! A variable's value resolves through four layers, later winning:
 //!
 //! 1. **builtin palette** (dark or light defaults)
-//! 2. **active theme** (`themes.colors_json`; legacy mobile token names
+//! 2. **active theme** (`themes.colors_json`; mobile token names
 //!    are aliased to their new roles)
 //! 3. **global overrides** — `settings` rows keyed `style.<var>`; these
 //!    are what `cord.g.style.*` writes and sync to every client via Turso
@@ -175,7 +175,7 @@ const SEED_BUILTINS_SQL: &str = "INSERT OR IGNORE INTO themes \
      (id, name, source, colors_json) VALUES (?, ?, 'builtin', ?)";
 
 // Seeded JSON carries BOTH vocabularies: the new Compose-style roles for
-// the TUI, plus the legacy camelCase keys the mobile client still reads,
+// the TUI, plus the mobile client still reads,
 // so one row renders correctly everywhere.
 macro_rules! seed_json {
     ($($new:literal : $old:literal : $val:expr),* $(,)?) => {{
@@ -326,7 +326,7 @@ impl Theme {
 }
 
 /// Overlay a partial token map (JSON object of color strings) onto a base
-/// palette. Accepts both new-role names and legacy mobile aliases;
+/// palette. Accepts both new-role names and mobile aliases;
 /// canonical names win when both are present.
 fn merge_colors(base: &Palette, colors_json: &str) -> Palette {
     let mut palette = base.clone();
@@ -337,46 +337,14 @@ fn merge_colors(base: &Palette, colors_json: &str) -> Palette {
         map.get(key).and_then(|v| v.as_str()).and_then(parse_color)
     };
 
-    // Legacy-only keys first (bg → background, accent → primary, ...),
-    // so the canonical spelling wins when a theme carries both.
-    for (old, target) in LEGACY_ALIASES {
-        if LEGACY_ONLY.contains(old) {
-            if let Some(hex) = pick(old) {
-                apply_color(&mut palette, target, &hex);
-            }
-        }
-    }
     // Canonical + plugin-defined names.
     for key in map.keys() {
-        if LEGACY_ONLY.contains(&key.as_str()) {
-            continue;
-        }
         if let Some(hex) = pick(key) {
             apply_color(&mut palette, key, &hex);
         }
     }
     palette
 }
-
-use cordanui_plugin_runtime::LEGACY_ALIASES;
-
-/// Legacy token names whose canonical spelling differs. Applied through
-/// [`resolve_legacy`] and skipped in the canonical pass.
-const LEGACY_ONLY: &[&str] = &[
-    "bg",
-    "text",
-    "border",
-    "treeLine",
-    "textDim",
-    "textFaint",
-    "accent",
-    "onAccent",
-    "danger",
-    "statusPending",
-    "statusWip",
-    "statusDone",
-    "statusAgent",
-];
 
 /// Set `var` on the palette from a normalized hex string.
 fn apply_color(palette: &mut Palette, var: &str, hex: &str) {
@@ -455,26 +423,6 @@ mod tests {
             color_of(&theme, "totallyMadeUp"),
             color_of(&theme, "onBackground")
         );
-    }
-
-    #[test]
-    fn legacy_theme_keys_alias_onto_new_roles() {
-        let db = test_db("legacy");
-        // A theme written by the mobile client with old token names.
-        crate::db::upsert_theme(
-            &db,
-            "legacy-theme",
-            "Legacy Theme",
-            "test",
-            r##"{"accent":"#ff0000","statusDone":"#00ff00","bg":"#010203"}"##,
-        )
-        .unwrap();
-        crate::db::set_active_theme(&db, "legacy-theme").unwrap();
-
-        let theme = Theme::resolve(&db, &HashMap::new());
-        assert_eq!(color_of(&theme, "primary"), Some(rgb(0xff0000)));
-        assert_eq!(color_of(&theme, "success"), Some(rgb(0x00ff00)));
-        assert_eq!(color_of(&theme, "background"), Some(rgb(0x010203)));
     }
 
     #[test]

@@ -37,34 +37,6 @@ pub const CORE_VARS: &[&str] = &[
     "outlineVariant",
 ];
 
-/// Fallback chain for legacy theme JSON authored against the old token
-/// names (the mobile client still writes these). Old keys never win over
-/// new ones when both are present.
-pub const LEGACY_ALIASES: &[(&str, &str)] = &[
-    ("bg", "background"),
-    ("text", "onBackground"),
-    ("border", "outline"),
-    ("treeLine", "outlineVariant"),
-    ("textDim", "onSurfaceVariant"),
-    ("textFaint", "outlineVariant"),
-    ("accent", "primary"),
-    ("onAccent", "onPrimary"),
-    ("danger", "error"),
-    // Old status tokens were widget-specific; map them to their roles.
-    ("statusPending", "onSurfaceVariant"),
-    ("statusWip", "primary"),
-    ("statusDone", "success"),
-    ("statusAgent", "tertiary"),
-];
-
-/// Map a legacy token name to its replacement, if it was one.
-pub fn resolve_legacy(name: &str) -> Option<&'static str> {
-    LEGACY_ALIASES
-        .iter()
-        .find(|(old, _)| *old == name)
-        .map(|(_, new)| *new)
-}
-
 /// Parse a color string into normalized `#rrggbb`.
 ///
 /// Accepted forms: `#rgb`, `#rrggbb`, `rgb(r, g, b)`, `rgba(r, g, b, a)`
@@ -168,12 +140,5 @@ mod tests {
             Some("#ff8800")
         );
         assert_eq!(parse_color("rgb(300,0,0)"), None);
-    }
-
-    #[test]
-    fn legacy_aliases_map_to_roles() {
-        assert_eq!(resolve_legacy("accent"), Some("primary"));
-        assert_eq!(resolve_legacy("statusDone"), Some("success"));
-        assert_eq!(resolve_legacy("primary"), None); // already canonical
     }
 }
