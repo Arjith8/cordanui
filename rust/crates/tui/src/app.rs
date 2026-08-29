@@ -1595,6 +1595,11 @@ impl App {
                     cordanui_plugin_runtime::UiLevel::Error => format!("✖ {message}"),
                 };
                 self.set_message(&prefixed);
+                // Dump plugin-raised warnings/errors to the shared errors table
+                // like every other subsystem (sync, agent, service).
+                if level != cordanui_plugin_runtime::UiLevel::Info {
+                    self.record_error("plugin", &message, None);
+                }
             } else {
                 pending_modal = Some(event);
                 break;
@@ -1810,6 +1815,13 @@ impl App {
             let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(&dir) else {
                 continue;
             };
+            // Register any [service] so `cord.services.is_running/start("cordanui-agents")`
+            // resolves even before manual `s` — needed for `cordanui-chat` auto-start
+            // `main.lua:6` (otherwise "no service registered").
+            if let Some(service) = &manifest.service {
+                self.services
+                    .register(&manifest.plugin.name, &dir, service.clone());
+            }
             if !manifest.is_lua() {
                 continue;
             }
@@ -1856,6 +1868,10 @@ impl App {
             }
         }
         self.plugin_commands.sort_by(|a, b| a.name.cmp(&b.name));
+        // Dump every plugin load problem to the shared errors table like sync/agent/service.
+        for p in &problems {
+            self.record_error("plugin", "plugin failed to load", Some(p));
+        }
         problems
     }
 
@@ -1864,7 +1880,6 @@ impl App {
         self.input.clear();
         self.command_selected = 0;
         if let Some(first) = problems.first() {
-            self.record_error("plugin", "plugin failed to load", Some(first));
             self.set_message(&format!("✖ {first}"));
         } else if self.plugin_commands.is_empty() {
             self.set_message(

@@ -176,20 +176,30 @@ impl ServiceManager {
         Ok(false)
     }
 
-    /// Whether the service is running (reaps exited children).
+    /// Whether the service is running (reaps exited children + checks pidfile for CLI-started).
     pub fn is_running(&self, plugin: &str) -> bool {
         let mut running = self.running.lock().unwrap();
         match running.get_mut(plugin) {
             Some(running_service) => match running_service.child.try_wait() {
                 Ok(Some(_)) => {
                     running.remove(plugin);
-                    false
+                    // Fall through to pidfile check — CLI may have restarted it.
                 }
-                Ok(None) => true,
-                Err(_) => false,
+                Ok(None) => return true,
+                Err(_) => return false,
             },
-            None => false,
+            None => {}
         }
+        drop(running);
+        // Not supervised by this process — check pidfile written by `cordanui service start`
+        // or a previous TUI run. Reap stale pidfiles.
+        if let Some(pid) = read_pid(plugin) {
+            if pid_alive(pid) {
+                return true;
+            }
+            let _ = std::fs::remove_file(pidfile_path(plugin));
+        }
+        false
     }
 }
 

@@ -160,7 +160,8 @@ impl LuaPlugin {
             .with_context(|| format!("reading {}", entry.display()))?;
 
         let lua = Arc::new(Lua::new());
-        register_api(&lua, dir, name, config).context("registering cordanui API")?;
+        register_api(&lua, dir, name, config, hooks.ui.clone())
+            .context("registering cordanui API")?;
         register_cord(
             &lua,
             hooks.styles,
@@ -363,6 +364,7 @@ fn register_api(
     plugin_dir: &Path,
     name: &str,
     config: Option<serde_json::Value>,
+    ui: Option<crate::ui::SharedUiHost>,
 ) -> mlua::Result<()> {
     let api = lua.create_table()?;
 
@@ -378,7 +380,9 @@ fn register_api(
     };
     api.set("config", to_lua(lua, config)?)?;
 
-    // cordanui.log.{info,warn,error}
+    // cordanui.log.{info,warn,error} — warn/error also go through UiHost::notify
+    // so `poll_plugin_ui_requests` can dump them to the shared `errors` table
+    // like every other subsystem.
     let log = lua.create_table()?;
     log.set(
         "info",
@@ -387,20 +391,32 @@ fn register_api(
             Ok(())
         })?,
     )?;
-    log.set(
-        "warn",
-        lua.create_function(|_, msg: String| {
-            tracing::warn!(target: "plugin", "{msg}");
-            Ok(())
-        })?,
-    )?;
-    log.set(
-        "error",
-        lua.create_function(|_, msg: String| {
-            tracing::error!(target: "plugin", "{msg}");
-            Ok(())
-        })?,
-    )?;
+    {
+        let ui_warn = ui.clone();
+        log.set(
+            "warn",
+            lua.create_function(move |_, msg: String| {
+                tracing::warn!(target: "plugin", "{msg}");
+                if let Some(host) = ui_warn.as_ref() {
+                    host.notify(crate::ui::UiLevel::Warn, msg.clone());
+                }
+                Ok(())
+            })?,
+        )?;
+    }
+    {
+        let ui_err = ui.clone();
+        log.set(
+            "error",
+            lua.create_function(move |_, msg: String| {
+                tracing::error!(target: "plugin", "{msg}");
+                if let Some(host) = ui_err.as_ref() {
+                    host.notify(crate::ui::UiLevel::Error, msg.clone());
+                }
+                Ok(())
+            })?,
+        )?;
+    }
     api.set("log", log)?;
 
     // cordanui.json.{encode,decode}
