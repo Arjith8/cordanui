@@ -447,38 +447,53 @@ fn register_api(
         })?,
     )?;
 
-    // cordanui.http.request — HTTP through the host. Awaitable from Lua.
+    // cordanui.http.request — HTTP through the host. Blocking (works from both
+    // sync panel on_key and async plugin.commands) — previously async and
+    // panicked with "no reactor running" when called from panel.
     let http = lua.create_table()?;
     http.set(
         "request",
-        lua.create_async_function(|lua, params: Table| {
-            let lua = lua.clone();
-            async move {
-                let url: String = params.get("url")?;
-                let method: Option<String> = params.get("method")?;
-                let headers: Option<Table> = params.get("headers")?;
-                let body: Option<String> = params.get("body")?;
+        lua.create_function(|lua, params: Table| {
+            let url: String = params.get("url")?;
+            let method: Option<String> = params.get("method")?;
+            let headers: Option<Table> = params.get("headers")?;
+            let body: Option<String> = params.get("body")?;
 
-                let mut req = http_client().request(method_from(&method), &url);
-                if let Some(hs) = headers {
-                    for pair in hs.pairs::<String, String>() {
-                        let (k, v) = pair?;
+            let headers_vec: Option<Vec<(String, String)>> = if let Some(hs) = headers {
+                Some(hs.pairs::<String, String>().collect::<mlua::Result<Vec<_>>>()?)
+            } else {
+                None
+            };
+            let method_owned = method.clone();
+            let url_owned = url.clone();
+            let body_owned = body.clone();
+            let do_req = move || -> mlua::Result<(u16, String)> {
+                let mut req = blocking_http_client().request(method_from(&method_owned), &url_owned);
+                if let Some(hs) = headers_vec {
+                    for (k, v) in hs {
                         req = req.header(k, v);
                     }
                 }
-                if let Some(b) = body {
+                if let Some(b) = body_owned {
                     req = req.body(b);
                 }
-
-                let resp = req.send().await.map_err(mlua::Error::external)?;
+                let resp = req.send().map_err(mlua::Error::external)?;
                 let status = resp.status().as_u16();
-                let text = resp.text().await.map_err(mlua::Error::external)?;
+                let text = resp.text().map_err(mlua::Error::external)?;
+                Ok((status, text))
+            };
+            let (status, text) = if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::spawn(do_req)
+                    .join()
+                    .unwrap_or(Err(mlua::Error::runtime("http thread panicked")))?
+            } else {
+                do_req()?
+            };
 
-                let out = lua.create_table()?;
-                out.set("status", status)?;
-                out.set("body", text)?;
-                Ok(out)
-            }
+            let out = lua.create_table()?;
+            out.set("status", status)?;
+            out.set("body", text)?;
+            Ok(out)
         })?,
     )?;
     api.set("http", http)?;
@@ -677,58 +692,72 @@ fn register_cord_services(
         })?,
     )?;
 
-    // cord.services.request(name, {method?, path, headers?, body?})
-    // Addressed to the service's manifest addr/health base URL. Requires
-    // the service to be running — start it first.
+    // cord.services.request(name, {method?, path, headers?, body?}) — blocking
+    // so it works from sync panel on_key (previously async -> "no reactor")
     api.set(
         "request",
-        lua.create_async_function({
+        lua.create_function({
             let services = services.clone();
-            let lua = lua.clone();
-            move |_, (name, params): (String, Table)| {
-                let services = services.clone();
-                let lua = lua.clone();
-                async move {
-                    let Some(host) = services.as_ref() else {
-                        return Err(mlua::Error::runtime(
-                            "cord.services is not available in this host",
-                        ));
-                    };
-                    if !host.is_running(&name) {
-                        return Err(mlua::Error::runtime(format!(
-                            "service '{name}' is not running — call cord.services.start first"
-                        )));
-                    }
-                    let Some(base) = host.base_url(&name) else {
-                        return Err(mlua::Error::runtime(format!(
-                            "service '{name}' declares no addr/health url"
-                        )));
-                    };
-                    let path: String = params.get("path").unwrap_or_else(|_| "/".into());
-                    let url = format!("{}{}", base.trim_end_matches('/'), path);
-                    let method: Option<String> = params.get("method").ok();
-                    let headers: Option<Table> = params.get("headers").ok();
-                    let json_body: Option<LuaValue> = params.get("body").ok();
+            move |lua, (name, params): (String, Table)| {
+                let Some(host) = services.as_ref() else {
+                    return Err(mlua::Error::runtime(
+                        "cord.services is not available in this host",
+                    ));
+                };
+                if !host.is_running(&name) {
+                    return Err(mlua::Error::runtime(format!(
+                        "service '{name}' is not running — call cord.services.start first"
+                    )));
+                }
+                let Some(base) = host.base_url(&name) else {
+                    return Err(mlua::Error::runtime(format!(
+                        "service '{name}' declares no addr/health url"
+                    )));
+                };
+                let path: String = params.get("path").unwrap_or_else(|_| "/".into());
+                let url = format!("{}{}", base.trim_end_matches('/'), path);
+                let method: Option<String> = params.get("method").ok();
+                let headers: Option<Table> = params.get("headers").ok();
+                let json_body: Option<LuaValue> = params.get("body").ok();
 
-                    let mut req = http_client().request(method_from(&method), &url);
-                    if let Some(hs) = headers {
-                        for pair in hs.pairs::<String, String>() {
-                            let (k, v) = pair?;
+                let headers_vec: Option<Vec<(String, String)>> = if let Some(hs) = headers {
+                    Some(hs.pairs::<String, String>().collect::<mlua::Result<Vec<_>>>()?)
+                } else {
+                    None
+                };
+                let json_string: Option<String> = if let Some(body) = json_body {
+                    Some(serde_json::to_string(&body).map_err(mlua::Error::external)?)
+                } else {
+                    None
+                };
+                let method_owned = method.clone();
+                let url_owned = url.clone();
+                let do_req = move || -> mlua::Result<(u16, String)> {
+                    let mut req = blocking_http_client().request(method_from(&method_owned), &url_owned);
+                    if let Some(hs) = headers_vec {
+                        for (k, v) in hs {
                             req = req.header(k, v);
                         }
                     }
-                    if let Some(body) = json_body {
-                        let json = serde_json::to_string(&body).map_err(mlua::Error::external)?;
+                    if let Some(json) = json_string {
                         req = req.header("content-type", "application/json").body(json);
                     }
-                    let resp = req.send().await.map_err(mlua::Error::external)?;
+                    let resp = req.send().map_err(mlua::Error::external)?;
                     let status = resp.status().as_u16();
-                    let text = resp.text().await.map_err(mlua::Error::external)?;
-                    let out = lua.create_table()?;
-                    out.set("status", status)?;
-                    out.set("body", text)?;
-                    Ok(out)
-                }
+                    let text = resp.text().map_err(mlua::Error::external)?;
+                    Ok((status, text))
+                };
+                let (status, text) = if tokio::runtime::Handle::try_current().is_ok() {
+                    std::thread::spawn(do_req)
+                        .join()
+                        .unwrap_or(Err(mlua::Error::runtime("http thread panicked")))?
+                } else {
+                    do_req()?
+                };
+                let out = lua.create_table()?;
+                out.set("status", status)?;
+                out.set("body", text)?;
+                Ok(out)
             }
         })?,
     )?;
@@ -1414,6 +1443,36 @@ async fn ui_answer(ui: Option<&SharedUiHost>, request: UiRequest) -> mlua::Resul
     }
 }
 
+fn ui_answer_blocking(ui: Option<&SharedUiHost>, request: UiRequest) -> mlua::Result<UiResponse> {
+    let Some(host) = ui else {
+        return Err(mlua::Error::runtime(
+            "cord.ui is not available in this host",
+        ));
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    host.submit(crate::ui::PendingUi {
+        request,
+        respond: tx,
+    });
+    // `rx.await` needs a reactor; panel on_key is sync (no reactor) and
+    // `plugin.commands` is inside `rt.block_on` (current_thread, cannot block).
+    // Use blocking_recv outside runtime, or spawn a thread when inside.
+    let recv_result = if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(move || rx.blocking_recv())
+            .join()
+            .unwrap_or(Ok(UiResponse::Text(None)))
+    } else {
+        rx.blocking_recv()
+    };
+    match recv_result {
+        Ok(UiResponse::Refused(reason)) => Err(mlua::Error::runtime(format!(
+            "the host refused the dialog: {reason}"
+        ))),
+        Ok(response) => Ok(response),
+        Err(_) => Ok(UiResponse::Text(None)),
+    }
+}
+
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -1421,6 +1480,33 @@ fn http_client() -> &'static reqwest::Client {
             .timeout(std::time::Duration::from_secs(120))
             .build()
             .expect("building shared HTTP client")
+    })
+}
+
+fn blocking_http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        // `reqwest::blocking::Client` holds a `tokio::runtime::Runtime` internally.
+        // If we create it inside an existing `current_thread` runtime (e.g. from
+        // `spawn_plugin_call`'s `rt.block_on` for `plugin.commands`), its
+        // `Drop` later panics with "Cannot drop a runtime in a context where
+        // blocking is not allowed" (panel on_key is sync, command is async).
+        // Create it outside any current runtime.
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::spawn(|| {
+                reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(120))
+                    .build()
+                    .expect("building blocking HTTP client")
+            })
+            .join()
+            .expect("blocking client thread")
+        } else {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("building blocking HTTP client")
+        }
     })
 }
 
