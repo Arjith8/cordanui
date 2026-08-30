@@ -115,6 +115,35 @@ fn run(
             continue;
         };
 
+        // Global leader + quit handling — <leader>q, C-c, C-d must work
+        // from ANY mode (chat buffer, help, modals...). Previously only in
+        // handle_normal_key, so <leader>q from chat/help did nothing.
+        if app.keybinds.leader.matches(key) {
+            app.leader_pending = true;
+            continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            break;
+        }
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            break;
+        }
+        if app.leader_pending {
+            if key.code == KeyCode::Char('q') {
+                break;
+            }
+            if key.code == KeyCode::Esc {
+                // Esc cancels leader and should still close current view (help, buffer, etc.)
+                app.leader_pending = false;
+                // Fall through to mode dispatch so Esc is handled normally
+            } else if app.mode != Mode::Normal {
+                // Non-Normal modes have no leader commands - consume the sequence
+                app.leader_pending = false;
+                continue;
+            }
+            // For Normal other keys, keep pending for handle_normal_key
+        }
+
         let mode = app.mode.clone();
         match mode {
             Mode::Help => handle_help_key(app, key)?,

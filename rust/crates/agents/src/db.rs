@@ -41,9 +41,9 @@ pub fn get_queued_tasks(db: &Database) -> Result<Vec<String>> {
 /// Fetch a single goal by ID (non-deleted). Returns None if not found.
 pub fn get_goal(db: &Database, id: &str) -> Result<Option<Goal>> {
     let result = db.query_first(
-        "SELECT id, title, description, status, parent_id, sort_order, \
-         created_at, updated_at, completed_at, agent_status, agent_result, \
-         agent_progress, metadata \
+        "SELECT id, title, description, status, parent_id, sheet_id, sort_order, \
+         created_at, updated_at, completed_at, due_at, remind_at, repeat_rule, \
+         agent_status, agent_result, agent_progress, metadata \
          FROM goals WHERE id = ? AND deleted_at IS NULL",
         vec![Value::from(id)],
     )?;
@@ -223,14 +223,21 @@ fn values_to_goal(row: &Vec<Value>) -> Goal {
         description: opt_str(2),
         status: GoalStatus::from_db(&text(row, 3)),
         parent_id: opt_str(4),
-        sort_order: 0,
-        created_at: text(row, 5),
-        updated_at: text(row, 6),
-        completed_at: opt_str(7),
-        agent_status: opt_str(8).map(|s| AgentStatus::from_db(&s)),
-        agent_result: opt_str(9),
-        agent_progress: opt_str(10),
-        metadata: opt_str(11),
+        sheet_id: opt_str(5),
+        sort_order: match row.get(6) {
+            Some(Value::Integer(n)) => *n,
+            _ => 0,
+        },
+        created_at: text(row, 7),
+        updated_at: text(row, 8),
+        completed_at: opt_str(9),
+        due_at: opt_str(10),
+        remind_at: opt_str(11),
+        repeat_rule: opt_str(12),
+        agent_status: opt_str(13).map(|s| AgentStatus::from_db(&s)),
+        agent_result: opt_str(14),
+        agent_progress: opt_str(15),
+        metadata: opt_str(16),
     }
 }
 

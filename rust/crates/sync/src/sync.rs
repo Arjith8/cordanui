@@ -55,6 +55,9 @@ const GOALS: TableSync = TableSync {
         "created_at",
         "updated_at",
         "completed_at",
+        "due_at",
+        "remind_at",
+        "repeat_rule",
         "agent_status",
         "agent_result",
         "agent_progress",
@@ -227,6 +230,76 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+// ---------- remote schema repair ----------
+
+/// Ensure the remote has columns that were added by newer migrations
+/// (`due_at`/`remind_at`/`repeat_rule` in v7, `sheet_id`/`deleted_at` in earlier
+/// migrations). The local DB is already migrated; an older Turso DB will
+/// reject `SELECT ... due_at` and `INSERT ... due_at` with `no such column`.
+/// We repair it in place via `ALTER TABLE ... ADD COLUMN` over the pipeline
+/// API, exactly like `mobile/src/db/turso.ts` does.
+fn ensure_remote_goals_schema(http: &reqwest::blocking::Client, remote: &RemoteConfig) {
+    // Keep in sync with `MISSING_COL_ALTERS` in `mobile/src/db/turso.ts`.
+    let stmts: Vec<(String, Vec<Value>)> = vec![
+        (
+            "CREATE TABLE IF NOT EXISTS goal_sheets (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at TEXT NOT NULL, deleted_at TEXT)"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "ALTER TABLE goals ADD COLUMN sheet_id TEXT REFERENCES goal_sheets(id) ON DELETE SET NULL"
+                .to_string(),
+            vec![],
+        ),
+        (
+            "ALTER TABLE goals ADD COLUMN deleted_at TEXT".to_string(),
+            vec![],
+        ),
+        ("ALTER TABLE goals ADD COLUMN due_at TEXT".to_string(), vec![]),
+        ("ALTER TABLE goals ADD COLUMN remind_at TEXT".to_string(), vec![]),
+        ("ALTER TABLE goals ADD COLUMN repeat_rule TEXT".to_string(), vec![]),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_goals_due_at ON goals(due_at)".to_string(),
+            vec![],
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_goals_sheet_id ON goals(sheet_id)".to_string(),
+            vec![],
+        ),
+    ];
+    for (sql, args) in stmts {
+        match pipeline(http, remote, &[(sql.clone(), args)]) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                // `duplicate column name` / `already exists` means the column/index
+                // is already there — ignore.
+                if msg.contains("duplicate column") || msg.contains("already exists") {
+                    continue;
+                }
+                tracing::warn!(sql = %sql, error = %e, "remote schema repair: statement failed");
+            }
+        }
+    }
+}
+
+fn pipeline_with_repair(
+    http: &reqwest::blocking::Client,
+    remote: &RemoteConfig,
+    stmts: &[(String, Vec<Value>)],
+) -> Result<Vec<HranaResult>> {
+    match pipeline(http, remote, stmts) {
+        Ok(r) => Ok(r),
+        Err(e) if e.to_string().contains("no such column") || e.to_string().contains("no such table") => {
+            tracing::warn!(error = %e, "remote missing column/table, attempting schema repair");
+            ensure_remote_goals_schema(http, remote);
+            // Retry once after repair.
+            pipeline(http, remote, stmts)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 // ---------- push ----------
 
 /// Upload every row pending in `_outbox`, then clear it. Server-side LWW
@@ -299,7 +372,7 @@ pub(crate) fn push(db: &Database, http: &reqwest::blocking::Client, remote: &Rem
     }
 
     if !all_stmts.is_empty() {
-        pipeline(http, remote, &all_stmts)?;
+        pipeline_with_repair(http, remote, &all_stmts)?;
     }
     for name in drained {
         conn.execute(
@@ -345,7 +418,7 @@ pub(crate) fn pull(db: &Database, http: &reqwest::blocking::Client, remote: &Rem
     let last_pull = get_state(&conn, "last_pull").unwrap_or_default();
     let cols = GOALS.cols.join(", ");
     let sql = format!("SELECT {cols} FROM goals WHERE updated_at > ?");
-    let results = pipeline(
+    let results = pipeline_with_repair(
         http,
         remote,
         &[(sql, vec![Value::Text(last_pull)])],

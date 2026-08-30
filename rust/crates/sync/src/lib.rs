@@ -213,7 +213,21 @@ impl Database {
             .map(|n| n > 0)
             .unwrap_or(false);
 
-        self.conn.execute_batch(cordanui_schema::SCHEMA_SQL)?;
+        if let Err(e) = self.conn.execute_batch(cordanui_schema::SCHEMA_SQL) {
+            if pre_existing {
+                // `SCHEMA_SQL` is the *latest* schema. On a pre-existing DB it may
+                // reference columns that haven't been migrated yet (e.g.
+                // `idx_goals_due_at` needs `due_at` added in v7). That shows up as
+                // `no such column: due_at` at offset 54 inside the CREATE INDEX.
+                // Migrations will add the column + index, so just warn and continue.
+                tracing::warn!(
+                    error = %e,
+                    "SCHEMA_SQL batch failed on pre-existing DB — continuing to migrations"
+                );
+            } else {
+                return Err(e.into());
+            }
+        }
 
         for m in cordanui_schema::MIGRATIONS {
             let done: bool = self

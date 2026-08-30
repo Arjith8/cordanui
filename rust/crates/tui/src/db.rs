@@ -289,7 +289,11 @@ mod tests {
                 title: "root".into(),
                 description: None,
                 parent_id: None,
+                sheet_id: None,
                 sort_order: Some(0),
+                due_at: None,
+                remind_at: None,
+                repeat_rule: None,
             },
         )
         .unwrap();
@@ -306,7 +310,11 @@ mod tests {
                 title: "child".into(),
                 description: None,
                 parent_id: Some(root.id.clone()),
+                sheet_id: None,
                 sort_order: Some(0),
+                due_at: None,
+                remind_at: None,
+                repeat_rule: None,
             },
         )
         .unwrap();
@@ -324,7 +332,11 @@ mod tests {
                 title: "grandchild".into(),
                 description: None,
                 parent_id: Some(child.id.clone()),
+                sheet_id: None,
                 sort_order: Some(0),
+                due_at: None,
+                remind_at: None,
+                repeat_rule: None,
             },
         )
         .unwrap();
@@ -346,7 +358,11 @@ mod tests {
                 title: "orphan".into(),
                 description: None,
                 parent_id: Some("nonexistent".into()),
+                sheet_id: None,
                 sort_order: Some(0),
+                due_at: None,
+                remind_at: None,
+                repeat_rule: None,
             },
         );
         assert!(result.is_err());
