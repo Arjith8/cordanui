@@ -16,6 +16,9 @@ CREATE TABLE IF NOT EXISTS goals (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     completed_at TEXT,
+    due_at       TEXT,   -- ISO8601 due date (nullable)
+    remind_at    TEXT,   -- ISO8601 reminder timestamp (nullable)
+    repeat_rule  TEXT,   -- none/null | daily | weekly | monthly | yearly
     -- agent fields (only populated when status = 'agent_mode')
     agent_status   TEXT,   -- queued | running | completed | failed
     agent_result   TEXT,   -- JSON output from the agent
@@ -39,6 +42,7 @@ CREATE INDEX IF NOT EXISTS idx_goals_parent_id ON goals(parent_id);
 CREATE INDEX IF NOT EXISTS idx_goals_status ON goals(status);
 CREATE INDEX IF NOT EXISTS idx_goals_sort_order ON goals(sort_order);
 CREATE INDEX IF NOT EXISTS idx_goals_sheet_id ON goals(sheet_id);
+CREATE INDEX IF NOT EXISTS idx_goals_due_at ON goals(due_at);
 
 -- Themes (shared with mobile clients; see agent-docs/theme-system-spec.md).
 -- `colors_json` is a JSON object mapping any subset of the canonical token

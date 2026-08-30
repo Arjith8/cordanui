@@ -368,6 +368,8 @@ impl App {
 
     /// Bare cycle_status key: pending → in progress → completed → pending.
     /// Skips `AgentMode` (reserved for the agent backend).
+    /// If the goal has a repeat_rule and would become Completed, instead
+    /// reschedule it to the next interval and keep it pending.
     pub fn cycle_status(&mut self) -> anyhow::Result<()> {
         let Some(row) = self.selected_row() else {
             return Ok(());
@@ -377,6 +379,25 @@ impl App {
             GoalStatus::InProgress => GoalStatus::Completed,
             _ => GoalStatus::Pending,
         };
+        if next == GoalStatus::Completed {
+            if let Some(repeat) = row.goal.repeat_rule.clone().filter(|r| !r.is_empty() && r != "none") {
+                if let Some(next_due) = Self::next_due_for_repeat(&repeat) {
+                    db::update(
+                        &self.db,
+                        &row.goal.id,
+                        UpdateGoalInput {
+                            status: Some(GoalStatus::Pending),
+                            due_at: Some(Some(next_due.clone())),
+                            completed_at: Some(None),
+                            ..Default::default()
+                        },
+                    )?;
+                    self.reload()?;
+                    self.set_message(&format!("repeated: next due {}", next_due));
+                    return Ok(());
+                }
+            }
+        }
         let completed_at = match next {
             GoalStatus::Completed => Some(Some(cordanui_schema::now_iso())),
             _ => Some(None),
@@ -400,16 +421,49 @@ impl App {
         Ok(())
     }
 
+    fn next_due_for_repeat(repeat_rule: &str) -> Option<String> {
+        let now = chrono::Utc::now();
+        let next = match repeat_rule {
+            "daily" => now + chrono::Duration::days(1),
+            "weekly" => now + chrono::Duration::days(7),
+            "monthly" => now + chrono::Duration::days(30),
+            "yearly" => now + chrono::Duration::days(365),
+            _ => return None,
+        };
+        Some(next.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+    }
+
     pub fn toggle_complete(&mut self) -> anyhow::Result<()> {
         if let Some(row) = self.selected_row() {
             let id = row.goal.id.clone();
             if row.goal.status == GoalStatus::Completed {
                 db::uncomplete(&self.db, &id)?;
+                self.reload()?;
+                self.set_message("toggled complete");
+            } else if let Some(repeat) = row.goal.repeat_rule.clone().filter(|r| !r.is_empty() && r != "none") {
+                if let Some(next_due) = Self::next_due_for_repeat(&repeat) {
+                    db::update(
+                        &self.db,
+                        &id,
+                        UpdateGoalInput {
+                            status: Some(GoalStatus::Pending),
+                            due_at: Some(Some(next_due.clone())),
+                            completed_at: Some(None),
+                            ..Default::default()
+                        },
+                    )?;
+                    self.reload()?;
+                    self.set_message(&format!("repeated: next due {}", next_due));
+                } else {
+                    db::complete(&self.db, &id)?;
+                    self.reload()?;
+                    self.set_message("toggled complete");
+                }
             } else {
                 db::complete(&self.db, &id)?;
+                self.reload()?;
+                self.set_message("toggled complete");
             }
-            self.reload()?;
-            self.set_message("toggled complete");
         }
         Ok(())
     }
@@ -442,6 +496,9 @@ impl App {
             parent_id: parent_id.clone(),
             sheet_id,
             sort_order: Some(sort_order),
+            due_at: None,
+            remind_at: None,
+            repeat_rule: None,
         };
         let created = db::create(&self.db, input)?;
         if let Some(pid) = &parent_id {
@@ -523,6 +580,106 @@ impl App {
         )?;
         self.reload()?;
         self.set_message("description updated");
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    pub fn start_edit_due(&mut self) {
+        if let Some(row) = self.selected_row() {
+            self.input.text = row.goal.due_at.clone().unwrap_or_default();
+            self.input.cursor = self.input.text.len();
+            self.mode = Mode::EditDue {
+                goal_id: row.goal.id.clone(),
+            };
+        }
+    }
+
+    pub fn commit_edit_due(&mut self) -> anyhow::Result<()> {
+        let goal_id = match &self.mode {
+            Mode::EditDue { goal_id } => goal_id.clone(),
+            _ => return Ok(()),
+        };
+        let text = self.input.text.trim().to_string();
+        let val = if text.is_empty() { None } else { Some(text) };
+        db::update(
+            &self.db,
+            &goal_id,
+            UpdateGoalInput {
+                due_at: Some(val),
+                ..Default::default()
+            },
+        )?;
+        self.reload()?;
+        self.set_message("due date updated");
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    pub fn start_edit_reminder(&mut self) {
+        if let Some(row) = self.selected_row() {
+            self.input.text = row.goal.remind_at.clone().unwrap_or_default();
+            self.input.cursor = self.input.text.len();
+            self.mode = Mode::EditReminder {
+                goal_id: row.goal.id.clone(),
+            };
+        }
+    }
+
+    pub fn commit_edit_reminder(&mut self) -> anyhow::Result<()> {
+        let goal_id = match &self.mode {
+            Mode::EditReminder { goal_id } => goal_id.clone(),
+            _ => return Ok(()),
+        };
+        let text = self.input.text.trim().to_string();
+        let val = if text.is_empty() { None } else { Some(text) };
+        db::update(
+            &self.db,
+            &goal_id,
+            UpdateGoalInput {
+                remind_at: Some(val),
+                ..Default::default()
+            },
+        )?;
+        self.reload()?;
+        self.set_message("reminder updated");
+        self.mode = Mode::Normal;
+        Ok(())
+    }
+
+    pub fn start_edit_repeat(&mut self) {
+        if let Some(row) = self.selected_row() {
+            self.input.text = row.goal.repeat_rule.clone().unwrap_or_default();
+            self.input.cursor = self.input.text.len();
+            self.mode = Mode::EditRepeat {
+                goal_id: row.goal.id.clone(),
+            };
+        }
+    }
+
+    pub fn commit_edit_repeat(&mut self) -> anyhow::Result<()> {
+        let goal_id = match &self.mode {
+            Mode::EditRepeat { goal_id } => goal_id.clone(),
+            _ => return Ok(()),
+        };
+        let text = self.input.text.trim().to_lowercase();
+        let val: Option<String> = if text.is_empty() || text == "none" {
+            None
+        } else if ["daily", "weekly", "monthly", "yearly"].contains(&text.as_str()) {
+            Some(text)
+        } else {
+            self.set_message("repeat must be one of: none, daily, weekly, monthly, yearly");
+            return Ok(());
+        };
+        db::update(
+            &self.db,
+            &goal_id,
+            UpdateGoalInput {
+                repeat_rule: Some(val),
+                ..Default::default()
+            },
+        )?;
+        self.reload()?;
+        self.set_message("repeat rule updated");
         self.mode = Mode::Normal;
         Ok(())
     }

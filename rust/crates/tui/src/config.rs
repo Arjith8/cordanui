@@ -171,6 +171,12 @@ pub struct Keybinds {
     pub sheets: KeyBinding,
     /// <leader> + this assigns range @1-6 / @<sno>-<sno> (sno = serial number, 1-based visible order; uuid fallback) to agent (from goals page or chat).
     pub assign_range: KeyBinding,
+    /// Bare key editing the selected goal's due date.
+    pub edit_due: KeyBinding,
+    /// Bare key editing the selected goal's reminder time.
+    pub edit_reminder: KeyBinding,
+    /// Bare key editing the selected goal's repeat rule.
+    pub edit_repeat: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -193,6 +199,9 @@ impl Default for Keybinds {
             move_goal: KeyBinding::parse("m").unwrap(),
             sheets: KeyBinding::parse("b").unwrap(),
             assign_range: KeyBinding::parse("A").unwrap(),
+            edit_due: KeyBinding::parse("D").unwrap(),
+            edit_reminder: KeyBinding::parse("R").unwrap(),
+            edit_repeat: KeyBinding::parse("ctrl+r").unwrap(),
         }
     }
 }
@@ -244,6 +253,9 @@ impl Keybinds {
             move_goal: get("move_goal", &defaults.move_goal),
             sheets: get("sheets", &defaults.sheets),
             assign_range: get("assign_range", &defaults.assign_range),
+            edit_due: get("edit_due", &defaults.edit_due),
+            edit_reminder: get("edit_reminder", &defaults.edit_reminder),
+            edit_repeat: get("edit_repeat", &defaults.edit_repeat),
         }
     }
 
@@ -356,6 +368,24 @@ impl Keybinds {
             &self.assign_range,
             &d.assign_range,
             "<leader> + key — assign @1-6 / @<sno>-<sno> range to agent (sno = serial)",
+        );
+        push(
+            "edit_due",
+            &self.edit_due,
+            &d.edit_due,
+            "edit selected goal due date",
+        );
+        push(
+            "edit_reminder",
+            &self.edit_reminder,
+            &d.edit_reminder,
+            "edit selected goal reminder",
+        );
+        push(
+            "edit_repeat",
+            &self.edit_repeat,
+            &d.edit_repeat,
+            "edit selected goal repeat rule",
         );
         v
     }

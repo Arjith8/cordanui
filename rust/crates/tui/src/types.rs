@@ -18,6 +18,12 @@ pub enum Mode {
     EditTitle { goal_id: String },
     /// Editing an existing goal's description.
     EditDescription { goal_id: String },
+    /// Editing an existing goal's due date.
+    EditDue { goal_id: String },
+    /// Editing an existing goal's reminder time.
+    EditReminder { goal_id: String },
+    /// Editing an existing goal's repeat rule.
+    EditRepeat { goal_id: String },
     /// Confirmation prompt for deleting a goal.
     ConfirmDelete { goal_id: String },
     /// Confirmation prompt for purging the entire database (danger zone

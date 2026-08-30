@@ -35,7 +35,7 @@ pub fn sync(db: &Database) -> anyhow::Result<()> {
 
 const SELECT_COLS: &str = "id, title, description, status, parent_id, sheet_id, sort_order, \
      created_at, updated_at, completed_at, agent_status, agent_result, \
-     agent_progress, metadata";
+     agent_progress, metadata, due_at, remind_at, repeat_rule";
 
 /// Fetch all (non-deleted) goals, ordered: roots first, then children grouped
 /// by parent, each bucket sorted by `sort_order` then `created_at`.
@@ -74,8 +74,8 @@ pub fn create(db: &Database, input: CreateGoalInput) -> anyhow::Result<Goal> {
     };
     let ts = cordanui_schema::now_iso();
     db.execute(
-        "INSERT INTO goals (id, title, description, status, parent_id, sheet_id, sort_order, created_at, updated_at) \
-         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
+        "INSERT INTO goals (id, title, description, status, parent_id, sheet_id, sort_order, created_at, updated_at, due_at, remind_at, repeat_rule) \
+         VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)",
         vec![
             Value::from(id.clone()),
             Value::from(input.title),
@@ -84,7 +84,10 @@ pub fn create(db: &Database, input: CreateGoalInput) -> anyhow::Result<Goal> {
             input.sheet_id.map(Value::from).unwrap_or(Value::Null),
             Value::from(input.sort_order.unwrap_or(0)),
             Value::from(ts.clone()),
-            Value::from(ts),
+            Value::from(ts.clone()),
+            input.due_at.map(Value::from).unwrap_or(Value::Null),
+            input.remind_at.map(Value::from).unwrap_or(Value::Null),
+            input.repeat_rule.map(Value::from).unwrap_or(Value::Null),
         ],
     )?;
     db.mark_dirty("goals", &id)?;
@@ -120,6 +123,18 @@ pub fn update(db: &Database, id: &str, input: UpdateGoalInput) -> anyhow::Result
     if let Some(completed_at) = input.completed_at {
         fields.push("completed_at = ?");
         params.push(completed_at.map(Value::from).unwrap_or(Value::Null));
+    }
+    if let Some(due_at) = input.due_at {
+        fields.push("due_at = ?");
+        params.push(due_at.map(Value::from).unwrap_or(Value::Null));
+    }
+    if let Some(remind_at) = input.remind_at {
+        fields.push("remind_at = ?");
+        params.push(remind_at.map(Value::from).unwrap_or(Value::Null));
+    }
+    if let Some(repeat_rule) = input.repeat_rule {
+        fields.push("repeat_rule = ?");
+        params.push(repeat_rule.map(Value::from).unwrap_or(Value::Null));
     }
     if let Some(agent_status) = input.agent_status {
         fields.push("agent_status = ?");
@@ -797,6 +812,9 @@ fn values_to_goal(row: &Vec<Value>) -> Goal {
         created_at: get_str(7),
         updated_at: get_str(8),
         completed_at: get_opt_str(9),
+        due_at: get_opt_str(14),
+        remind_at: get_opt_str(15),
+        repeat_rule: get_opt_str(16),
         agent_status: agent_status_str.map(|s| AgentStatus::from_db(&s)),
         agent_result: get_opt_str(11),
         agent_progress: get_opt_str(12),

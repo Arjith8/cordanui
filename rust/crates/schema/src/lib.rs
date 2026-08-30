@@ -39,29 +39,17 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
         name: "themes_drop_is_dark_source_is_github_url",
-        sql: "ALTER TABLE themes DROP COLUMN is_dark;",
+        sql: include_str!("../../../schema/migrations/001_themes_drop_is_dark.sql"),
     },
     Migration {
         version: 2,
         name: "create_plugins_table",
-        sql: "CREATE TABLE IF NOT EXISTS plugins (\
-                  id           TEXT PRIMARY KEY,\
-                  source       TEXT NOT NULL,\
-                  dir          TEXT NOT NULL,\
-                  active       INTEGER NOT NULL DEFAULT 0,\
-                  installed_at TEXT NOT NULL\
-              );",
+        sql: include_str!("../../../schema/migrations/002_create_plugins_table.sql"),
     },
     Migration {
         version: 3,
         name: "create_errors_table",
-        sql: "CREATE TABLE IF NOT EXISTS errors (\
-                  id         TEXT PRIMARY KEY,\
-                  context    TEXT NOT NULL,\
-                  message    TEXT NOT NULL,\
-                  detail     TEXT,\
-                  created_at TEXT NOT NULL\
-              );",
+        sql: include_str!("../../../schema/migrations/003_create_errors_table.sql"),
     },
     Migration {
         version: 4,
@@ -71,13 +59,7 @@ pub const MIGRATIONS: &[Migration] = &[
         // databases lack sheet_id, and mobile databases that already have
         // it never execute this step (their runner records it via the
         // legacy-alignment path instead).
-        sql: "CREATE TABLE IF NOT EXISTS goal_sheets (\
-                  id         TEXT PRIMARY KEY,\
-                  name       TEXT NOT NULL,\
-                  created_at TEXT NOT NULL\
-              );\
-              ALTER TABLE goals ADD COLUMN sheet_id TEXT REFERENCES goal_sheets(id) ON DELETE SET NULL;\
-              CREATE INDEX IF NOT EXISTS idx_goals_sheet_id ON goals(sheet_id);",
+        sql: include_str!("../../../schema/migrations/004_goal_sheets_and_sheet_id.sql"),
     },
     Migration {
         version: 5,
@@ -85,34 +67,19 @@ pub const MIGRATIONS: &[Migration] = &[
         // Mobile's device-local log merges into the shared `errors` table.
         // The CREATE makes this work on databases that never had
         // errors_mobile (nothing to copy, then dropped).
-        sql: "CREATE TABLE IF NOT EXISTS errors_mobile (\
-                  id         TEXT PRIMARY KEY,\
-                  context    TEXT NOT NULL,\
-                  message    TEXT NOT NULL,\
-                  detail     TEXT,\
-                  created_at TEXT NOT NULL\
-              );\
-              INSERT OR IGNORE INTO errors (id, context, message, detail, created_at) \
-                  SELECT id, context, message, detail, created_at FROM errors_mobile;\
-              DROP TABLE errors_mobile;",
+        sql: include_str!("../../../schema/migrations/005_unify_error_log.sql"),
     },
     Migration {
         version: 6,
         name: "soft_delete_tombstones",
         // Deletes become tombstones so they can propagate through sync.
         // Readers filter `deleted_at IS NULL`.
-        sql: "ALTER TABLE goals ADD COLUMN deleted_at TEXT;\
-              ALTER TABLE themes ADD COLUMN deleted_at TEXT;\
-              ALTER TABLE goal_sheets ADD COLUMN deleted_at TEXT;\
-              CREATE TABLE IF NOT EXISTS _outbox (\
-                  table_name TEXT NOT NULL,\
-                  row_id     TEXT NOT NULL,\
-                  PRIMARY KEY (table_name, row_id)\
-              );\
-              CREATE TABLE IF NOT EXISTS _sync_state (\
-                  key   TEXT PRIMARY KEY,\
-                  value TEXT NOT NULL\
-              );",
+        sql: include_str!("../../../schema/migrations/006_soft_delete_tombstones.sql"),
+    },
+    Migration {
+        version: 7,
+        name: "goal_due_reminder_repeat",
+        sql: include_str!("../../../schema/migrations/007_goal_due_reminder_repeat.sql"),
     },
 ];
 
@@ -208,6 +175,9 @@ pub struct Goal {
     pub created_at: String,
     pub updated_at: String,
     pub completed_at: Option<String>,
+    pub due_at: Option<String>,
+    pub remind_at: Option<String>,
+    pub repeat_rule: Option<String>,
     pub agent_status: Option<AgentStatus>,
     pub agent_result: Option<String>,
     pub agent_progress: Option<String>,
@@ -222,6 +192,9 @@ pub struct CreateGoalInput {
     pub parent_id: Option<String>,
     pub sheet_id: Option<String>,
     pub sort_order: Option<i64>,
+    pub due_at: Option<String>,
+    pub remind_at: Option<String>,
+    pub repeat_rule: Option<String>,
 }
 
 /// A goal sheet (buffer) — organizational grouping for goals.
@@ -245,6 +218,9 @@ pub struct UpdateGoalInput {
     pub status: Option<GoalStatus>,
     pub sort_order: Option<i64>,
     pub completed_at: Option<Option<String>>,
+    pub due_at: Option<Option<String>>,
+    pub remind_at: Option<Option<String>>,
+    pub repeat_rule: Option<Option<String>>,
     pub agent_status: Option<Option<AgentStatus>>,
     pub agent_result: Option<Option<String>>,
     pub agent_progress: Option<Option<String>>,
@@ -260,6 +236,9 @@ impl UpdateGoalInput {
             && self.status.is_none()
             && self.sort_order.is_none()
             && self.completed_at.is_none()
+            && self.due_at.is_none()
+            && self.remind_at.is_none()
+            && self.repeat_rule.is_none()
             && self.agent_status.is_none()
             && self.agent_result.is_none()
             && self.agent_progress.is_none()

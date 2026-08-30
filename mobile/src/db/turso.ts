@@ -244,6 +244,9 @@ const DESIRED_GOAL_COLS = [
   'created_at',
   'updated_at',
   'completed_at',
+  'due_at',
+  'remind_at',
+  'repeat_rule',
   // Agent fields — synced so mobile sees agent status/result written by
   // the backend, and the backend sees agent_status='queued' written by
   // mobile.
@@ -324,6 +327,9 @@ const MISSING_COL_ALTERS: Record<string, string> = {
   sheet_id:
     'ALTER TABLE goals ADD COLUMN sheet_id TEXT REFERENCES goal_sheets(id) ON DELETE SET NULL',
   deleted_at: 'ALTER TABLE goals ADD COLUMN deleted_at TEXT',
+  due_at: 'ALTER TABLE goals ADD COLUMN due_at TEXT',
+  remind_at: 'ALTER TABLE goals ADD COLUMN remind_at TEXT',
+  repeat_rule: 'ALTER TABLE goals ADD COLUMN repeat_rule TEXT',
   agent_status: 'ALTER TABLE goals ADD COLUMN agent_status TEXT',
   agent_result: 'ALTER TABLE goals ADD COLUMN agent_result TEXT',
   agent_progress: 'ALTER TABLE goals ADD COLUMN agent_progress TEXT',

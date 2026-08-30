@@ -9,7 +9,7 @@ export interface GoalEditModalProps {
   goal: Goal | null;
   visible: boolean;
   onClose: () => void;
-  onSave: (id: string, title: string, description: string) => void;
+  onSave: (id: string, title: string, description: string, dueAt: string | null, remindAt: string | null, repeatRule: string | null) => void;
   onDelete: (id: string) => void;
   /** Called after a goal is assigned to the agent (to trigger a refresh). */
   onAgentAssigned?: (id: string) => void;
@@ -26,6 +26,9 @@ export default function GoalEditModal({
   const { colors } = useTheme();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
+  const [dueAt, setDueAt] = useState('');
+  const [remindAt, setRemindAt] = useState('');
+  const [repeatRule, setRepeatRule] = useState('');
   const [agentAvailable, setAgentAvailable] = useState(false);
 
   // Reset local state whenever a new goal is opened.
@@ -34,6 +37,9 @@ export default function GoalEditModal({
     setLastId(goal.id);
     setTitle(goal.title);
     setDescription(goal.description ?? '');
+    setDueAt(goal.due_at ?? '');
+    setRemindAt(goal.remind_at ?? '');
+    setRepeatRule(goal.repeat_rule ?? '');
   }
 
   // Check agent availability when the modal opens for a new goal.
@@ -97,6 +103,43 @@ export default function GoalEditModal({
             numberOfLines={4}
           />
 
+          <Text style={[styles.label, { color: colors.outlineVariant }]}>Due (YYYY-MM-DD)</Text>
+          <TextInput
+            style={[styles.input, { backgroundColor: colors.surface, color: colors.onBackground }]}
+            value={dueAt}
+            onChangeText={setDueAt}
+            placeholder="2026-09-01"
+            placeholderTextColor={colors.outlineVariant}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <Text style={[styles.label, { color: colors.outlineVariant }]}>Remind at (ISO)</Text>
+          <TextInput
+            style={[styles.input, { backgroundColor: colors.surface, color: colors.onBackground }]}
+            value={remindAt}
+            onChangeText={setRemindAt}
+            placeholder="2026-09-01T09:00:00Z"
+            placeholderTextColor={colors.outlineVariant}
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          <Text style={[styles.label, { color: colors.outlineVariant }]}>Repeat</Text>
+          <View style={styles.repeatRow}>
+            {(['none', 'daily', 'weekly', 'monthly', 'yearly'] as const).map((opt) => (
+              <Pressable
+                key={opt}
+                onPress={() => setRepeatRule(opt === 'none' ? '' : opt)}
+                style={[
+                  styles.repeatChip,
+                  { borderColor: colors.outline },
+                  (repeatRule || 'none') === opt || (opt === 'none' && !repeatRule) ? { backgroundColor: colors.primary, borderColor: colors.primary } : null,
+                ]}
+              >
+                <Text style={{ color: (repeatRule || 'none') === opt || (opt === 'none' && !repeatRule) ? colors.onPrimary : colors.onSurfaceVariant, fontSize: 12 }}>{opt}</Text>
+              </Pressable>
+            ))}
+          </View>
+
           {agentAvailable && goal.status !== 'agent_mode' ? (
             <Pressable
               style={[styles.agentBtn, { backgroundColor: colors.tertiary }]}
@@ -139,7 +182,15 @@ export default function GoalEditModal({
             <Pressable
               style={[styles.saveBtn, { backgroundColor: colors.primary }]}
               onPress={() => {
-                if (title.trim()) onSave(goal.id, title.trim(), description.trim());
+                if (title.trim())
+                  onSave(
+                    goal.id,
+                    title.trim(),
+                    description.trim(),
+                    dueAt.trim() || null,
+                    remindAt.trim() || null,
+                    repeatRule.trim() || null,
+                  );
               }}
             >
               <Text style={[styles.saveText, { color: colors.onPrimary }]}>Save</Text>
@@ -236,5 +287,17 @@ const styles = StyleSheet.create({
   saveText: {
     fontSize: 16,
     fontWeight: '600',
+  },
+  repeatRow: {
+    flexDirection: 'row',
+    gap: 6,
+    flexWrap: 'wrap',
+    marginTop: 4,
+  },
+  repeatChip: {
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
   },
 });

@@ -143,6 +143,12 @@ fn run(
             Mode::ConfirmPurge => handle_purge_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             Mode::AssignRange => handle_assign_range_key(app, key)?,
+            Mode::EditDue { .. }
+            | Mode::EditReminder { .. }
+            | Mode::EditRepeat { .. }
+            | Mode::AddGoal { .. }
+            | Mode::EditTitle { .. }
+            | Mode::EditDescription { .. } => handle_input_key(app, key)?,
             _ => handle_input_key(app, key)?,
         }
 
@@ -268,6 +274,18 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
         }
         return Ok(false);
     }
+    if binds.edit_due.matches(key) {
+        app.start_edit_due();
+        return Ok(false);
+    }
+    if binds.edit_reminder.matches(key) {
+        app.start_edit_reminder();
+        return Ok(false);
+    }
+    if binds.edit_repeat.matches(key) {
+        app.start_edit_repeat();
+        return Ok(false);
+    }
 
     // No leader — bare navigation keys only.
     match key.code {
@@ -324,6 +342,9 @@ fn handle_input_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
             Mode::AddGoal { .. } => app.commit_add_goal()?,
             Mode::EditTitle { .. } => app.commit_edit_title()?,
             Mode::EditDescription { .. } => app.commit_edit_description()?,
+            Mode::EditDue { .. } => app.commit_edit_due()?,
+            Mode::EditReminder { .. } => app.commit_edit_reminder()?,
+            Mode::EditRepeat { .. } => app.commit_edit_repeat()?,
             _ => {}
         },
         KeyCode::Backspace => app.input.backspace(),

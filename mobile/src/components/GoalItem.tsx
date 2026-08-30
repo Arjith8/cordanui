@@ -226,6 +226,54 @@ export default function GoalItem({
                 </View>
               </View>
 
+              {/* Due / reminder / repeat — first-class, not plugin */}
+              {(goal.due_at || goal.remind_at || goal.repeat_rule) && (
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                  {goal.due_at ? (
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        paddingHorizontal: 6,
+                        paddingVertical: 2,
+                        borderRadius: 6,
+                        backgroundColor: colors.surfaceVariant,
+                        color: goal.due_at < new Date().toISOString() && goal.status !== 'completed' ? colors.error : colors.primary,
+                      }}
+                    >
+                      📅 {goal.due_at.slice(0, 10)}
+                    </Text>
+                  ) : null}
+                  {goal.remind_at ? (
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        paddingHorizontal: 6,
+                        paddingVertical: 2,
+                        borderRadius: 6,
+                        backgroundColor: colors.surfaceVariant,
+                        color: colors.tertiary,
+                      }}
+                    >
+                      ⏰ {goal.remind_at.slice(0, 16).replace('T', ' ')}
+                    </Text>
+                  ) : null}
+                  {goal.repeat_rule ? (
+                    <Text
+                      style={{
+                        fontSize: 12,
+                        paddingHorizontal: 6,
+                        paddingVertical: 2,
+                        borderRadius: 6,
+                        backgroundColor: colors.surfaceVariant,
+                        color: colors.onSurfaceVariant,
+                      }}
+                    >
+                      ↻ {goal.repeat_rule}
+                    </Text>
+                  ) : null}
+                </View>
+              )}
+
               {/* Agent status badge — only for goals in agent_mode. */}
               {goal.status === 'agent_mode' ? (
                 <AgentStatusBadge goal={goal} />

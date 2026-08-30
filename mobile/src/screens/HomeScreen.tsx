@@ -252,9 +252,9 @@ export default function HomeScreen() {
   }, []);
 
   const handleSave = useCallback(
-    async (id: string, title: string, description: string) => {
+    async (id: string, title: string, description: string, dueAt: string | null, remindAt: string | null, repeatRule: string | null) => {
       try {
-        await updateGoal(id, { title, description });
+        await updateGoal(id, { title, description, due_at: dueAt, remind_at: remindAt, repeat_rule: repeatRule });
         setModalVisible(false);
         await refresh();
       } catch (e) {

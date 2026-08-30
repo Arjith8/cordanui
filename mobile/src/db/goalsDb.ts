@@ -207,6 +207,9 @@ async function verifySchema(database: SQLite.SQLiteDatabase): Promise<void> {
     'created_at',
     'updated_at',
     'completed_at',
+    'due_at',
+    'remind_at',
+    'repeat_rule',
     'deleted_at',
   ]) {
     if (!colNames.has(c)) {
@@ -357,8 +360,8 @@ export async function createGoal(input: CreateGoalInput): Promise<Goal> {
   const sortOrder = input.sort_order ?? nextRow?.next ?? 0;
   await database.runAsync(
     `INSERT INTO goals
-       (id, title, description, status, parent_id, sheet_id, sort_order, created_at, updated_at)
-     VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+       (id, title, description, status, parent_id, sheet_id, sort_order, created_at, updated_at, due_at, remind_at, repeat_rule)
+     VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       id,
       input.title,
@@ -368,6 +371,9 @@ export async function createGoal(input: CreateGoalInput): Promise<Goal> {
       sortOrder,
       ts,
       ts,
+      input.due_at ?? null,
+      input.remind_at ?? null,
+      input.repeat_rule ?? null,
     ],
   );
   const created = await getGoal(id);
@@ -392,6 +398,9 @@ export async function updateGoal(id: string, input: UpdateGoalInput): Promise<Go
   setIf('status', input.status);
   setIf('sort_order', input.sort_order);
   setIf('completed_at', input.completed_at);
+  setIf('due_at', input.due_at);
+  setIf('remind_at', input.remind_at);
+  setIf('repeat_rule', input.repeat_rule);
   setIf('agent_status', input.agent_status);
   setIf('agent_result', input.agent_result);
   setIf('agent_progress', input.agent_progress);

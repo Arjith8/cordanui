@@ -446,7 +446,7 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
                 Style::default().fg(c.on_background)
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::raw(indent.clone()),
                 Span::raw(expand_icon),
                 Span::styled(
@@ -454,7 +454,35 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
                     Style::default().fg(status_color),
                 ),
                 Span::styled(row.goal.title.clone(), title_style),
-            ]);
+            ];
+            // Due / reminder / repeat badges after title.
+            let now_iso = cordanui_schema::now_iso();
+            if let Some(due) = &row.goal.due_at {
+                let is_overdue = due < &now_iso && row.goal.status != GoalStatus::Completed;
+                spans.push(Span::styled(
+                    format!("  📅 {}", due),
+                    if is_overdue {
+                        Style::default().fg(c.error)
+                    } else {
+                        Style::default().fg(c.tertiary)
+                    },
+                ));
+            }
+            if let Some(remind) = &row.goal.remind_at {
+                spans.push(Span::styled(
+                    format!("  ⏰ {}", remind),
+                    Style::default().fg(c.tertiary),
+                ));
+            }
+            if let Some(repeat) = &row.goal.repeat_rule {
+                if !repeat.is_empty() && repeat != "none" {
+                    spans.push(Span::styled(
+                        format!("  ↻ {}", repeat),
+                        Style::default().fg(c.tertiary),
+                    ));
+                }
+            }
+            let line = Line::from(spans);
 
             // Description is only shown while the row's detail view
             // (leader + show_details) is toggled on.
@@ -539,6 +567,9 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
         Mode::EditTitle { .. } => (" Edit title: ".to_string(), app.input.text.clone()),
         Mode::EditDescription { .. } => (" Edit description: ".to_string(), app.input.text.clone()),
+        Mode::EditDue { .. } => (" Due: ".to_string(), app.input.text.clone()),
+        Mode::EditReminder { .. } => (" Remind: ".to_string(), app.input.text.clone()),
+        Mode::EditRepeat { .. } => (" Repeat: ".to_string(), app.input.text.clone()),
         Mode::ConfirmDelete { .. } => (" DELETE ".to_string(), String::new()),
         Mode::ConfirmPurge => (" CONFIRM PURGE ".to_string(), String::new()),
         Mode::Help => (" HELP ".to_string(), String::new()),
@@ -575,7 +606,12 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let label_style = match &app.mode {
         Mode::Normal => Style::default().fg(c.outline_variant),
-        Mode::AddGoal { .. } | Mode::EditTitle { .. } | Mode::EditDescription { .. } => {
+        Mode::AddGoal { .. }
+        | Mode::EditTitle { .. }
+        | Mode::EditDescription { .. }
+        | Mode::EditDue { .. }
+        | Mode::EditReminder { .. }
+        | Mode::EditRepeat { .. } => {
             Style::default().fg(c.primary)
         }
         Mode::PluginManager { .. }
@@ -607,6 +643,9 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
             Mode::AddGoal { .. }
                 | Mode::EditTitle { .. }
                 | Mode::EditDescription { .. }
+                | Mode::EditDue { .. }
+                | Mode::EditReminder { .. }
+                | Mode::EditRepeat { .. }
                 | Mode::PluginManager { .. }
                 | Mode::AddSheet
         ) {
@@ -627,17 +666,25 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
             let n = app.keybinds.new_goal.label();
             let d = app.keybinds.show_details.label();
             let h = app.keybinds.help.label();
+            let due = app.keybinds.edit_due.label();
+            let rem = app.keybinds.edit_reminder.label();
+            let rep = app.keybinds.edit_repeat.label();
             if app.leader_pending {
                 format!(
                     "leader active — {n} new goal (subgoal if expanded) · {d} details/subgoals · {h} help · Esc cancel"
                 )
             } else {
-                format!("leader · leader+{n} new · leader+{d} details · leader+{h} help")
+                format!(
+                    "leader · leader+{n} new · leader+{d} details · leader+{h} help · {due} due · {rem} remind · {rep} repeat"
+                )
             }
         }
         Mode::AddGoal { .. } => "Enter to save · Esc to cancel".into(),
         Mode::EditTitle { .. } => "Enter to save · Esc to cancel".into(),
         Mode::EditDescription { .. } => "Enter to save · Esc to cancel".into(),
+        Mode::EditDue { .. } => "Enter to save due date (empty to clear) · Esc to cancel".into(),
+        Mode::EditReminder { .. } => "Enter to save reminder (empty to clear) · Esc to cancel".into(),
+        Mode::EditRepeat { .. } => "Enter to save (none/daily/weekly/monthly/yearly) · Esc to cancel".into(),
         Mode::ConfirmDelete { .. } => "y to confirm · n/Esc to cancel".into(),
         Mode::ConfirmPurge => "y to purge · n/Esc to cancel".into(),
         Mode::Help => {

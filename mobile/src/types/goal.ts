@@ -20,6 +20,9 @@ export interface Goal {
   created_at: string; // ISO 8601
   updated_at: string; // ISO 8601
   completed_at: string | null;
+  due_at: string | null;
+  remind_at: string | null;
+  repeat_rule: string | null;
   agent_status: AgentStatus | null;
   agent_result: string | null;
   agent_progress: string | null;
@@ -40,6 +43,9 @@ export interface CreateGoalInput {
   parent_id?: string | null;
   sheet_id?: string | null;
   sort_order?: number;
+  due_at?: string | null;
+  remind_at?: string | null;
+  repeat_rule?: string | null;
 }
 
 export interface UpdateGoalInput {
@@ -48,6 +54,9 @@ export interface UpdateGoalInput {
   status?: GoalStatus;
   sort_order?: number;
   completed_at?: string | null;
+  due_at?: string | null;
+  remind_at?: string | null;
+  repeat_rule?: string | null;
   agent_status?: AgentStatus | null;
   agent_result?: string | null;
   agent_progress?: string | null;
