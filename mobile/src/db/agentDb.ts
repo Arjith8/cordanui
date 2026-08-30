@@ -54,11 +54,40 @@ export async function getAgentUrl(): Promise<string | null> {
 }
 
 /**
- * Whether agent triggers should be visible. True when a non-empty
- * `agent.url` is available (from synced settings or env var).
+ * Health probe for the agent backend — `GET {url}/health` must return 2xx.
+ * Short timeout so the UI never blocks on a dead backend.
+ */
+export async function isAgentHealthy(url: string): Promise<boolean> {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 3000);
+  try {
+    const base = url.replace(/\/+$/, '');
+    const headers: Record<string, string> = {};
+    const token = getConfig().agentToken;
+    if (token) headers['authorization'] = `Bearer ${token}`;
+    const res = await fetch(`${base}/health`, {
+      method: 'GET',
+      headers,
+      signal: controller.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/**
+ * Whether agent triggers should be visible. True only when a non-empty
+ * `agent.url` is available (from synced settings or env var) **and** the
+ * backend passes its health check (`GET /health` 2xx). Credentials must be
+ * set and the service must be reachable — otherwise agentic UI stays hidden.
  */
 export async function isAgentAvailable(): Promise<boolean> {
-  return (await getAgentUrl()) !== null;
+  const url = await getAgentUrl();
+  if (!url) return false;
+  return await isAgentHealthy(url);
 }
 
 /**
