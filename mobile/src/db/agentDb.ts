@@ -143,8 +143,7 @@ export async function assignToAgent(
 }
 
 /**
- * Assign a range of goals to the agent — supports `@1-6` numeric (1-based flat
- * sort_order) and `@<id>-<id>` dotted UUID. Mirrors TUI's `cord.goals.assign_range`.
+ * Assign a range of goals to the agent — supports `@1-6` / `@<sno>-<sno>` (sno = serial, 1-based visible sort_order) and `@<id>-<id>` dotted uuid fallback. Mirrors TUI's `cord.goals.assign_range`.
  */
 export async function assignRangeToAgent(
   start: string,

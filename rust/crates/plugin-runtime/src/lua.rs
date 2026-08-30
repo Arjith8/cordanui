@@ -1126,7 +1126,7 @@ fn register_cord_goals(
         })?,
     )?;
     // cord.goals.assign_range(start, end, {agent?, model?}) -> [id]
-    // start/end are 1-based numeric strings ("1","6") or full IDs ("abc.def")
+    // start/end are 1-based sno strings ("1","6") (= serial, visible order) or full IDs ("abc.def") as fallback
     let goals_range = goals.clone();
     api.set(
         "assign_range",

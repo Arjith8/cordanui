@@ -2503,7 +2503,7 @@ impl cordanui_plugin_runtime::ui::GoalsHost for AppGoalsHost {
         if sorted.is_empty() {
             return Ok(Vec::new());
         }
-        // `@1-6` numeric vs `@<id>-<id>` dotted UUID — try numeric first
+        // `@1-6` / `@<sno>-<sno>` — sno = 1-based visible serial (sort_order order); numeric try first, uuid/dotted id as fallback
         let start_trim = start.trim_start_matches('@');
         let end_trim = end.trim_start_matches('@');
         let s_num = start_trim.parse::<usize>().ok();
@@ -2513,7 +2513,7 @@ impl cordanui_plugin_runtime::ui::GoalsHost for AppGoalsHost {
             let e0 = (e.saturating_sub(1)).min(sorted.len() - 1);
             if s0 <= e0 { (s0, e0) } else { (e0, s0) }
         } else {
-            // ID range — find positions, allow prefix/suffix match for dotted hierarchy
+            // sno-as-uuid fallback — find positions, allow prefix/suffix match for dotted hierarchy
             let find_idx = |id: &str| {
                 sorted
                     .iter()

@@ -169,7 +169,7 @@ pub struct Keybinds {
     pub move_goal: KeyBinding,
     /// <leader> + this opens the sheet (buffer) picker.
     pub sheets: KeyBinding,
-    /// <leader> + this assigns range @1-6 / @<id>-<id> to agent (from goals page or chat).
+    /// <leader> + this assigns range @1-6 / @<sno>-<sno> (sno = serial number, 1-based visible order; uuid fallback) to agent (from goals page or chat).
     pub assign_range: KeyBinding,
 }
 
@@ -355,7 +355,7 @@ impl Keybinds {
             "assign_range",
             &self.assign_range,
             &d.assign_range,
-            "<leader> + key — assign @1-6 / @<id>-<id> range to agent",
+            "<leader> + key — assign @1-6 / @<sno>-<sno> range to agent (sno = serial)",
         );
         v
     }
