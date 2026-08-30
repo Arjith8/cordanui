@@ -67,6 +67,8 @@ pub enum Mode {
     /// Host-level settings (Turso credentials) plus one entry per plugin
     /// that owns a configurator.
     GlobalConfig,
+    /// Stats overlay.
+    Stats,
 }
 
 // ─── plugin modal ────────────────────────────────────────────────────────────

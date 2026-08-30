@@ -116,6 +116,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if let Mode::GlobalConfig = &app.mode {
         render_global_config(app, frame);
     }
+    if app.mode == Mode::Stats {
+        render_stats(app, frame);
+    }
 }
 
 /// The command-line match list: up to 8 commands filtered by the input.
@@ -602,6 +605,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
             };
             (" GLOBAL SETTINGS ".to_string(), text)
         }
+        Mode::Stats => (" STATS ".to_string(), String::new()),
     };
 
     let label_style = match &app.mode {
@@ -627,7 +631,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::Command | Mode::GlobalConfig | Mode::AssignRange => Style::default().fg(c.secondary),
         Mode::ConfirmDelete { .. } | Mode::ConfirmDeleteSheet { .. } => Style::default().fg(c.error),
         Mode::ConfirmPurge => Style::default().fg(c.error),
-        Mode::Help => Style::default().fg(c.primary),
+        Mode::Help | Mode::Stats => Style::default().fg(c.primary),
     };
 
     let block = Block::default()
@@ -722,6 +726,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
                 "Enter open plugin settings · ↑↓ row · Esc close".into()
             }
         }
+        Mode::Stats => "Esc/q to close".into(),
         Mode::PluginModal => match app.plugin_modal.as_ref().map(|m| &m.kind) {
             Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
             Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),
@@ -1748,6 +1753,84 @@ fn render_plugin_help(app: &App, frame: &mut Frame) {
         .block(block)
         .style(Style::default().fg(c.on_background));
     frame.render_widget(&paragraph, area);
+}
+
+fn render_stats(app: &App, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(70, 75, frame.area());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(" Stats ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+
+    let s = app.stats_snapshot();
+    let total = s.total as f64;
+
+    let pct = |n: usize| if total > 0.0 { n as f64 / total * 100.0 } else { 0.0 };
+    let bar = |n: usize, width: usize| {
+        let p = pct(n);
+        let filled = ((p / 100.0) * width as f64).round() as usize;
+        format!("{}{}", "█".repeat(filled), "░".repeat(width.saturating_sub(filled)))
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        format!("  Total goals: {}", s.total),
+        Style::default().fg(c.primary).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+
+    // Status breakdown with bars
+    let bw = 14usize;
+    let status_rows = [
+        ("pending", s.pending, c.get("onSurfaceVariant").unwrap_or(c.outline_variant)),
+        ("in progress", s.in_progress, c.primary),
+        ("completed", s.completed, c.success),
+        ("agent mode", s.agent_mode, c.tertiary),
+    ];
+    for (label, cnt, col) in status_rows {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {label:<12}"), Style::default().fg(c.on_background)),
+            Span::styled(format!("{cnt:>4}  "), Style::default().fg(col).add_modifier(Modifier::BOLD)),
+            Span::styled(bar(cnt, bw), Style::default().fg(col)),
+            Span::styled(format!(" {:>5.1}%", pct(cnt)), Style::default().fg(c.outline_variant)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  overdue      ", Style::default().fg(c.on_background)),
+        Span::styled(format!("{:>4}", s.overdue), Style::default().fg(c.error).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  due today {:>4}  due week {:>4}  no due {:>4}  remind {:>4}", s.due_today, s.due_week, s.no_due, s.remind_set), Style::default().fg(c.outline_variant)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  Repeat", Style::default().fg(c.secondary).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(vec![
+        Span::styled(format!("    none {:>4}  daily {:>4}  weekly {:>4}  monthly {:>4}  yearly {:>4}", s.repeat_none, s.repeat_daily, s.repeat_weekly, s.repeat_monthly, s.repeat_yearly), Style::default().fg(c.on_background)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("  Sheets", Style::default().fg(c.secondary).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  count: {}", s.sheets_count), Style::default().fg(c.outline_variant)),
+        Span::styled(format!("  avg children: {:.1}", s.avg_children), Style::default().fg(c.outline_variant)),
+    ]));
+    for (name, cnt) in &s.sheet_distribution {
+        lines.push(Line::from(vec![
+            Span::styled(format!("    {:<20}", truncate_str(name, 20)), Style::default().fg(c.on_background)),
+            Span::styled(format!("{cnt:>4}  "), Style::default().fg(c.primary)),
+            Span::styled(bar(*cnt, bw), Style::default().fg(c.primary)),
+            Span::styled(format!(" {:>5.1}%", pct(*cnt)), Style::default().fg(c.outline_variant)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  Agent", Style::default().fg(c.secondary).add_modifier(Modifier::BOLD))));
+    lines.push(Line::from(vec![
+        Span::styled(format!("    queued {:>4}  running {:>4}  completed {:>4}  failed {:>4}", s.agent_queued, s.agent_running, s.agent_completed, s.agent_failed), Style::default().fg(c.on_background)),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 /// Helper: centered rect for overlays.

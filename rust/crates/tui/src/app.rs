@@ -28,6 +28,178 @@ pub use crate::types::{
     PluginCommand, PluginCommandOutcome, PluginModalKind, PluginPane, SyncStatus, SYNC_INTERVAL,
 };
 
+// ─── stats ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct StatsSnapshot {
+    pub total: usize,
+    pub pending: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub agent_mode: usize,
+    pub overdue: usize,
+    pub due_today: usize,
+    pub due_week: usize,
+    pub no_due: usize,
+    pub remind_set: usize,
+    pub repeat_none: usize,
+    pub repeat_daily: usize,
+    pub repeat_weekly: usize,
+    pub repeat_monthly: usize,
+    pub repeat_yearly: usize,
+    pub sheets_count: usize,
+    pub sheet_distribution: Vec<(String, usize)>,
+    pub avg_children: f64,
+    pub agent_queued: usize,
+    pub agent_running: usize,
+    pub agent_completed: usize,
+    pub agent_failed: usize,
+}
+
+pub fn stats_snapshot(goals: &[Goal], sheets: &[cordanui_schema::GoalSheet]) -> StatsSnapshot {
+    let total = goals.len();
+    let pending = goals.iter().filter(|g| g.status == GoalStatus::Pending).count();
+    let in_progress = goals.iter().filter(|g| g.status == GoalStatus::InProgress).count();
+    let completed = goals.iter().filter(|g| g.status == GoalStatus::Completed).count();
+    let agent_mode = goals.iter().filter(|g| g.status == GoalStatus::AgentMode).count();
+
+    let now = chrono::Utc::now();
+    let today = now.date_naive();
+    let week_later = today + chrono::Duration::days(7);
+
+    let mut overdue = 0usize;
+    let mut due_today = 0usize;
+    let mut due_week = 0usize;
+    let mut no_due = 0usize;
+    for g in goals {
+        match &g.due_at {
+            None => no_due += 1,
+            Some(s) if s.trim().is_empty() => no_due += 1,
+            Some(s) => {
+                // Try parse RFC3339; compare as string if parse fails (lexicographic ISO works for UTC)
+                let parsed = chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok();
+                let is_overdue = if let Some(dt) = parsed {
+                    dt < now && g.status != GoalStatus::Completed
+                } else {
+                    s.as_str() < now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true).as_str()
+                        && g.status != GoalStatus::Completed
+                };
+                if is_overdue {
+                    overdue += 1;
+                }
+                if let Some(dt) = parsed {
+                    let d = dt.date_naive();
+                    if d == today {
+                        due_today += 1;
+                    }
+                    if d >= today && d <= week_later {
+                        due_week += 1;
+                    }
+                } else {
+                    // Fallback: string prefix YYYY-MM-DD
+                    if s.len() >= 10 {
+                        let date_str = &s[..10];
+                        if let Ok(d) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                            if d == today {
+                                due_today += 1;
+                            }
+                            if d >= today && d <= week_later {
+                                due_week += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let remind_set = goals
+        .iter()
+        .filter(|g| g.remind_at.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+        .count();
+
+    let mut repeat_none = 0usize;
+    let mut repeat_daily = 0usize;
+    let mut repeat_weekly = 0usize;
+    let mut repeat_monthly = 0usize;
+    let mut repeat_yearly = 0usize;
+    for g in goals {
+        match g.repeat_rule.as_deref().map(str::trim) {
+            None | Some("") | Some("none") => repeat_none += 1,
+            Some("daily") => repeat_daily += 1,
+            Some("weekly") => repeat_weekly += 1,
+            Some("monthly") => repeat_monthly += 1,
+            Some("yearly") => repeat_yearly += 1,
+            _ => repeat_none += 1,
+        }
+    }
+
+    let sheets_count = sheets.len();
+    let mut sheet_distribution: Vec<(String, usize)> = Vec::new();
+    {
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut no_sheet = 0usize;
+        for g in goals {
+            match &g.sheet_id {
+                Some(id) if !id.is_empty() => *counts.entry(id.clone()).or_default() += 1,
+                _ => no_sheet += 1,
+            }
+        }
+        // Map sheet ids to names
+        let name_map: HashMap<String, String> = sheets.iter().map(|s| (s.id.clone(), s.name.clone())).collect();
+        for (id, cnt) in counts {
+            let name = name_map.get(&id).cloned().unwrap_or(id.clone());
+            sheet_distribution.push((name, cnt));
+        }
+        if no_sheet > 0 {
+            sheet_distribution.push(("All / no sheet".to_string(), no_sheet));
+        }
+        sheet_distribution.sort_by(|a, b| b.1.cmp(&a.1));
+    }
+
+    let children_total: usize = {
+        let parent_ids: HashSet<&str> = goals.iter().filter_map(|g| g.parent_id.as_deref()).collect();
+        // Count goals that are children
+        goals.iter().filter(|g| g.parent_id.is_some()).count()
+    };
+    let _ = children_total;
+    let parents = goals.iter().filter(|g| goals.iter().any(|c| c.parent_id.as_deref() == Some(g.id.as_str()))).count();
+    let total_children = goals.iter().filter(|g| g.parent_id.is_some()).count();
+    let avg_children = if parents > 0 { total_children as f64 / parents as f64 } else { 0.0 };
+
+    let agent_queued = goals.iter().filter(|g| g.agent_status == Some(cordanui_schema::AgentStatus::Queued)).count();
+    let agent_running = goals.iter().filter(|g| g.agent_status == Some(cordanui_schema::AgentStatus::Running)).count();
+    let agent_completed = goals.iter().filter(|g| g.agent_status == Some(cordanui_schema::AgentStatus::Completed)).count();
+    let agent_failed = goals.iter().filter(|g| g.agent_status == Some(cordanui_schema::AgentStatus::Failed)).count();
+
+    StatsSnapshot {
+        total,
+        pending,
+        in_progress,
+        completed,
+        agent_mode,
+        overdue,
+        due_today,
+        due_week,
+        no_due,
+        remind_set,
+        repeat_none,
+        repeat_daily,
+        repeat_weekly,
+        repeat_monthly,
+        repeat_yearly,
+        sheets_count,
+        sheet_distribution,
+        avg_children,
+        agent_queued,
+        agent_running,
+        agent_completed,
+        agent_failed,
+    }
+}
+
 /// The full TUI application state.
 pub struct App {
     pub db: Database,
@@ -2331,6 +2503,14 @@ impl App {
         let next = (self.help_selected as i32 + delta).rem_euclid(n);
         self.help_selected = next as usize;
         self.help_scroll = 0;
+    }
+
+    pub fn open_stats(&mut self) {
+        self.mode = Mode::Stats;
+    }
+
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        stats_snapshot(&self.goals, &self.sheets)
     }
 
     pub fn apply_style_updates(&mut self) -> anyhow::Result<()> {

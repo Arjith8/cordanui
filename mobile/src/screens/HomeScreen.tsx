@@ -19,6 +19,7 @@ import { nextStatus } from '@/types/goal';
 import { orderGoals } from '@/utils/order';
 
 import ErrorsPage from '@/components/ErrorsPage';
+import StatsPage from '@/components/StatsPage';
 import GoalEditModal from '@/components/GoalEditModal';
 import GoalItem from '@/components/GoalItem';
 import InlineAddInput from '@/components/InlineAddInput';
@@ -44,6 +45,7 @@ export default function HomeScreen() {
   const [editingGoal, setEditingGoal] = useState<Goal | null>(null);
   const [modalVisible, setModalVisible] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
+  const [showStats, setShowStats] = useState(false);
   const [moveGoal, setMoveGoal] = useState<Goal | null>(null);
   const [moveVisible, setMoveVisible] = useState(false);
 
@@ -321,6 +323,10 @@ export default function HomeScreen() {
     );
   }
 
+  if (showStats) {
+    return <StatsPage goals={goals} sheets={sheets} onBack={() => setShowStats(false)} />;
+  }
+
   if (showErrors) {
     return <ErrorsPage onBack={() => setShowErrors(false)} />;
   }
@@ -336,15 +342,26 @@ export default function HomeScreen() {
             {totals.completed}/{totals.total} done · {totals.pending} pending
           </Text>
         </View>
-        <Pressable
-          onPress={() => setShowErrors(true)}
-          hitSlop={8}
-          style={[styles.profileBtn, { backgroundColor: colors.surface }]}
-          accessibilityRole="button"
-          accessibilityLabel="Open profile, sync and settings"
-        >
-          <Text style={[styles.profileIcon, { color: colors.primary }]}>⚙</Text>
-        </Pressable>
+        <View style={styles.headerActions}>
+          <Pressable
+            onPress={() => setShowStats(true)}
+            hitSlop={8}
+            style={[styles.profileBtn, { backgroundColor: colors.surface }]}
+            accessibilityRole="button"
+            accessibilityLabel="Open stats"
+          >
+            <Text style={[styles.profileIcon, { color: colors.primary }]}>◈</Text>
+          </Pressable>
+          <Pressable
+            onPress={() => setShowErrors(true)}
+            hitSlop={8}
+            style={[styles.profileBtn, { backgroundColor: colors.surface }]}
+            accessibilityRole="button"
+            accessibilityLabel="Open profile, sync and settings"
+          >
+            <Text style={[styles.profileIcon, { color: colors.primary }]}>⚙</Text>
+          </Pressable>
+        </View>
       </View>
 
       {error ? (
@@ -521,6 +538,11 @@ const styles = StyleSheet.create({
   },
   profileIcon: {
     fontSize: 18,
+  },
+  headerActions: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
   },
   tabs: {
     flexGrow: 0,

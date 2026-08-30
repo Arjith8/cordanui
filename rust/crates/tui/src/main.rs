@@ -142,6 +142,7 @@ fn run(
             Mode::GlobalConfig => handle_global_config_key(app, key)?,
             Mode::ConfirmPurge => handle_purge_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
+            Mode::Stats => handle_stats_key(app, key),
             Mode::AssignRange => handle_assign_range_key(app, key)?,
             Mode::EditDue { .. }
             | Mode::EditReminder { .. }
@@ -218,6 +219,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             _ if binds.global_config.matches(key) => app.open_global_config(),
             _ if binds.sync.matches(key) => app.request_sync(),
             _ if binds.sheets.matches(key) => app.open_sheet_picker()?,
+            _ if binds.stats.matches(key) => app.open_stats(),
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -898,4 +900,11 @@ fn handle_assign_range_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<
         _ => {}
     }
     Ok(())
+}
+
+fn handle_stats_key(app: &mut app::App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.cancel(),
+        _ => {}
+    }
 }

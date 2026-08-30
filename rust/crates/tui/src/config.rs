@@ -177,6 +177,8 @@ pub struct Keybinds {
     pub edit_reminder: KeyBinding,
     /// Bare key editing the selected goal's repeat rule.
     pub edit_repeat: KeyBinding,
+    /// <leader> + this opens the stats page.
+    pub stats: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -202,6 +204,7 @@ impl Default for Keybinds {
             edit_due: KeyBinding::parse("D").unwrap(),
             edit_reminder: KeyBinding::parse("R").unwrap(),
             edit_repeat: KeyBinding::parse("ctrl+r").unwrap(),
+            stats: KeyBinding::parse("S").unwrap(),
         }
     }
 }
@@ -256,6 +259,7 @@ impl Keybinds {
             edit_due: get("edit_due", &defaults.edit_due),
             edit_reminder: get("edit_reminder", &defaults.edit_reminder),
             edit_repeat: get("edit_repeat", &defaults.edit_repeat),
+            stats: get("stats", &defaults.stats),
         }
     }
 
@@ -386,6 +390,12 @@ impl Keybinds {
             &self.edit_repeat,
             &d.edit_repeat,
             "edit selected goal repeat rule",
+        );
+        push(
+            "stats",
+            &self.stats,
+            &d.stats,
+            "<leader> + key — open stats page",
         );
         v
     }
