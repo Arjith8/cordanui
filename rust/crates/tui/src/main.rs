@@ -270,7 +270,11 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
                     return Ok(false);
                 }
                 if n == "esc" {
-                    // Unhandled Esc: leave the buffer (back to All/goals).
+                    // Esc is now no-op in chat (user request) - consume but do not close
+                    return Ok(false);
+                }
+                if n == "q" {
+                    // q with draft empty: chat returned false to signal close (draft==\"\" check in Lua)
                     *app.active_buffer_id.lock().unwrap() = None;
                     return Ok(false);
                 }
