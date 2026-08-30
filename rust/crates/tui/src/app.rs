@@ -19,6 +19,7 @@ use ratatui::widgets::ListState;
 
 use crate::db;
 use crate::plugin_ui::PanelCommand;
+use cordanui_plugin_runtime::ui::GoalsHost;
 use cordanui_plugin_runtime::{UiRequest, UiResponse};
 
 // Re-export all types so existing `use crate::app::X` paths keep working.
@@ -110,6 +111,7 @@ pub struct App {
     pub active_buffer_id: Arc<Mutex<Option<String>>>,
     pub sheet_manager: Arc<crate::sheets::SheetManager>,
     pub buffer_manager: Arc<crate::buffers::BufferManager>,
+    pub goals_host: Arc<AppGoalsHost>,
 }
 
 impl App {
@@ -128,6 +130,7 @@ impl App {
         ));
         let styles = std::sync::Arc::new(crate::style::StyleBridge::new());
         let services = std::sync::Arc::new(crate::services::ServiceManager::new());
+        let goals_host = Arc::new(AppGoalsHost::new(db.clone(), services.clone()));
         let theme = crate::theme::Theme::resolve(&db, &styles.session_snapshot());
         let plugin_ui = std::sync::Arc::new(crate::plugin_ui::PluginUiBridge::new());
         let mut list_state = ListState::default();
@@ -187,6 +190,7 @@ impl App {
             active_buffer_id: active_buffer,
             sheet_manager,
             buffer_manager,
+            goals_host,
         };
         Ok(app)
     }
@@ -895,6 +899,45 @@ impl App {
         self.agent_choices = choices;
         self.agent_selected = 0;
         self.mode = Mode::AgentPicker { goal_id };
+        Ok(())
+    }
+
+    pub fn start_assign_range(&mut self) {
+        self.input.clear();
+        self.input.text = "@".to_string();
+        self.input.cursor = 1;
+        self.mode = Mode::AssignRange;
+    }
+
+    pub fn commit_assign_range(&mut self) -> anyhow::Result<()> {
+        let raw = self.input.text.trim().to_string();
+        self.mode = Mode::Normal;
+        self.input.clear();
+        if raw.is_empty() || raw == "@" {
+            self.set_message("assign cancelled — empty range");
+            return Ok(());
+        }
+        // Strip leading @, split on - or .. or space
+        let trimmed = raw.trim_start_matches('@').trim().to_string();
+        let (start, end) = if let Some((s, e)) = trimmed.split_once('-') {
+            (s.trim().to_string(), e.trim().to_string())
+        } else if let Some((s, e)) = trimmed.split_once("..") {
+            (s.trim().to_string(), e.trim().to_string())
+        } else {
+            // Single @id or @1
+            let single = trimmed.clone();
+            (single.clone(), single)
+        };
+        // Use goals_host to assign (handles numeric 1-based and dotted IDs)
+        let ids = self
+            .goals_host
+            .assign_range_to_agent(&start, &end, None, None)?;
+        if ids.is_empty() {
+            self.set_message("assign: no goals matched range");
+        } else {
+            self.reload()?;
+            self.set_message(&format!("assigned {} goal(s) @{}-{} to agent", ids.len(), start, end));
+        }
         Ok(())
     }
 
@@ -1849,6 +1892,7 @@ impl App {
                     &self.services,
                     &self.sheet_manager,
                     &self.buffer_manager,
+                    &self.goals_host,
                 ),
             ) {
                 Ok(state) => {
@@ -2384,5 +2428,107 @@ impl App {
             }
         }
         Ok(())
+    }
+}
+
+/// Host for `cord.goals` — list and assign goals to agents from Lua (e.g. `@1-6` in chat).
+pub struct AppGoalsHost {
+    db: Database,
+    services: Arc<crate::services::ServiceManager>,
+}
+
+impl AppGoalsHost {
+    pub fn new(db: Database, services: Arc<crate::services::ServiceManager>) -> Self {
+        Self { db, services }
+    }
+}
+
+impl cordanui_plugin_runtime::ui::GoalsHost for AppGoalsHost {
+    fn list_goals(&self) -> Vec<Goal> {
+        crate::db::get_all(&self.db).unwrap_or_default()
+    }
+
+    fn assign_to_agent(
+        &self,
+        goal_id: &str,
+        agent: Option<String>,
+        model: Option<String>,
+    ) -> anyhow::Result<()> {
+        // Verify goal exists
+        let goal = crate::db::get(&self.db, goal_id)?
+            .ok_or_else(|| anyhow::anyhow!("goal not found: {goal_id}"))?;
+        // Optionally merge agent/model into metadata (like TUI's start_agent_run)
+        if agent.is_some() || model.is_some() {
+            let existing: serde_json::Value = goal
+                .metadata
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok())
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let mut obj = existing.as_object().cloned().unwrap_or_default();
+            if let Some(a) = agent {
+                obj.insert("agent".into(), serde_json::Value::String(a));
+            }
+            if let Some(m) = model {
+                obj.insert("model".into(), serde_json::Value::String(m));
+            }
+            let _ = crate::db::update(
+                &self.db,
+                goal_id,
+                UpdateGoalInput {
+                    metadata: Some(Some(serde_json::Value::Object(obj).to_string())),
+                    ..Default::default()
+                },
+            );
+        }
+        // Queue for agent backend (mobile/TUI poll will pick up `agent_mode/queued`)
+        let ts = cordanui_schema::now_iso();
+        self.db.execute(
+            "UPDATE goals SET status='agent_mode', agent_status='queued', agent_result=NULL, agent_progress=NULL, updated_at=? WHERE id=? AND deleted_at IS NULL",
+            vec![cordanui_sync::Value::from(ts), cordanui_sync::Value::from(goal_id)],
+        )?;
+        self.db.mark_dirty("goals", goal_id)?;
+        Ok(())
+    }
+
+    fn assign_range_to_agent(
+        &self,
+        start: &str,
+        end: &str,
+        agent: Option<String>,
+        model: Option<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let all = self.list_goals();
+        let mut sorted = all;
+        sorted.sort_by(|a, b| a.sort_order.cmp(&b.sort_order).then(a.created_at.cmp(&b.created_at)));
+        if sorted.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `@1-6` numeric vs `@<id>-<id>` dotted UUID — try numeric first
+        let start_trim = start.trim_start_matches('@');
+        let end_trim = end.trim_start_matches('@');
+        let s_num = start_trim.parse::<usize>().ok();
+        let e_num = end_trim.parse::<usize>().ok();
+        let (lo, hi) = if let (Some(s), Some(e)) = (s_num, e_num) {
+            let s0 = (s.saturating_sub(1)).min(sorted.len() - 1);
+            let e0 = (e.saturating_sub(1)).min(sorted.len() - 1);
+            if s0 <= e0 { (s0, e0) } else { (e0, s0) }
+        } else {
+            // ID range — find positions, allow prefix/suffix match for dotted hierarchy
+            let find_idx = |id: &str| {
+                sorted
+                    .iter()
+                    .position(|g| g.id == id || g.id.ends_with(id) || id.ends_with(&g.id) || g.id.contains(id))
+                    .unwrap_or(0)
+            };
+            let s_idx = find_idx(start_trim);
+            let e_idx = find_idx(end_trim);
+            if s_idx <= e_idx { (s_idx, e_idx) } else { (e_idx, s_idx) }
+        };
+        let mut assigned = Vec::new();
+        for g in sorted.iter().skip(lo).take(hi - lo + 1) {
+            self.assign_to_agent(&g.id, agent.clone(), model.clone())?;
+            assigned.push(g.id.clone());
+        }
+        Ok(assigned)
     }
 }

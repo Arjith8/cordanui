@@ -55,8 +55,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::protocol::{AgentEvent, AgentRunConfig, CompleteRequest, CompleteResponse};
 use crate::style::{parse_color, SharedStyleHost};
 use crate::ui::{
-    PanelSpec, SharedBuffersHost, SharedConfigHost, SharedErrorLogHost, SharedPanelHost,
-    SharedServiceHost, SharedSheetsHost, SharedUiHost, UiLevel, UiRequest, UiResponse, Widget,
+    PanelSpec, SharedBuffersHost, SharedConfigHost, SharedErrorLogHost, SharedGoalsHost,
+    SharedPanelHost, SharedServiceHost, SharedSheetsHost, SharedUiHost, UiLevel, UiRequest,
+    UiResponse, Widget,
 };
 use anyhow::{bail, Context, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value, Value as LuaValue};
@@ -81,6 +82,7 @@ pub struct HostHooks {
     pub errors: Option<SharedErrorLogHost>,
     pub sheets: Option<SharedSheetsHost>,
     pub buffers: Option<SharedBuffersHost>,
+    pub goals: Option<SharedGoalsHost>,
 }
 
 impl HostHooks {
@@ -128,6 +130,11 @@ impl HostHooks {
         self.buffers = Some(buffers);
         self
     }
+
+    pub fn with_goals(mut self, goals: SharedGoalsHost) -> Self {
+        self.goals = Some(goals);
+        self
+    }
 }
 
 /// An in-process Lua plugin: a loaded and initialized `main.lua`.
@@ -172,6 +179,7 @@ impl LuaPlugin {
             hooks.errors,
             hooks.sheets,
             hooks.buffers,
+            hooks.goals,
             name,
         )
         .context("registering cord styling API")?;
@@ -529,6 +537,7 @@ fn register_cord(
     errors: Option<SharedErrorLogHost>,
     sheets: Option<SharedSheetsHost>,
     buffers: Option<SharedBuffersHost>,
+    goals: Option<SharedGoalsHost>,
     plugin_name: &str,
 ) -> mlua::Result<()> {
     let cord = lua.create_table()?;
@@ -538,6 +547,7 @@ fn register_cord(
     register_cord_errors(lua, &cord, errors)?;
     register_cord_sheets(lua, &cord, sheets)?;
     register_cord_buffers(lua, &cord, buffers)?;
+    register_cord_goals(lua, &cord, goals)?;
 
     for scope in ["g", "local"] {
         let persistent = scope == "g";
@@ -1063,6 +1073,85 @@ fn register_cord_buffers(
     )?;
 
     cord.set("buffers", api)?;
+    Ok(())
+}
+
+fn register_cord_goals(
+    lua: &Lua,
+    cord: &Table,
+    goals: Option<SharedGoalsHost>,
+) -> mlua::Result<()> {
+    let api = lua.create_table()?;
+    // cord.goals.list() -> [{id, title, status, parent_id, sheet_id}]
+    let goals_list = goals.clone();
+    api.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let Some(host) = goals_list.as_ref() else {
+                return Err(mlua::Error::runtime("cord.goals is not available in this host"));
+            };
+            let list = host.list_goals();
+            let out = lua.create_table()?;
+            for (i, g) in list.iter().enumerate() {
+                let t = lua.create_table()?;
+                t.set("id", g.id.clone())?;
+                t.set("title", g.title.clone())?;
+                t.set("status", g.status.as_str().to_string())?;
+                t.set("parent_id", g.parent_id.clone())?;
+                t.set("sheet_id", g.sheet_id.clone())?;
+                t.set("index", (i + 1) as i64)?;
+                out.set(i + 1, t)?;
+            }
+            Ok(out)
+        })?,
+    )?;
+    // cord.goals.assign(id, {agent?, model?}) -> true
+    let goals_assign = goals.clone();
+    api.set(
+        "assign",
+        lua.create_function(move |_, (goal_id, opts): (String, Option<Table>)| {
+            let Some(host) = goals_assign.as_ref() else {
+                return Err(mlua::Error::runtime("cord.goals is not available in this host"));
+            };
+            let (agent, model) = if let Some(t) = opts {
+                let a: Option<String> = t.get("agent").ok();
+                let m: Option<String> = t.get("model").ok();
+                (a, m)
+            } else {
+                (None, None)
+            };
+            host.assign_to_agent(&goal_id, agent, model)
+                .map_err(mlua::Error::external)?;
+            Ok(true)
+        })?,
+    )?;
+    // cord.goals.assign_range(start, end, {agent?, model?}) -> [id]
+    // start/end are 1-based numeric strings ("1","6") or full IDs ("abc.def")
+    let goals_range = goals.clone();
+    api.set(
+        "assign_range",
+        lua.create_function(move |lua, (start, end, opts): (String, String, Option<Table>)| {
+            let Some(host) = goals_range.as_ref() else {
+                return Err(mlua::Error::runtime("cord.goals is not available in this host"));
+            };
+            let (agent, model) = if let Some(t) = opts {
+                let a: Option<String> = t.get("agent").ok();
+                let m: Option<String> = t.get("model").ok();
+                (a, m)
+            } else {
+                (None, None)
+            };
+            let ids = host
+                .assign_range_to_agent(&start, &end, agent, model)
+                .map_err(mlua::Error::external)?;
+            let out = lua.create_table()?;
+            for (i, id) in ids.iter().enumerate() {
+                out.set(i + 1, id.clone())?;
+            }
+            Ok(out)
+        })?,
+    )?;
+    cord.set("goals", api)?;
     Ok(())
 }
 

@@ -169,6 +169,8 @@ pub struct Keybinds {
     pub move_goal: KeyBinding,
     /// <leader> + this opens the sheet (buffer) picker.
     pub sheets: KeyBinding,
+    /// <leader> + this assigns range @1-6 / @<id>-<id> to agent (from goals page or chat).
+    pub assign_range: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -190,6 +192,7 @@ impl Default for Keybinds {
             toggle_complete: KeyBinding::parse("space").unwrap(),
             move_goal: KeyBinding::parse("m").unwrap(),
             sheets: KeyBinding::parse("b").unwrap(),
+            assign_range: KeyBinding::parse("A").unwrap(),
         }
     }
 }
@@ -240,6 +243,7 @@ impl Keybinds {
             toggle_complete: get("toggle_complete", &defaults.toggle_complete),
             move_goal: get("move_goal", &defaults.move_goal),
             sheets: get("sheets", &defaults.sheets),
+            assign_range: get("assign_range", &defaults.assign_range),
         }
     }
 
@@ -346,6 +350,12 @@ impl Keybinds {
             &self.sheets,
             &d.sheets,
             "<leader> + key — open sheet (buffer) picker",
+        );
+        push(
+            "assign_range",
+            &self.assign_range,
+            &d.assign_range,
+            "<leader> + key — assign @1-6 / @<id>-<id> range to agent",
         );
         v
     }

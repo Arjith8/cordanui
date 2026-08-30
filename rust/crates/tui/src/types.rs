@@ -38,6 +38,8 @@ pub enum Mode {
     AgentPicker { goal_id: String },
     /// An agent run is streaming for this goal.
     AgentRunning { goal_id: String },
+    /// Input for `@1-6` / `@<id>-<id>` range assign to agent (from goals page or chat).
+    AssignRange,
     /// Pick a new parent for the selected goal (None = move to root).
     MovePicker { goal_id: String },
     /// Pick a sheet (buffer) to switch to, or create/delete.

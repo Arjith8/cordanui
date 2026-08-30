@@ -142,6 +142,7 @@ fn run(
             Mode::GlobalConfig => handle_global_config_key(app, key)?,
             Mode::ConfirmPurge => handle_purge_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
+            Mode::AssignRange => handle_assign_range_key(app, key)?,
             _ => handle_input_key(app, key)?,
         }
 
@@ -206,6 +207,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
                     app.open_agent_picker(row.goal.id.clone())?;
                 }
             }
+            _ if binds.assign_range.matches(key) => app.start_assign_range(),
             _ if binds.commands.matches(key) => app.open_command_mode(),
             _ if binds.global_config.matches(key) => app.open_global_config(),
             _ if binds.sync.matches(key) => app.request_sync(),
@@ -215,6 +217,28 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             }
         }
         return Ok(false);
+    }
+
+    // Plugin buffer (e.g. cordanui-chat) gets first chance at keys when
+    // its tab is selected — it replaces the goal list panel (buffer) rather
+    // than a popup. This was missing after the buffer feature landed; without
+    // it a buffer's on_key never fires (fa47559). Buffer wins over bare
+    // navigation (j/k) but not over the leader prefix (handled above).
+    if let Some(buf_id) = app.active_buffer_id.lock().unwrap().clone() {
+        if let Some(spec) = app.plugin_buffers.lock().unwrap().get(&buf_id).cloned() {
+            let name = key_to_buffer_name(key);
+            if let Some(n) = name {
+                let handled = (spec.on_key)(&n);
+                if handled {
+                    return Ok(false);
+                }
+                if n == "esc" {
+                    // Unhandled Esc: leave the buffer (back to All/goals).
+                    *app.active_buffer_id.lock().unwrap() = None;
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     // Configured bare keys.
@@ -247,6 +271,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
 
     // No leader — bare navigation keys only.
     match key.code {
+        KeyCode::Char('@') => app.start_assign_range(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
         KeyCode::Char('k') | KeyCode::Up => app.move_up(),
         KeyCode::Esc => app.leader_pending = false,
@@ -260,6 +285,36 @@ fn key_label(key: &KeyEvent) -> String {
         KeyCode::Char(c) => c.to_string(),
         other => format!("{other:?}").to_lowercase(),
     }
+}
+
+fn key_to_buffer_name(key: KeyEvent) -> Option<String> {
+    Some(match key.code {
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "shift+tab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Char(' ') => "space".to_string(),
+        KeyCode::Char(c) => {
+            let base = c.to_string();
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                format!("ctrl+{base}")
+            } else if key.modifiers.contains(KeyModifiers::SHIFT) && c.is_ascii_lowercase() {
+                c.to_ascii_uppercase().to_string()
+            } else {
+                base
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn handle_input_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
@@ -808,4 +863,18 @@ fn handle_agent_running_key(app: &mut app::App, key: KeyEvent) {
     if key.code == KeyCode::Esc {
         app.mode = Mode::Normal;
     }
+}
+
+fn handle_assign_range_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<()> {
+    match key.code {
+        KeyCode::Esc => app.cancel(),
+        KeyCode::Enter => app.commit_assign_range()?,
+        KeyCode::Backspace => app.input.backspace(),
+        KeyCode::Left => app.input.move_left(),
+        KeyCode::Right => app.input.move_right(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.input.clear(),
+        KeyCode::Char(c) if !c.is_control() => app.input.push_char(c),
+        _ => {}
+    }
+    Ok(())
 }

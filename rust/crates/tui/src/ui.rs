@@ -562,6 +562,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         }
         Mode::PluginPanel => (" PLUGIN PANEL ".to_string(), String::new()),
         Mode::Command => (" COMMAND ".to_string(), app.input.text.clone()),
+        Mode::AssignRange => (" Assign @1-6: ".to_string(), app.input.text.clone()),
         Mode::GlobalConfig => {
             let text = if app.config_editing.is_some() {
                 app.config_editing.clone().unwrap_or_default()
@@ -587,7 +588,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::AgentRunning { .. }
         | Mode::PluginModal
         | Mode::PluginPanel => Style::default().fg(c.primary),
-        Mode::Command | Mode::GlobalConfig => Style::default().fg(c.secondary),
+        Mode::Command | Mode::GlobalConfig | Mode::AssignRange => Style::default().fg(c.secondary),
         Mode::ConfirmDelete { .. } | Mode::ConfirmDeleteSheet { .. } => Style::default().fg(c.error),
         Mode::ConfirmPurge => Style::default().fg(c.error),
         Mode::Help => Style::default().fg(c.primary),
@@ -663,6 +664,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
         Mode::AgentRunning { .. } => "streaming… Esc hides (run continues)".into(),
         Mode::PluginPanel => "plugin panel — keys go to the plugin".into(),
         Mode::Command => "↑↓ select · type to filter · Enter run · Esc close".into(),
+        Mode::AssignRange => "Enter assign (e.g. @1-6 or @id-id) · Esc cancel".into(),
         Mode::GlobalConfig => {
             let field_count = app.global_spec.as_ref().map(|s| s.fields.len()).unwrap_or(0);
             if app.config_editing.is_some() {

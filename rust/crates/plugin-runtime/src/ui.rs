@@ -299,6 +299,15 @@ pub trait BuffersHost: Send + Sync {
 }
 pub type SharedBuffersHost = std::sync::Arc<dyn BuffersHost>;
 
+/// Host side of `cord.goals` — list and assign goals to agents. Used for
+/// `@1-6` / `@<id>-<id>` mentions in `cordanui-chat` and direct assign from TUI.
+pub trait GoalsHost: Send + Sync {
+    fn list_goals(&self) -> Vec<cordanui_schema::Goal>;
+    fn assign_to_agent(&self, goal_id: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<()>;
+    fn assign_range_to_agent(&self, start: &str, end: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<Vec<String>>;
+}
+pub type SharedGoalsHost = std::sync::Arc<dyn GoalsHost>;
+
 /// A request plus the channel the host answers on.
 ///
 /// Hosts that drop a `PendingUi` without responding cause the waiting

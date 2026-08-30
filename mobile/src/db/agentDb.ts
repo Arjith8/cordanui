@@ -143,6 +143,50 @@ export async function assignToAgent(
 }
 
 /**
+ * Assign a range of goals to the agent — supports `@1-6` numeric (1-based flat
+ * sort_order) and `@<id>-<id>` dotted UUID. Mirrors TUI's `cord.goals.assign_range`.
+ */
+export async function assignRangeToAgent(
+  start: string,
+  end: string,
+  opts?: { agent?: string; model?: string },
+): Promise<string[]> {
+  const db = await getDb();
+  const goals = await db.getAllAsync<Goal>(
+    'SELECT * FROM goals WHERE deleted_at IS NULL ORDER BY sort_order, created_at',
+  );
+  if (goals.length === 0) return [];
+  const sTrim = start.replace(/^@/, '');
+  const eTrim = end.replace(/^@/, '');
+  const sNum = parseInt(sTrim, 10);
+  const eNum = parseInt(eTrim, 10);
+  let lo: number, hi: number;
+  if (!isNaN(sNum) && !isNaN(eNum)) {
+    lo = Math.min(sNum, eNum) - 1;
+    hi = Math.max(sNum, eNum) - 1;
+    lo = Math.max(0, Math.min(lo, goals.length - 1));
+    hi = Math.max(0, Math.min(hi, goals.length - 1));
+  } else {
+    const findIdx = (id: string) =>
+      goals.findIndex(
+        (g) => g.id === id || g.id.endsWith(id) || id.endsWith(g.id) || g.id.includes(id),
+      );
+    const sIdx = findIdx(sTrim);
+    const eIdx = findIdx(eTrim);
+    lo = sIdx === -1 ? 0 : sIdx;
+    hi = eIdx === -1 ? goals.length - 1 : eIdx;
+  }
+  if (lo > hi) [lo, hi] = [hi, lo];
+  const slice = goals.slice(lo, hi + 1);
+  const assigned: string[] = [];
+  for (const g of slice) {
+    await assignToAgent(g.id, opts);
+    assigned.push(g.id);
+  }
+  return assigned;
+}
+
+/**
  * Unassign a goal from the agent — revert to 'pending' and clear agent
  * fields. Useful if the user changes their mind before the backend picks
  * it up.
