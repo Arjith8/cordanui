@@ -2868,4 +2868,56 @@ impl cordanui_plugin_runtime::ui::GoalsHost for AppGoalsHost {
         }
         Ok(assigned)
     }
+
+    fn set_goal_data(&self, goal_id: &str, key: &str, value: serde_json::Value) -> anyhow::Result<()> {
+        let goal = crate::db::get(&self.db, goal_id)?.ok_or_else(|| anyhow::anyhow!("goal not found: {goal_id}"))?;
+        let mut meta: serde_json::Value = goal
+            .metadata
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let obj = meta.as_object_mut().ok_or_else(|| anyhow::anyhow!("metadata is not an object"))?;
+        // data is a nested object for plugin dynamic forms: metadata.data.<key> = value
+        let data = obj.entry("data").or_insert_with(|| serde_json::Value::Object(Default::default()));
+        if let Some(data_obj) = data.as_object_mut() {
+            if value.is_null() {
+                data_obj.remove(key);
+            } else {
+                data_obj.insert(key.to_string(), value);
+            }
+        }
+        crate::db::update(
+            &self.db,
+            goal_id,
+            UpdateGoalInput {
+                metadata: Some(Some(meta.to_string())),
+                ..Default::default()
+            },
+        )?;
+        self.db.mark_dirty("goals", goal_id)?;
+        Ok(())
+    }
+
+    fn list_models(&self) -> Vec<String> {
+        // Collect from active provider plugins' manifests (installed_plugins is not on AppGoalsHost,
+        // so we re-read from DB). This is live enough for the plugin picker.
+        let rows = match crate::db::list_plugins(&self.db) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut models = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in rows.iter().filter(|r| r.active) {
+            if let Ok(manifest) = cordanui_plugin_runtime::PluginManifest::from_dir(std::path::Path::new(&row.dir)) {
+                if let Some(provider) = manifest.provider {
+                    for m in provider.models {
+                        if seen.insert(m.clone()) {
+                            models.push(m);
+                        }
+                    }
+                }
+            }
+        }
+        models
+    }
 }

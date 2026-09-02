@@ -235,11 +235,34 @@ fn render_plugin_panel(app: &App, frame: &mut Frame) {
                     flatten(child, c, out);
                 }
             }
+            Widget::Row { children } => {
+                let mut cols: Vec<Vec<Line>> = Vec::new();
+                for child in children {
+                    let mut sub = Vec::new();
+                    flatten(child, c, &mut sub);
+                    cols.push(sub);
+                }
+                let max_h = cols.iter().map(|v| v.len()).max().unwrap_or(0);
+                for i in 0..max_h {
+                    let mut spans = Vec::new();
+                    for (ci, col) in cols.iter().enumerate() {
+                        if ci > 0 {
+                            spans.push(Span::styled(" │ ", Style::default().fg(c.outline)));
+                        }
+                        if let Some(line) = col.get(i) {
+                            spans.extend(line.spans.clone());
+                        }
+                    }
+                    if !spans.is_empty() {
+                        out.push(Line::from(spans));
+                    }
+                }
+            }
         }
     }
     flatten(&(spec.draw)(), c, &mut lines);
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
 }
 
 /// A plugin-requested dialog (`cord.ui.input/confirm/pick`), rendered as
@@ -343,19 +366,21 @@ fn render_plugin_modal(app: &App, frame: &mut Frame) {
             } else {
                 buffer.clone()
             };
-            vec![
-                Line::from(""),
-                Line::from(if buffer.is_empty() {
-                    Span::styled(body, Style::default().fg(c.outline_variant))
-                } else {
-                    Span::styled(body, Style::default().fg(c.on_background))
-                }),
-            ]
+            let style = if buffer.is_empty() {
+                Style::default().fg(c.outline_variant)
+            } else {
+                Style::default().fg(c.on_background)
+            };
+            let mut out = vec![Line::from("")];
+            for part in body.split('\n') {
+                out.push(Line::from(Span::styled(part.to_string(), style)));
+            }
+            out
         }
         _ => vec![Line::from("")],
     };
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
 }
 
 fn render_header(app: &App, frame: &mut Frame, area: Rect) {
@@ -743,7 +768,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
 
     let line = Line::from(vec![Span::styled(
         format!(" {hint}"),
-        Style::default().fg(c.outline_variant),
+        Style::default().fg(c.on_surface).add_modifier(Modifier::BOLD),
     )]);
     let paragraph = Paragraph::new(line);
     frame.render_widget(&paragraph, area);
@@ -1602,12 +1627,8 @@ fn render_confirm_delete_sheet(frame: &mut Frame, sheet_id: &str, c: &Palette) {
 
 fn render_plugin_buffer(spec: &cordanui_plugin_runtime::PanelSpec, app: &App, frame: &mut Frame, area: Rect) {
     let c = &app.theme.colors;
-    let block = Block::default()
-        .title(format!(" {} ", spec.title))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(c.tertiary));
-    let inner = block.inner(area);
-    frame.render_widget(&block, area);
+    // no rect/border — requested: causes hangs and not needed for diff sheet
+    let inner = area;
     // Reuse PanelSpec draw logic similar to plugin_panel
     use cordanui_plugin_runtime::Widget;
     let mut lines: Vec<Line> = Vec::new();
@@ -1638,6 +1659,29 @@ fn render_plugin_buffer(spec: &cordanui_plugin_runtime::PanelSpec, app: &App, fr
                     flatten(child, c, out);
                 }
             }
+            Widget::Row { children } => {
+                let mut cols: Vec<Vec<Line>> = Vec::new();
+                for child in children {
+                    let mut sub = Vec::new();
+                    flatten(child, c, &mut sub);
+                    cols.push(sub);
+                }
+                let max_h = cols.iter().map(|v| v.len()).max().unwrap_or(0);
+                for i in 0..max_h {
+                    let mut spans = Vec::new();
+                    for (ci, col) in cols.iter().enumerate() {
+                        if ci > 0 {
+                            spans.push(Span::styled(" │ ", Style::default().fg(c.outline)));
+                        }
+                        if let Some(line) = col.get(i) {
+                            spans.extend(line.spans.clone());
+                        }
+                    }
+                    if !spans.is_empty() {
+                        out.push(Line::from(spans));
+                    }
+                }
+            }
         }
     }
     flatten(&(spec.draw)(), c, &mut lines);
@@ -1647,7 +1691,7 @@ fn render_plugin_buffer(spec: &cordanui_plugin_runtime::PanelSpec, app: &App, fr
             Style::default().fg(c.outline_variant),
         )));
     }
-    frame.render_widget(Paragraph::new(lines).block(Block::default()), inner);
+    frame.render_widget(Paragraph::new(lines).block(Block::default()).wrap(Wrap { trim: false }), inner);
 }
 
 /// Live agent run view: spinner + progress log for the running goal.

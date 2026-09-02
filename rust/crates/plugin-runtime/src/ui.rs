@@ -125,6 +125,8 @@ pub enum Widget {
     },
     /// Vertical stack of children.
     Column { children: Vec<Widget> },
+    /// Horizontal row (for vsplit). Children laid out left→right.
+    Row { children: Vec<Widget> },
 }
 
 impl Widget {
@@ -178,6 +180,15 @@ impl Widget {
                 }
             }
             return Ok(Some(Self::Column { children }));
+        }
+        if let Ok(row_values) = t.get::<Vec<LuaValue>>("row") {
+            let mut children = Vec::new();
+            for child in &row_values {
+                if let Some(w) = Self::from_lua(child)? {
+                    children.push(w);
+                }
+            }
+            return Ok(Some(Self::Row { children }));
         }
         if let Ok(content) = t.get::<String>("content") {
             let fg: Option<String> = t.get("fg").ok();
@@ -305,6 +316,16 @@ pub trait GoalsHost: Send + Sync {
     fn list_goals(&self) -> Vec<cordanui_schema::Goal>;
     fn assign_to_agent(&self, goal_id: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<()>;
     fn assign_range_to_agent(&self, start: &str, end: &str, agent: Option<String>, model: Option<String>) -> anyhow::Result<Vec<String>>;
+    /// Dynamic form / data attribute: merge JSON patch into goals.metadata.
+    /// Plugins use this to expose forms that mobile renders via data attribute.
+    fn set_goal_data(&self, goal_id: &str, key: &str, value: serde_json::Value) -> anyhow::Result<()> {
+        let _ = (goal_id, key, value);
+        anyhow::bail!("set_goal_data not implemented by host");
+    }
+    /// List available provider models (live catalog or manifest fallback).
+    fn list_models(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 pub type SharedGoalsHost = std::sync::Arc<dyn GoalsHost>;
 

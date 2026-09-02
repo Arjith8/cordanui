@@ -1151,6 +1151,39 @@ fn register_cord_goals(
             Ok(out)
         })?,
     )?;
+    // cord.goals.set_data(id, key, value) -> true  // dynamic form via data attribute
+    let goals_data = goals.clone();
+    api.set(
+        "set_data",
+        lua.create_function(move |lua2, (goal_id, key, value): (String, String, Value)| {
+            let Some(host) = goals_data.as_ref() else {
+                return Err(mlua::Error::runtime("cord.goals is not available in this host"));
+            };
+            let json_val: serde_json::Value = match value {
+                Value::Nil => serde_json::Value::Null,
+                other => lua2.from_value::<serde_json::Value>(other).map_err(mlua::Error::external)?,
+            };
+            host.set_goal_data(&goal_id, &key, json_val)
+                .map_err(mlua::Error::external)?;
+            Ok(true)
+        })?,
+    )?;
+    // cord.goals.models() -> [model_id]  live catalog
+    let goals_models = goals.clone();
+    api.set(
+        "models",
+        lua.create_function(move |lua, ()| {
+            let Some(host) = goals_models.as_ref() else {
+                return Err(mlua::Error::runtime("cord.goals is not available in this host"));
+            };
+            let list = host.list_models();
+            let out = lua.create_table()?;
+            for (i, m) in list.iter().enumerate() {
+                out.set(i + 1, m.clone())?;
+            }
+            Ok(out)
+        })?,
+    )?;
     cord.set("goals", api)?;
     Ok(())
 }

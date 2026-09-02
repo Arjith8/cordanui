@@ -12,7 +12,9 @@ import EditableText from '@/components/EditableText';
 import InlineAddInput from '@/components/InlineAddInput';
 import StatusCircle from '@/components/StatusCircle';
 import PluginCard from '@/components/PluginCard';
+import DynamicForm from '@/components/DynamicForm';
 import { parseMobileWidgets } from '@/plugin/metadata';
+import { parseAssignContext, parseDynamicForm } from '@/plugin/dynamicForm';
 
 /**
  * A goal rendered as an accordion node in a border-drawn tree. Children live
@@ -285,6 +287,23 @@ export default function GoalItem({
               {(() => {
                 const widgets = parseMobileWidgets(goal);
                 return widgets ? <PluginCard widgets={widgets} /> : null;
+              })()}
+              {/* Dynamic form via metadata.data.form — any plugin can expose a
+                  form schema (fields) without code push; assign_context too. */}
+              {(() => {
+                const form = parseDynamicForm(goal);
+                return form ? <DynamicForm schema={form} /> : null;
+              })()}
+              {(() => {
+                const ctx = parseAssignContext(goal);
+                return ctx ? (
+                  <View style={{ marginTop: 8, padding: 8, backgroundColor: colors.surfaceVariant, borderRadius: 8 }}>
+                    <Text style={{ fontSize: 11, color: colors.tertiary, fontWeight: '600' }}>Assign context</Text>
+                    <Text style={{ fontSize: 13, color: colors.onSurface, marginTop: 4 }} selectable>
+                      {ctx}
+                    </Text>
+                  </View>
+                ) : null;
               })()}
             </View>
           </View>
