@@ -792,20 +792,8 @@ fn handle_plugin_modal_key(app: &mut app::App, key: KeyEvent) {
         (KeyCode::Backspace, _, Some("input") | Some("text")) => app.plugin_modal_backspace(),
         (KeyCode::Enter, _, _) => app.submit_plugin_modal(),
         (KeyCode::Esc, _, _) => {
-            // First Esc clears typed text; an empty box cancels.
-            if matches!(kind, Some("input") | Some("text"))
-                && app.plugin_modal_text().is_some_and(|t| !t.is_empty())
-            {
-                if let Some(app::ActivePluginModal {
-                    kind: PluginModalKind::Input { buffer, .. },
-                    ..
-                }) = &mut app.plugin_modal
-                {
-                    buffer.clear();
-                }
-            } else {
-                app.cancel_plugin_modal();
-            }
+            // Esc always cancels immediately (was: first Esc cleared text, second cancelled)
+            app.cancel_plugin_modal();
         }
         // Confirm: y/n aliases.
         (KeyCode::Char('y') | KeyCode::Char('Y'), _, Some("confirm")) => app.submit_plugin_modal(),
