@@ -512,7 +512,7 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
             }
             let line = Line::from(spans);
 
-            // Description is only shown while the row's detail view
+            // Description + agent result/progress is only shown while the row's detail view
             // (leader + show_details) is toggled on.
             let mut lines = vec![line];
             if app.detailed.as_deref() == Some(row.goal.id.as_str()) {
@@ -528,6 +528,70 @@ fn render_goal_list(app: &mut App, frame: &mut Frame, area: Rect) {
                         Style::default().fg(c.on_surface_variant),
                     ),
                 ]));
+                // Show agent progress/result when in agent_mode
+                if let Some(status) = &row.goal.agent_status {
+                    let status_str = match status.as_str() {
+                        "queued" => "queued",
+                        "running" => "running",
+                        "completed" => "completed",
+                        "failed" => "failed",
+                        other => other,
+                    };
+                    let color = match status.as_str() {
+                        "completed" => c.success,
+                        "failed" => c.error,
+                        "running" => c.primary,
+                        _ => c.tertiary,
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw(""),
+                        Span::styled(
+                            format!("{indent}      ↳ {status_str}"),
+                            Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                    if let Some(prog) = &row.goal.agent_progress {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(prog) {
+                            let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or(prog.as_str());
+                            let detail = v.get("detail").and_then(|d| d.as_str()).unwrap_or("");
+                            let text = if detail.is_empty() { msg.to_string() } else { format!("{msg} — {detail}") };
+                            for part in text.split('\n').take(3) {
+                                lines.push(Line::from(vec![
+                                    Span::raw(""),
+                                    Span::styled(
+                                        format!("{indent}        {part}"),
+                                        Style::default().fg(c.on_surface_variant),
+                                    ),
+                                ]));
+                            }
+                        }
+                    }
+                    if let Some(res) = &row.goal.agent_result {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(res) {
+                            if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+                                for part in content.split('\n').take(8) {
+                                    if part.trim().is_empty() { continue; }
+                                    lines.push(Line::from(vec![
+                                        Span::raw(""),
+                                        Span::styled(
+                                            format!("{indent}      {part}"),
+                                            Style::default().fg(c.on_surface),
+                                        ),
+                                    ]));
+                                }
+                                if content.chars().count() > 800 {
+                                    lines.push(Line::from(vec![
+                                        Span::raw(""),
+                                        Span::styled(
+                                            format!("{indent}      … (truncated, {} chars)", content.chars().count()),
+                                            Style::default().fg(c.outline_variant),
+                                        ),
+                                    ]));
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             ListItem::new(Text::from(lines))
