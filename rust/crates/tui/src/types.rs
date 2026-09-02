@@ -69,6 +69,8 @@ pub enum Mode {
     GlobalConfig,
     /// Stats overlay.
     Stats,
+    /// Fullscreen scrollable view of a goal's agent_result (untruncated).
+    FullResult { goal_id: String, scroll: usize },
 }
 
 // ─── plugin modal ────────────────────────────────────────────────────────────

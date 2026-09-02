@@ -119,6 +119,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     if app.mode == Mode::Stats {
         render_stats(app, frame);
     }
+    if let Mode::FullResult { goal_id, scroll } = &app.mode {
+        render_full_result(app, goal_id, *scroll, frame);
+    }
 }
 
 /// The command-line match list: up to 8 commands filtered by the input.
@@ -657,6 +660,7 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
             };
             (prompt.to_string(), app.input.text.clone())
         }
+        Mode::FullResult { .. } => (" Full result ".to_string(), String::new()),
         Mode::EditTitle { .. } => (" Edit title: ".to_string(), app.input.text.clone()),
         Mode::EditDescription { .. } => (" Edit description: ".to_string(), app.input.text.clone()),
         Mode::EditDue { .. } => (" Due: ".to_string(), app.input.text.clone()),
@@ -716,11 +720,12 @@ fn render_input_bar(app: &App, frame: &mut Frame, area: Rect) {
         | Mode::AddSheet
         | Mode::AgentRunning { .. }
         | Mode::PluginModal
-        | Mode::PluginPanel => Style::default().fg(c.primary),
+        | Mode::PluginPanel
+        | Mode::FullResult { .. } => Style::default().fg(c.primary),
         Mode::Command | Mode::GlobalConfig | Mode::AssignRange => Style::default().fg(c.secondary),
         Mode::ConfirmDelete { .. } | Mode::ConfirmDeleteSheet { .. } => Style::default().fg(c.error),
         Mode::ConfirmPurge => Style::default().fg(c.error),
-        Mode::Help | Mode::Stats => Style::default().fg(c.primary),
+        Mode::Help | Mode::Stats | Mode::FullResult { .. } => Style::default().fg(c.primary),
     };
 
     let block = Block::default()
@@ -816,6 +821,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
             }
         }
         Mode::Stats => "Esc/q to close".into(),
+        Mode::FullResult { .. } => "j/k scroll · Esc/q close".into(),
         Mode::PluginModal => match app.plugin_modal.as_ref().map(|m| &m.kind) {
             Some(PluginModalKind::Input { .. }) => "type · Enter submit · Esc cancel".into(),
             Some(PluginModalKind::Confirm) => "y confirm · n/Esc cancel".into(),
@@ -1939,6 +1945,69 @@ fn render_stats(app: &App, frame: &mut Frame) {
     ]));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_full_result(app: &App, goal_id: &str, scroll: usize, frame: &mut Frame) {
+    let c = &app.theme.colors;
+    let area = centered_rect(85, 85, frame.area());
+    frame.render_widget(Clear, area);
+    let goal = app.goals.iter().find(|g| g.id == goal_id);
+    let title = goal.map(|g| g.title.clone()).unwrap_or_else(|| goal_id.to_string());
+    let block = Block::default()
+        .title(format!(" Full result — {} ", truncate_str(&title, 40)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(c.primary));
+    let inner = block.inner(area);
+    frame.render_widget(&block, area);
+
+    let Some(g) = goal else {
+        frame.render_widget(Paragraph::new("Goal not found").style(Style::default().fg(c.error)), inner);
+        return;
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    // Header with status
+    if let Some(st) = &g.agent_status {
+        let st_str = format!("{st:?}").to_lowercase();
+        lines.push(Line::from(Span::styled(format!("Status: {st_str}"), Style::default().fg(c.tertiary).add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(""));
+    }
+    // Full agent_result content (untruncated)
+    if let Some(res) = &g.agent_result {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(res) {
+            if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
+                for line in content.split('\n') {
+                    lines.push(Line::from(Span::styled(line.to_string(), Style::default().fg(c.on_surface))));
+                }
+            } else {
+                for line in res.split('\n') {
+                    lines.push(Line::from(Span::styled(line.to_string(), Style::default().fg(c.on_surface))));
+                }
+            }
+        }
+    } else if let Some(prog) = &g.agent_progress {
+        lines.push(Line::from(Span::styled("Progress:", Style::default().fg(c.primary).add_modifier(Modifier::BOLD))));
+        for line in prog.split('\n') {
+            lines.push(Line::from(Span::styled(line.to_string(), Style::default().fg(c.on_surface_variant))));
+        }
+    } else {
+        lines.push(Line::from(Span::styled("(no result yet)", Style::default().fg(c.outline_variant))));
+    }
+
+    let total = lines.len();
+    let height = inner.height as usize;
+    let scroll = scroll.min(total.saturating_sub(height).max(0));
+    let visible = lines.into_iter().skip(scroll).take(height).collect::<Vec<_>>();
+
+    let footer = format!(" {}/{} lines — j/k scroll, Esc/q close ", scroll + visible.len().min(height), total);
+    let inner_with_footer = Rect::new(inner.x, inner.y, inner.width, inner.height.saturating_sub(1));
+    frame.render_widget(Paragraph::new(visible).wrap(Wrap { trim: false }), inner_with_footer);
+    // footer
+    let footer_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(footer, Style::default().fg(c.outline_variant)))),
+        footer_area,
+    );
 }
 
 /// Helper: centered rect for overlays.

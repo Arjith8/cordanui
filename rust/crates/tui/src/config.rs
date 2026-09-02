@@ -179,6 +179,8 @@ pub struct Keybinds {
     pub edit_repeat: KeyBinding,
     /// <leader> + this opens the stats page.
     pub stats: KeyBinding,
+    /// <leader> + this opens the full agent result (untruncated).
+    pub open_result: KeyBinding,
 }
 
 impl Default for Keybinds {
@@ -205,6 +207,7 @@ impl Default for Keybinds {
             edit_reminder: KeyBinding::parse("R").unwrap(),
             edit_repeat: KeyBinding::parse("ctrl+r").unwrap(),
             stats: KeyBinding::parse("S").unwrap(),
+            open_result: KeyBinding::parse("o").unwrap(),
         }
     }
 }
@@ -260,6 +263,7 @@ impl Keybinds {
             edit_reminder: get("edit_reminder", &defaults.edit_reminder),
             edit_repeat: get("edit_repeat", &defaults.edit_repeat),
             stats: get("stats", &defaults.stats),
+            open_result: get("open_result", &defaults.open_result),
         }
     }
 
@@ -396,6 +400,12 @@ impl Keybinds {
             &self.stats,
             &d.stats,
             "<leader> + key — open stats page",
+        );
+        push(
+            "open_result",
+            &self.open_result,
+            &d.open_result,
+            "<leader> + key — open full agent result (untruncated)",
         );
         v
     }

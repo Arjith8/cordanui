@@ -172,6 +172,7 @@ fn run(
             Mode::ConfirmPurge => handle_purge_key(app, key),
             Mode::AgentRunning { .. } => handle_agent_running_key(app, key),
             Mode::Stats => handle_stats_key(app, key),
+            Mode::FullResult { .. } => handle_full_result_key(app, key),
             Mode::AssignRange => handle_assign_range_key(app, key)?,
             Mode::EditDue { .. }
             | Mode::EditReminder { .. }
@@ -179,7 +180,6 @@ fn run(
             | Mode::AddGoal { .. }
             | Mode::EditTitle { .. }
             | Mode::EditDescription { .. } => handle_input_key(app, key)?,
-            _ => handle_input_key(app, key)?,
         }
 
         // Clear transient message after any key in normal mode
@@ -249,6 +249,7 @@ fn handle_normal_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<bool> 
             _ if binds.sync.matches(key) => app.request_sync(),
             _ if binds.sheets.matches(key) => app.open_sheet_picker()?,
             _ if binds.stats.matches(key) => app.open_stats(),
+            _ if binds.open_result.matches(key) => app.open_full_result(),
             _ => {
                 app.set_message(&format!("unknown leader command ({})", key_label(&key)));
             }
@@ -926,6 +927,28 @@ fn handle_assign_range_key(app: &mut app::App, key: KeyEvent) -> anyhow::Result<
 fn handle_stats_key(app: &mut app::App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.cancel(),
+        _ => {}
+    }
+}
+
+fn handle_full_result_key(app: &mut app::App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => app.cancel(),
+        KeyCode::Down | KeyCode::Char('j') => app.full_result_scroll(1),
+        KeyCode::Up | KeyCode::Char('k') => app.full_result_scroll(-1),
+        KeyCode::PageDown => app.full_result_scroll(10),
+        KeyCode::PageUp => app.full_result_scroll(-10),
+        KeyCode::Home => {
+            if let crate::app::Mode::FullResult { scroll, .. } = &mut app.mode {
+                *scroll = 0;
+            }
+        }
+        KeyCode::End => {
+            // scroll to bottom — set large, render will clamp
+            if let crate::app::Mode::FullResult { scroll, .. } = &mut app.mode {
+                *scroll = 100000;
+            }
+        }
         _ => {}
     }
 }
