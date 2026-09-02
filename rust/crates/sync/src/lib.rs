@@ -169,12 +169,22 @@ impl Database {
             None
         };
 
+        // reqwest::blocking::Client creates its own tokio runtime internally.
+        // If Database::open is called from within an existing tokio runtime
+        // (e.g. cordanui-agents #[tokio::main]), dropping that inner runtime
+        // inside the outer async context panics at tokio::runtime::blocking::shutdown.
+        // Build it on a fresh thread outside any runtime.
+        let http = std::thread::spawn(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+        })
+        .join()
+        .unwrap()?;
         let shared = Arc::new(Shared {
             path: config.db_path.clone(),
             remote,
-            http: reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .build()?,
+            http,
         });
 
         let conn = shared.open_conn()?;
@@ -281,13 +291,27 @@ impl Database {
         if !self.sync_enabled {
             return Ok(());
         }
-        let remote = self
-            .shared
-            .remote
-            .as_ref()
-            .expect("sync enabled without remote config");
-        sync::push(self, &self.shared.http, remote)?;
-        sync::pull(self, &self.shared.http, remote)?;
+        let remote = self.shared.remote.as_ref().expect("sync enabled without remote config").clone();
+        let shared = Arc::clone(&self.shared);
+        // `sync::push`/`pull` use `reqwest::blocking::Client` which creates its
+        // own tokio runtime internally. If `Database::sync` is called from
+        // within an existing tokio runtime (e.g. `cordanui-agents`
+        // `#[tokio::main]`), dropping that inner runtime inside the outer async
+        // context panics at `tokio::runtime::blocking::shutdown`. Run the
+        // blocking HTTP on a fresh thread outside any runtime.
+        let handle = std::thread::spawn(move || {
+            let db = Database {
+                shared: Arc::clone(&shared),
+                conn: shared.open_conn().expect("sync thread: failed to open db conn"),
+                sync_enabled: true,
+            };
+            let res: anyhow::Result<()> = (|| {
+                sync::push(&db, &db.shared.http, &remote)?;
+                sync::pull(&db, &db.shared.http, &remote)
+            })();
+            res
+        });
+        handle.join().unwrap()?;
         Ok(())
     }
 
