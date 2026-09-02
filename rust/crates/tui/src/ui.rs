@@ -1947,6 +1947,87 @@ fn render_stats(app: &App, frame: &mut Frame) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+fn spans_for_md_line(line: &str, c: &Palette) -> Vec<Span<'static>> {
+    let trimmed = line.trim_start();
+    let heading_level = trimmed.chars().take_while(|&ch| ch == '#').count();
+    let is_heading = heading_level > 0 && heading_level <= 6 && trimmed.chars().nth(heading_level) == Some(' ');
+    if is_heading {
+        let content = trimmed[heading_level + 1..].to_string();
+        return vec![Span::styled(content, Style::default().fg(c.primary).add_modifier(Modifier::BOLD))];
+    }
+    if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+        let content = trimmed[2..].to_string();
+        let mut spans = vec![Span::styled("· ".to_string(), Style::default().fg(c.tertiary))];
+        spans.extend(inline_md_spans(&content, c));
+        return spans;
+    }
+    if trimmed.starts_with("> ") {
+        let content = trimmed[2..].to_string();
+        return vec![Span::styled(content, Style::default().fg(c.outline_variant).add_modifier(Modifier::ITALIC))];
+    }
+    inline_md_spans(line, c)
+}
+
+fn inline_md_spans(line: &str, c: &Palette) -> Vec<Span<'static>> {
+    // Small inline parser: **bold** and `code` (code wins over bold when nested)
+    let mut spans = Vec::new();
+    let mut i = 0;
+    let chars: Vec<char> = line.chars().collect();
+    let mut buf = String::new();
+    let mut in_bold = false;
+    let mut in_code = false;
+    while i < chars.len() {
+        if !in_code && i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '*' {
+            if !buf.is_empty() {
+                let style = if in_code {
+                    Style::default().fg(c.secondary).add_modifier(Modifier::ITALIC)
+                } else if in_bold {
+                    Style::default().fg(c.on_surface).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(c.on_surface)
+                };
+                spans.push(Span::styled(buf.clone(), style));
+                buf.clear();
+            }
+            in_bold = !in_bold;
+            i += 2;
+            continue;
+        }
+        if chars[i] == '`' {
+            if !buf.is_empty() {
+                let style = if in_code {
+                    Style::default().fg(c.secondary).add_modifier(Modifier::ITALIC)
+                } else if in_bold {
+                    Style::default().fg(c.on_surface).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(c.on_surface)
+                };
+                spans.push(Span::styled(buf.clone(), style));
+                buf.clear();
+            }
+            in_code = !in_code;
+            i += 1;
+            continue;
+        }
+        buf.push(chars[i]);
+        i += 1;
+    }
+    if !buf.is_empty() {
+        let style = if in_code {
+            Style::default().fg(c.secondary).add_modifier(Modifier::ITALIC)
+        } else if in_bold {
+            Style::default().fg(c.on_surface).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(c.on_surface)
+        };
+        spans.push(Span::styled(buf, style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(line.to_string(), Style::default().fg(c.on_surface)));
+    }
+    spans
+}
+
 fn render_full_result(app: &App, goal_id: &str, scroll: usize, frame: &mut Frame) {
     let c = &app.theme.colors;
     let area = centered_rect(85, 85, frame.area());
@@ -1972,16 +2053,16 @@ fn render_full_result(app: &App, goal_id: &str, scroll: usize, frame: &mut Frame
         lines.push(Line::from(Span::styled(format!("Status: {st_str}"), Style::default().fg(c.tertiary).add_modifier(Modifier::BOLD))));
         lines.push(Line::from(""));
     }
-    // Full agent_result content (untruncated)
+    // Full agent_result content (untruncated) — rendered as markdown
     if let Some(res) = &g.agent_result {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(res) {
             if let Some(content) = v.get("content").and_then(|c| c.as_str()) {
                 for line in content.split('\n') {
-                    lines.push(Line::from(Span::styled(line.to_string(), Style::default().fg(c.on_surface))));
+                    lines.push(Line::from(spans_for_md_line(line, c)));
                 }
             } else {
                 for line in res.split('\n') {
-                    lines.push(Line::from(Span::styled(line.to_string(), Style::default().fg(c.on_surface))));
+                    lines.push(Line::from(spans_for_md_line(line, c)));
                 }
             }
         }
