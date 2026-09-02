@@ -98,7 +98,7 @@ pub enum PluginModalKind {
         selected: Vec<bool>,
         cursor: usize,
     },
-    /// Multi-line text: Enter inserts a newline, Ctrl+Enter submits.
+    /// Multi-line text: Enter submits, Shift+Enter inserts a newline.
     TextEditor {
         buffer: String,
         placeholder: Option<String>,

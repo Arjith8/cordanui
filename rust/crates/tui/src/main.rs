@@ -779,17 +779,17 @@ fn handle_plugin_modal_key(app: &mut app::App, key: KeyEvent) {
     });
 
     match (key.code, key.modifiers, kind) {
-        // Text editor: Ctrl+Enter submits; plain Enter adds a newline.
-        (KeyCode::Enter, m, Some("text")) if m.contains(KeyModifiers::CONTROL) => {
+        // Text editor: Enter submits; Shift+Enter adds a newline (multi-select assign extra context).
+        (KeyCode::Enter, m, Some("text")) if m.contains(KeyModifiers::SHIFT) => {
+            app.plugin_modal_newline()
+        }
+        (KeyCode::Enter, _, Some("text")) => {
             app.submit_plugin_modal()
         }
         (KeyCode::Char(c), _, Some("input") | Some("text")) if !c.is_control() => {
             app.plugin_modal_push_char(c)
         }
         (KeyCode::Backspace, _, Some("input") | Some("text")) => app.plugin_modal_backspace(),
-        (KeyCode::Enter, m, Some("text")) if !m.contains(KeyModifiers::CONTROL) => {
-            app.plugin_modal_newline()
-        }
         (KeyCode::Enter, _, _) => app.submit_plugin_modal(),
         (KeyCode::Esc, _, _) => {
             // First Esc clears typed text; an empty box cancels.

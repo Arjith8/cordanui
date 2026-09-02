@@ -760,7 +760,7 @@ fn render_hint_bar(app: &App, frame: &mut Frame, area: Rect) {
                 "↑↓ move · space toggle · Enter submit · Esc cancel".into()
             }
             Some(PluginModalKind::TextEditor { .. }) => {
-                "Enter newline · Ctrl+Enter submit · Esc cancel".into()
+                "Enter submit · Shift+Enter newline · Esc cancel".into()
             }
             None => String::new(),
         },

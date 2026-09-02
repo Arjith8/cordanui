@@ -49,7 +49,7 @@ pub enum UiRequest {
         preselected: Vec<usize>,
     },
     /// Multi-line text entry (Enter inserts a newline; the host chooses
-    /// its submit chord, e.g. Ctrl+Enter). Returns the text or `None`.
+    /// its submit chord, e.g. Enter (Shift+Enter for newline). Returns the text or `None`.
     Text {
         title: String,
         placeholder: Option<String>,
